@@ -72,10 +72,26 @@ ML_FEATURE_COLUMNS = [
 
 
 def _extract_frame_number(filename: str) -> float:
-    """Largest run of digits in `filename`; `inf` if none (sorts last), matching
-    the nested `extract_number` helper in src/gui_main.py:973-975."""
-    match = re.search(r"\d+", filename)
-    return int(match.group()) if match else float("inf")
+    """The LAST run of digits in `filename`; `inf` if none (sorts last).
+
+    Bug fix (found while testing `test_data/embryos_GBE_GAP43`, whose mask
+    filenames look like `Ctrl_GAP43-mChCtrl_GAP43-mCh0000_handCorrection.tif`):
+    the original port of v1's nested `extract_number` helper
+    (src/gui_main.py:973-975) used `re.search` (the FIRST digit run), which
+    for that dataset picks up "43" from the "GAP43" gene name -- appearing
+    before the actual zero-padded frame counter -- giving every one of the
+    31 frames the same "frame number" and silently collapsing them into one.
+    `extract_cell_info`'s own `fig_id` computation had a second, different
+    bug in the same direction (used the LARGEST digit run, which also
+    resolves to "43" > any of "0000".."0030"). Both are fixed here by using
+    the LAST digit run consistently, which is the actual frame counter for
+    every filename pattern seen in this project's test datasets (including
+    ones with multiple embedded numbers, like a gene name plus a frame
+    counter) -- verified against every `test_data/*/images` and `*/masks`
+    filename pattern in the repo before making this the default.
+    """
+    matches = re.findall(r"\d+", filename)
+    return int(matches[-1]) if matches else float("inf")
 
 
 def list_segmentation_files(npy_folder: str) -> list[str]:
@@ -467,7 +483,10 @@ def extract_cell_info(
         cells_info_fig = pd.DataFrame(columns=CELLS_INFO_COLUMNS)
         regex = re.compile(r"\d+")
         nums = regex.findall(filename)
-        fig_id = str(max(map(int, nums))) if nums else str(idx + 1)
+        # Last digit run, not max -- see _extract_frame_number's docstring for
+        # why (a filename can embed an unrelated number, e.g. a gene name,
+        # that's numerically larger than the actual frame counter).
+        fig_id = str(int(nums[-1])) if nums else str(idx + 1)
         frame_number = int(fig_id) if fig_id else idx + 1
 
         if progress_cb is not None:

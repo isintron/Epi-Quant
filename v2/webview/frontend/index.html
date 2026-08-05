@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Epi-Quant</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="mock-banner" class="mock-banner" style="display:none">
+  Dev-mode mock API active (no window.pywebview found) — showing fixture data only.
+</div>
+
+<header>
+  <h1>Epi-Quant</h1>
+  <nav id="step-nav">
+    <button class="step-btn" data-step="setup">1. Setup</button>
+    <button class="step-btn" data-step="extract" disabled>2. Extract</button>
+    <button class="step-btn" data-step="classify" disabled>3. Classify</button>
+    <button class="step-btn" data-step="correct-classification" disabled>4. Correct Classification</button>
+    <button class="step-btn" data-step="track" disabled>5. Track</button>
+    <button class="step-btn" data-step="correct-tracking" disabled>6. Correct Tracking</button>
+    <button class="step-btn" data-step="trajectory" disabled>7. Trajectory</button>
+  </nav>
+</header>
+
+<main>
+
+  <section id="step-setup" class="step-section">
+    <h2>Setup</h2>
+    <div class="field-row">
+      <label>Masks folder</label>
+      <input type="text" id="mask-folder-input" readonly>
+      <button id="browse-mask-folder" class="secondary-btn">Browse…</button>
+    </div>
+    <div class="field-row">
+      <label>Images folder</label>
+      <input type="text" id="image-folder-input" readonly>
+      <button id="browse-image-folder" class="secondary-btn">Browse…</button>
+    </div>
+    <div class="field-row">
+      <label>Output folder</label>
+      <input type="text" id="output-folder-input" readonly>
+      <button id="browse-output-folder" class="secondary-btn">Browse…</button>
+    </div>
+    <div class="field-row">
+      <button id="set-project-btn" class="primary-btn">Set Project</button>
+    </div>
+    <div id="setup-status" class="status-line"></div>
+  </section>
+
+  <section id="step-extract" class="step-section">
+    <h2>Extract Cell Features</h2>
+    <div class="field-row">
+      <label class="checkbox-label"><input type="checkbox" id="exclude-edge-cells"> Exclude edge cells</label>
+    </div>
+    <details>
+      <summary>Advanced options</summary>
+      <div class="field-row">
+        <label>Mask type</label>
+        <select id="mask-type-select">
+          <option value="auto" selected>auto</option>
+          <option value="labeled">labeled (already an instance mask)</option>
+          <option value="skeleton">skeleton (boundary lines)</option>
+          <option value="binary_mask">binary_mask (foreground = cell body)</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label>Background area ratio</label>
+        <input type="number" id="background-area-ratio-input" value="10" step="0.5" min="0">
+      </div>
+    </details>
+    <div class="field-row">
+      <button id="start-extraction-btn" class="primary-btn">Extract Features</button>
+    </div>
+    <div class="progress-bar" id="extract-progress-bar" style="display:none"><div class="progress-fill"></div></div>
+    <div id="extract-status" class="status-line"></div>
+
+    <div id="extract-preview" style="display:none">
+      <div class="frame-nav">
+        <button id="extract-prev-frame" class="secondary-btn">&larr; Prev</button>
+        <span id="extract-frame-label"></span>
+        <button id="extract-next-frame" class="secondary-btn">Next &rarr;</button>
+      </div>
+      <div class="image-click-wrap"><img id="extract-preview-img" class="frame-preview"></div>
+    </div>
+
+    <div class="next-step-choices" id="extract-next-choices" style="display:none">
+      <button id="go-to-classify" class="primary-btn">Classify cells →</button>
+      <button id="skip-classification" class="secondary-btn">Skip classification, track directly →</button>
+    </div>
+  </section>
+
+  <section id="step-classify" class="step-section">
+    <h2>Classify Cells</h2>
+    <div class="field-row">
+      <label class="radio-label"><input type="radio" name="n-clusters-mode" value="auto" id="n-clusters-auto" checked> Auto (silhouette-selected)</label>
+      <span class="k-range-row">
+        k range: <input type="number" id="k-range-min" value="2" min="2" class="small-input"> to
+        <input type="number" id="k-range-max" value="9" min="2" class="small-input">
+      </span>
+    </div>
+    <div class="field-row">
+      <label class="radio-label"><input type="radio" name="n-clusters-mode" value="manual" id="n-clusters-manual"> Manual:</label>
+      <input type="number" id="n-clusters-input" value="2" min="2" class="small-input">
+    </div>
+    <div class="field-row">
+      <button id="run-classification-btn" class="primary-btn">Run Classification</button>
+    </div>
+    <div id="classify-status" class="status-line"></div>
+
+    <div id="classify-results" style="display:none">
+      <h3>Cluster Legend &amp; Colors</h3>
+      <div class="field-row">
+        <label>Palette preset</label>
+        <select id="palette-preset-select"></select>
+      </div>
+      <div id="cluster-legend" class="cluster-legend"></div>
+      <div class="field-row">
+        <button id="save-classification-btn" class="secondary-btn">Save Classification</button>
+      </div>
+
+      <h3>Preview</h3>
+      <div class="frame-nav">
+        <button id="classify-prev-frame" class="secondary-btn">&larr; Prev</button>
+        <span id="classify-frame-label"></span>
+        <button id="classify-next-frame" class="secondary-btn">Next &rarr;</button>
+      </div>
+      <div class="image-click-wrap"><img id="classify-overlay-img" class="frame-preview"></div>
+      <div id="classify-cell-info" class="status-line"></div>
+
+      <div class="next-step-choices">
+        <button id="go-to-correct-classification" class="secondary-btn">Manually correct classification →</button>
+        <button id="compute-leading-edge-btn" class="secondary-btn" style="display:none">Compute Leading Edge (2-cluster boundary)</button>
+        <button id="go-to-track-from-classify" class="primary-btn">Continue to Track →</button>
+      </div>
+      <div id="leading-edge-status" class="status-line"></div>
+    </div>
+  </section>
+
+  <section id="step-correct-classification" class="step-section">
+    <h2>Correct Classification</h2>
+    <p class="hint">Click a cell in the image, then pick its correct cluster.</p>
+    <div class="frame-nav">
+      <button id="correct-class-prev-frame" class="secondary-btn">&larr; Prev</button>
+      <span id="correct-class-frame-label"></span>
+      <button id="correct-class-next-frame" class="secondary-btn">Next &rarr;</button>
+    </div>
+    <div class="image-click-wrap"><img id="correct-class-overlay-img" class="frame-preview"></div>
+    <div id="correct-class-selected-cell" class="status-line"></div>
+    <div id="correct-class-cluster-picker" class="cluster-picker"></div>
+    <div class="field-row">
+      <button id="save-correction-classification-btn" class="secondary-btn">Save Corrections</button>
+      <button id="done-correcting-classification" class="primary-btn">Continue to Track →</button>
+    </div>
+  </section>
+
+  <section id="step-track" class="step-section">
+    <h2>Track Cells</h2>
+    <div id="track-mode-options" class="field-row"></div>
+    <div class="field-row">
+      <button id="start-tracking-btn" class="primary-btn">Track Cells</button>
+    </div>
+    <div class="progress-bar" id="track-progress-bar" style="display:none"><div class="progress-fill"></div></div>
+    <div id="track-status" class="status-line"></div>
+    <div class="next-step-choices" id="track-next-choices" style="display:none">
+      <button id="go-to-correct-tracking" class="secondary-btn">Manually correct tracking →</button>
+      <button id="go-to-trajectory" class="primary-btn">View Trajectories →</button>
+    </div>
+  </section>
+
+  <section id="step-correct-tracking" class="step-section">
+    <h2>Correct Tracking</h2>
+    <p class="hint">Click a cell to inspect its track. Matched/unmatched colors are set below.</p>
+    <div class="frame-nav">
+      <button id="correct-track-prev-frame" class="secondary-btn">&larr; Prev</button>
+      <span id="correct-track-frame-label"></span>
+      <button id="correct-track-next-frame" class="secondary-btn">Next &rarr;</button>
+    </div>
+    <div class="image-click-wrap"><img id="correct-track-overlay-img" class="frame-preview"></div>
+    <div id="correct-track-selected-cell" class="status-line"></div>
+
+    <div id="correct-track-reassign" class="field-row" style="display:none">
+      <label>Reassign to track #</label>
+      <input type="number" id="new-track-id-input" class="small-input">
+      <button id="apply-track-correction-btn" class="secondary-btn">Apply</button>
+    </div>
+
+    <div class="field-row">
+      <button id="save-tracking-btn" class="secondary-btn">Save Corrections</button>
+      <button id="done-correcting-tracking" class="primary-btn">View Trajectories →</button>
+    </div>
+  </section>
+
+  <section id="step-trajectory" class="step-section">
+    <h2>Trajectory View</h2>
+    <div class="field-row">
+      <label>Track number</label>
+      <select id="track-number-select"></select>
+    </div>
+    <div class="frame-nav">
+      <button id="trajectory-prev-frame" class="secondary-btn">&larr; Prev</button>
+      <span id="trajectory-frame-label"></span>
+      <button id="trajectory-next-frame" class="secondary-btn">Next &rarr;</button>
+    </div>
+    <div class="image-click-wrap"><img id="trajectory-overlay-img" class="frame-preview"></div>
+    <div id="trajectory-status" class="status-line"></div>
+  </section>
+
+</main>
+
+<script src="api.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+# Dependencies for v2/webview/ (the pywebview desktop UI) on top of v2/'s own
+# implicit dependencies (no repo-wide requirements file exists for v2/ itself
+# yet -- see v2/README.md).
+pywebview>=6.0
+numpy
+pandas
+opencv-python
+Pillow
+scikit-learn
+scipy
+openpyxl
+matplotlib

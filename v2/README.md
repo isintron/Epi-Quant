@@ -1,0 +1,391 @@
+# Epi-Quant v2 — backend logic extraction
+
+This is a prep step for rebuilding Epi-Quant's frontend on pywebview. The
+modules here pull the pure quantitative-analysis logic out of `src/`'s
+PyQt5 windows into plain, independently-debuggable Python functions with
+explicit inputs/outputs — no `self.*` state, no `config.py` globals. `src/`
+is untouched and keeps working exactly as before; nothing here is wired up
+to a UI yet.
+
+Run modules directly with `v2/` as the working directory (or on
+`PYTHONPATH`), the same way `src/`'s `gui_*.py` files already expect sibling
+imports to resolve — e.g.:
+
+```bash
+cd v2
+python data_input.py --mask-folder /path/to/masks --output /path/to/out
+```
+
+## Input format flexibility (reviewer-requested extension)
+
+A peer reviewer asked for the pipeline to accept segmentation input beyond
+Cellpose's `.npy` format, since other commonly-used epithelial segmentation
+tools (e.g. EpySeg) export masks or boundary *skeletons* as `.tif`/`.tiff`
+images instead. `data_input.py` now supports this via a small composable
+pre-processing layer that sits in front of the (unchanged) `extract_cell_info`:
+
+- `detect_mask_format(folder)` — `'npy'` / `'tiff'` / `'mixed'` / `'empty'`.
+- `load_tiff_mask(path, mask_type='auto')` — converts one TIFF into a
+  Cellpose-`'outlines'`-compatible labeled array. `mask_type` is `'auto'`
+  (default), `'labeled'` (already an instance mask), `'skeleton'` (boundary
+  lines to discard, splitting the rest into cells), or `'binary_mask'`
+  (foreground pixels already *are* the cell bodies, no boundary to remove).
+  `'auto'` treats any 2-valued TIFF as `'skeleton'`, since that's the more
+  common convention for non-Cellpose tools and what motivated this request —
+  pass an explicit `mask_type` if a given tool's binary output means the
+  opposite.
+- `convert_tiff_masks_to_npy(...)` / `prepare_segmentation_folder(...)` —
+  batch conversion; the latter is the one-call "just get me an npy folder"
+  entry point (no-ops if the folder is already `.npy`).
+
+**Distinguishing a skeleton from a filled mask isn't just a pixel-value
+question.** For a 2-valued TIFF, `_resolve_skeleton_classes` labels each of
+the two classes under both 4- and 8-connectivity and picks the class that
+fragments heavily going from 8- to 4-connectivity as the boundary/skeleton
+(a thin 1px-wide line network falls apart at diagonal-only junctions under
+4-connectivity; solid cell-body blobs don't) — this is more robust than
+assuming "the minority-pixel-count class is the boundary," since that isn't
+true for every tool/dataset.
+
+**Unsegmented background can look like one giant "cell."** Labeling the
+complement of a skeleton only works if the skeleton fully encloses the
+imaged tissue; any region outside the segmented area (or between the tissue
+edge and the image border) merges into one connected blob that can dwarf
+every real cell by 1-2 orders of magnitude. `background_area_ratio` (default
+10× the median component area, `None` to disable) discards such oversized
+components after labeling — real epithelial cells packed into one field of
+view have comparable cross-sectional areas, so this cleanly separates
+genuine cells from background artifacts without needing to know the image's
+layout. This only applies to labels this module derives itself
+(`'skeleton'`/`'binary_mask'`/2-valued-`'auto'`); an already-labeled mask
+(`mask_type='labeled'`) is trusted as-is.
+
+**Tested against `test_data/embryos_GBE_GAP43`** (a real hand-corrected EpySeg-
+style dataset: `masks/****_handCorrection.tif`, an 8-bit RGB
+boundary-skeleton TIFF, black interior / white boundary lines): auto-detected
+as `'tiff'`, converted via the skeleton path to 267 raw connected components,
+one of which (28,698px, ~85× the 336px median) was correctly identified and
+dropped as unsegmented background by the default `background_area_ratio=10`,
+leaving 266 real cells with a sane area distribution (167–610px, mean ~343)
+carried all the way through `extract_cell_info` → `compute_pca` →
+`cluster_cells_kmeans`. The pre-existing `.npy`-based `test_data/pupae_E-cad`
+dataset was re-verified unaffected (still 1213 cells / 2 frames, identical to
+before this change).
+
+## N-cluster classification (generalized from binary AS/LE)
+
+v1's biology (Drosophila dorsal closure) only ever had two cell populations,
+so `pca_kmeans.cluster_cells_kmeans` hardcoded `n_clusters=2` and baked a
+binary majority/minority relabeling directly into the classification step,
+and `manual_correction_classification.compute_leading_edge` hardcoded
+`cluster_label==1`/`==0` as fixed "large"/"small" sides of the AS/LE
+boundary. Many other tissues naturally split into more than two
+morphologically distinct cell populations (confirmed by viewing
+`test_data/cp_dataset_puzzle-like_cells`'s sample image: a thin elongated cell-file
+region alongside several rounded rosette-shaped cell clusters in the same
+frame) — this generalizes classification to arbitrary N while leaving the
+actual K-means computation and `src/`'s frozen v1 methodology untouched.
+
+**What changed:**
+
+- `cluster_cells_kmeans(cells_info_pca, output_dir=None, n_clusters=2, k_range=(2, 9), random_state=None)`:
+  `n_clusters` accepts any int, or the literal string `"auto"` to pick k via
+  a new `_select_k_by_silhouette` helper (tries each k in `k_range`, clamped
+  to `min(k_range[1], n_samples - 1)`, scores with
+  `sklearn.metrics.silhouette_score`, picks the max — returns the full
+  per-k score dict, not just the winner). Clusters are ranked by population
+  size descending and labeled generically: `Cluster_Label=0`/`Cell_Type='cluster_1'`
+  is always the largest cluster, ..., `'cluster_N'` the smallest. **For the
+  classic N=2 case this produces the exact same `Cluster_Label` integers v1
+  did** (majority still 0, minority still 1) — verified by diffing a
+  before/after run on `test_data/pupae_E-cad`, `Cluster_Label` columns were
+  byte-for-byte identical; only the `Cell_Type` string changed
+  (`'epi cell'`/`'mes cell'` → `'cluster_1'`/`'cluster_2'`). The
+  `cells_PCA_2D.png` decision-boundary contour (fit via `LogisticRegression`,
+  a binary-classifier concept) is only drawn when the final cluster count is
+  exactly 2; for N>2 it's a plain `tab10` multi-color scatter with no
+  boundary line.
+- `compute_leading_edge(..., cluster_pair: tuple[int, int] | None = None)`:
+  **Important correction made while implementing this** — v1's "large cell"
+  sentinel (`cluster_label==1` → -1) was NOT tied to population majority.
+  Running real data confirmed the opposite: for the classic AS/LE case,
+  `Cluster_Label=1` ("mes cell") is the population MINORITY (29 cells vs.
+  1184 for `Cluster_Label=0`/"epi cell") — "large cell" referred to
+  physically large individual cells (amnioserosa), which happen to be few
+  in number, not "the more populous cluster". Those are two different
+  things that only correlated in that one dataset. So `cluster_pair` is a
+  purely positional convention (`cluster_pair[0]` → -1, `cluster_pair[1]` →
+  +1), decided by the caller, NOT a runtime "whichever cluster has more
+  cells" computation. `cluster_pair=None` auto-resolves only when exactly 2
+  `Cluster_Label` values are present: if they're exactly `{0, 1}` (the
+  normal 2-cluster `cluster_cells_kmeans` output), resolves to `(1, 0)`
+  specifically to reproduce v1's exact numeric behavior; any other 2-value
+  pair (e.g. after manual relabeling) resolves to ascending order, since no
+  legacy convention applies there. More than 2 `Cluster_Label` values present
+  with `cluster_pair=None` raises `ValueError`. An explicit `cluster_pair`
+  referencing an absent label also raises `ValueError`. Cells in any
+  third/non-compared cluster are skipped entirely (generalizes v1's
+  `not in [0, 1]` guard to `not in cluster_pair`).
+- `update_clustering_data(clustering_data, cell_index, classification_result)`:
+  drops the old 0/1-only restriction (which silently did nothing — not even
+  raising — for any other value, while still marking the row `modified=True`,
+  a latent no-op bug). Now accepts any int and sets
+  `Cell_Type=f"cluster_{classification_result + 1}"` — no more
+  `'mes Cell'`/`'epi Cell'` strings anywhere in `v2/`.
+
+**What was verified unaffected:** `cell_tracking.py` needed zero changes —
+confirmed via exhaustive grep that `split_by_leading_edge`/`track_cells`
+only ever read the numeric `leading_edge` column and its sign (`<= 0` /
+`> 0`), never `Cluster_Label` or any `mes`/`epi` string. `common.py`,
+`data_input.py`, `trajectory_visualization.py`, and all of `gap_analysis/*.py`
+have zero references to any of this terminology. `src/` (v1, including
+`src/gui_comparison.py`'s hardcoded 2-item mes/epi manual-correction
+dropdown) is completely untouched.
+
+**Test results:**
+
+- `test_data/pupae_E-cad` (N=2 regression): `Cluster_Label` integers
+  identical before/after (diffed directly); `Cell_Type` correctly renamed to
+  `cluster_1`(1184 cells)/`cluster_2`(29 cells); `cells_PCA_2D.png` still
+  renders the `LogisticRegression` boundary; `compute_leading_edge` with no
+  `cluster_pair` (auto-resolves to `(1, 0)`) reproduced the exact
+  pre-refactor summary (n=826, min=0.0, max=282.85155117128136, count(+1)=1,
+  count(-1)=0, computed-distance count=825).
+- `test_data/cp_dataset_puzzle-like_cells` (N-cluster / auto-k, 3 independent images
+  clustered separately, not pooled, since they're unrelated samples): the
+  `Root_YX_019` image (65 cells) selected k=8 (silhouette 0.4440, vs. 0.4199
+  at k=2 — the two smallest resulting clusters were 4 and 1 cells, so treat
+  this particular winner with some caution on such a small sample; silhouette
+  scores across k=6..9 were all within ~0.006 of each other, not a sharp
+  separation). The other two images (`N_294_final_crop_ds2_YX_001`, 300
+  cells; `N_435_final_crop_ds2_YX_009`, 183 cells) both cleanly selected
+  k=2 with scores decreasing monotonically for larger k. `Cluster_Label`
+  ordering was verified correctly size-ranked in all three cases (e.g. the
+  k=8 run: 16, 13, 8, 8, 8, 5, 4, 1). The k=8 output's plot was confirmed to
+  have no boundary line (plain `tab10` scatter, visually inspected).
+  `compute_leading_edge(cluster_pair=None)` on the k=8 output correctly
+  raised `ValueError` naming all 8 present labels; an explicit
+  `cluster_pair=(0, 1)` succeeded and, spot-checked directly, produced a
+  real `leading_edge` value for exactly the 29 cells in clusters 0/1 (16+13)
+  while leaving all 34 cells in clusters 2-7 untouched (`None`); a
+  `cluster_pair=(0, 99)` (99 absent) correctly raised `ValueError`.
+- `update_clustering_data` unit check: `classification_result=3` produced
+  `Cluster_Label=3`, `Cell_Type="cluster_4"`, `modified=True`, as expected.
+
+## Module map
+
+| File                                    | Covers (v1 source)                                                                                                            |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `common.py`                           | Path setup, shared`save_modified_rows` helper                                                                               |
+| `data_input.py`                       | Module 1 — Cellpose`.npy` loading + 18-feature extraction (`gui_main.bio_extract_cell_info`)                             |
+| `pca_kmeans.py`                       | Module 2 — PCA + K-means classification (`gui_main.bio_compute_cell_pca` / `bio_clustering_k_mean`)                      |
+| `manual_correction_classification.py` | Module 4a — classification correction +`leading_edge` computation (`gui_comparison.py`)                                  |
+| `cell_tracking.py`                    | Module 3 — Hungarian-algorithm tracking (`gui_main.run_cell_tracking` + tracking orchestration)                            |
+| `manual_correction_tracking.py`       | Module 4b — tracking correction (`gui_cell_track.py`)                                                                      |
+| `trajectory_visualization.py`         | Module 5 — trajectory replay + displacement field (`gui_plot_track.py`, `gui_cell_direction.py`) + lifetime-map scaffold |
+| `rendering.py`                        | Overlay compositing for the webview UI (see below) — cluster/tracking/trajectory tinting, click-to-cell pixel lookup, PNG encoding |
+| `webview/`                            | The pywebview desktop UI itself (see "pywebview UI" section below)                                                            |
+| `gap_analysis/`                       | Stub modules for manuscript analyses with no v1 implementation (see below)                                                    |
+
+Build/dependency order: `common` → `data_input` → `pca_kmeans` →
+`manual_correction_classification` (parity-check gate here, see below) →
+`cell_tracking` → `manual_correction_tracking` → `trajectory_visualization`.
+`gap_analysis/` has no real dependencies on the above. `rendering.py` depends
+on `data_input.py` only; `webview/` depends on everything.
+
+## pywebview UI (`v2/webview/`) — handoff notes
+
+**Status: first version built and backend-verified; frontend needs a real
+click-through by a human before calling it done.** If you're picking this up
+in a new conversation, read `~/.claude/skills/epi-quant-webview-ui/SKILL.md`
+first — it has the file layout, the `EpiQuantAPI` naming convention, the
+progress-wiring template, and an "add a new pipeline step" checklist. This
+section is just the current status/outstanding-work summary.
+
+**What exists**: `rendering.py` (overlay compositing + click-to-cell lookup,
+new this round, informed by but not copied from v1's PyQt5/matplotlib
+drawing code) and `webview/api.py`+`app.py`+`frontend/` (vanilla HTML/CSS/JS,
+no build step) implement the full pipeline: Setup → Extract → Classify
+(skippable, n_clusters manual or `"auto"`, per-cluster HEX colors + preset
+palettes) → Correct Classification (click-to-reassign) → Track (single
+population, or leading-edge-boundary split for exactly 2 clusters) → Correct
+Tracking (click-to-reassign/add) → basic Trajectory view (outline highlight
+per frame, no vector-field/streamline rendering — that's deferred).
+
+**Verified**: the entire backend, via `api.py`'s own `if __name__ ==
+"__main__"` smoke-test harness (`python v2/webview/api.py --mask-folder ...
+--image-folder ... --output-dir ... [--classify --n-clusters 2]`), run
+against all three real datasets:
+- `test_data/AS_dorsal view_E-cad` and `test_data/embryos_GBE_GAP43` —
+  skip-classification → track directly, both passed.
+- `test_data/AS_LE_lateral view_E-cad` — full classify(k=2) → manual cluster
+  correction → leading-edge → boundary-split tracking → manual track
+  correction, all passed, output files spot-checked on disk.
+
+The frontend was visually exercised via a **dev-mode mock** (`api.js` falls
+back to fixture data when `window.pywebview` is absent) served over a local
+`http.server` and driven with the Browser tool — this caught and fixed two
+real bugs (see Bug Fix Changelog below) but only proves the JS wiring/layout
+works with fake 1×1-pixel images, not real interaction.
+
+**Not yet verified — do this next**: run the actual app
+(`pip install -r v2/webview/requirements.txt && python v2/webview/app.py`)
+and click through it for real, especially:
+1. Click-to-cell on full-size real images (the natural-vs-CSS pixel scaling
+   in `app.js`'s `imagePixelFromClick` was only checked by reading the code
+   and testing the underlying Python function in isolation, never through an
+   actual browser click on a real rendered image).
+2. The native folder-picker dialogs (`select_folder`, wraps
+   `webview.create_file_dialog`) — untested, since the dev-mode mock stubs
+   this out entirely.
+3. Whether progress bars/status text update smoothly during the longer real
+   runs (extraction/tracking on `AS_LE_lateral view_E-cad` took several
+   minutes in the backend-only harness — the `window.evaluate_js` push
+   wiring was never watched live in a real window).
+4. General visual polish — this was built to be functional, not pretty.
+
+## Deferred (not touched this round)
+
+The data-export module (`gui_main.generate_quantitative_analysis_data`,
+which assembles and writes one `track_{n}_quantitative_analysis.xlsx` file
+per tracked cell) is explicitly deferred — not extracted or stubbed here.
+
+## `compute_leading_edge` parity check
+
+`manual_correction_classification.compute_leading_edge` is a genuine new
+extraction (not a mechanical hoist) assembled from two ~150-line Qt methods
+in `gui_comparison.py`. Before relying on it: run v1's classification-
+correction flow on a real multi-frame dataset, capture the `leading_edge`
+column it writes to `Cells_info.xlsx`, run v2's `compute_leading_edge` on
+the same `outlines`/`cells_info`/`clustering_data` inputs, and diff the two
+`leading_edge` columns row-for-row — they must match exactly.
+
+## Gap analysis: manuscript analyses with no v1 implementation
+
+Confirmed missing from `src/` entirely (stub files created in
+`gap_analysis/`, signatures + docstrings + `NotImplementedError` only):
+
+1. **Cross-genotype (WT vs. `pyd`) statistical comparison** — Fig.5A-C,E,G,
+   Fig.6A,B,D,E. `gui_comparison.py` ("Correct Cell Classification Results")
+   is single-dataset correction UI only; no two-dataset comparison exists
+   anywhere. → `gap_analysis/genotype_comparison.py`
+2. **Packing / neighbor-count analysis** — Fig.5G, Fig.6B. No cell-adjacency
+   graph exists in v1 (vertex count via `cv2.approxPolyDP` describes a
+   cell's own contour, not its neighbor count). → `gap_analysis/packing_analysis.py`
+3. **Shape parameter `p = perimeter / sqrt(area)`** — Fig.5D/E/F. Not
+   computed anywhere. Distinct from the existing `Cells_info.xlsx`
+   `'P-Value'` column (`4*pi/circularity**2`) — do not conflate the two. →
+   `gap_analysis/shape_parameter.py`
+4. **Oscillation period/amplitude analysis** — Fig.4B, Fig.6D/E. Only an
+   unrelated MSD power-law exponent (gamma) exists (duplicated in
+   `gui_cell_shadow_plot.py` / `gui_quantitative_analysis.py`). →
+   `gap_analysis/oscillation_analysis.py`
+5. **PCA-subtractive + DTW trajectory comparison** — Fig.6F-I. No `dtw` code
+   anywhere; would need a new dependency (`fastdtw`/`dtaidistance`). →
+   `gap_analysis/pca_dtw_analysis.py`
+
+## Bug Fix Changelog
+
+Four bugs found during exploration were fixed here (v2 is a new location,
+not a live-patch of v1, so this is safe). **None of these fixes alter the
+headline published methodology** (PCA explained-variance percentages,
+K-means classification results, or Hungarian-algorithm cell-tracking loss
+rates) for any cell/frame that was already being processed correctly in v1
+— they only correct edge-case or latent bugs.
+
+1. **Path-setup duplication** (`common.py`). v1 had two divergent
+   implementations: `config.set_paths` (`src/config.py:10-28`, dead code,
+   never actually called) and `gui_main.MainWindow.update_paths_and_create_folders`
+   (`src/gui_main.py:583-679`), which duplicated the same logic inline and
+   additionally set an undeclared `config.output_path` attribute. Fixed:
+   one canonical `common.setup_output_dirs()`. Pure bookkeeping — no
+   numeric effect.
+2. **PCA feature-abbreviation duplicate dict key** (`pca_kmeans.py`).
+   `src/gui_main.py:1445-1446` had `'Cell Left Boundary'` as a dict key
+   twice (the second was meant to be `'Cell Right Boundary'`); Python's
+   duplicate-key overwrite silently gave Right Boundary no abbreviation at
+   all (its full column name leaked onto the `PCA_Component_{i}_Contribution_Squared.png`
+   chart's x-axis instead of a short code). Fixed: `'Cell Left Boundary': 'Lb'`, `'Cell Right Boundary': 'Rb'`. Cosmetic only — does not change PC
+   scores or explained-variance percentages.
+3. **`leading_edge == 0` silently dropped from tracking** (`cell_tracking.py`,
+   `split_by_leading_edge`). `src/gui_main.py:796,800` split cells with
+   strict `< 0` / `> 0`, inconsistent with `run_cell_tracking`'s own
+   internal population-detection at `src/gui_main.py:1626,1641` (already
+   `<= 0` / `> 0`) — any cell with `leading_edge == 0` fell into neither
+   split and was never tracked. Fixed: `<= 0` (mes) / `> 0` (epi)
+   consistently. Can only add previously-dropped edge-case cells; doesn't
+   change Hungarian matching or cell-loss methodology for anything already
+   tracked.
+4. **Unconditional debug print** (`data_input.py`, `extract_cell_info`).
+   `src/gui_main.py:1085` unconditionally `print()`ed every row containing a
+   `-1` sentinel value (failed ellipse fit / zero-perimeter cell) on every
+   call. Fixed: guarded `logging.debug()`, only when such rows exist. No
+   change to the returned DataFrame or Excel output.
+
+### Additional opportunistic fix (not one of the 4 above, flagged separately)
+
+- **`data_input.extract_cell_info`**: v1's `bio_extract_cell_info`
+  (`src/gui_main.py:1043-1046`) leaves `cell_arclength`/`circularity`/
+  `p_value` completely unassigned in the (practically unreachable, since
+  `cv2.findContours` on a just-rasterized single-cell mask should always
+  return at least one contour) branch where `cv2.findContours` finds zero
+  contours — referencing them later would raise `UnboundLocalError`. v2
+  defensively assigns `-1` sentinels there instead (matching the existing
+  `-1` convention already used for the zero-perimeter case), so a
+  virtually-unreachable edge case degrades gracefully instead of crashing.
+  Flagged here since it wasn't one of the 4 explicitly agreed fixes.
+
+- **`data_input._extract_frame_number` / `extract_cell_info`'s `fig_id`**
+  (found while building the webview UI and testing against
+  `test_data/embryos_GBE_GAP43`, whose mask filenames look like
+  `Ctrl_GAP43-mChCtrl_GAP43-mCh0000_handCorrection.tif`): the ported v1
+  logic picked the FIRST digit run (`_extract_frame_number`) or the LARGEST
+  digit run (`fig_id`) as the frame number. Both resolve to `43` (from the
+  "GAP43" gene name) for every one of that dataset's 31 files, since `43` is
+  both first and numerically larger than any of the actual `0000`..`0030`
+  frame counters — silently collapsing all 31 frames into one ("frame 43"),
+  which broke extraction and tracking entirely for that dataset (produced 1
+  frame / 0 tracks instead of 30 frames / hundreds of tracks). Fixed: both
+  now consistently use the LAST digit run, which is the real frame counter
+  for every filename pattern in this project's `test_data/` (verified
+  against all of them before making this the default — the only
+  side-effect elsewhere is a cosmetic frame-label change for
+  `test_data/cp_dataset_puzzle-like_cells`'s independent samples, e.g.
+  `"Cell294_..."` → `"Cell1_..."`, since those aren't real sequential
+  frames and the label value doesn't affect correctness).
+
+### Known quirks reproduced bug-for-bug (deliberately NOT fixed)
+
+- **`manual_correction_classification.compute_leading_edge`**: in the
+  "has matching points" branch, v1 assigns the *unsigned* KDTree distance
+  regardless of which of the two compared clusters (`cluster_pair`) a cell
+  belongs to — no sign differentiation there, unlike the sentinel-fallback
+  branch which is explicitly signed (`-1`/`+1`).
+- ~~**`manual_correction_classification.update_clustering_data`**: writes
+  `'mes Cell'`/`'epi Cell'` (capital C), while `pca_kmeans.cluster_cells_kmeans`
+  writes `'mes cell'`/`'epi cell'` (lowercase c) for the same concept — a
+  pre-existing v1 casing inconsistency, preserved verbatim.~~ **Superseded**
+  by the N-cluster generalization above: `update_clustering_data` no longer
+  writes any `mes`/`epi` string at all (generic `cluster_N` naming instead),
+  so this casing inconsistency no longer exists anywhere in `v2/`. Kept here
+  as a historical record, not deleted outright.
+- **`trajectory_visualization.compute_displacement_vectors`**: frame-column
+  resolution (`str(start_frame) in column_name`) is a substring match, not
+  an exact one — fragile in principle (e.g. could match `'Frame10'` when
+  looking for frame `1`), though harmless under the normal ascending
+  `Frame1..FrameN` column order. Reproduced verbatim from
+  `gui_cell_direction.py:90-91`.
+
+### Frontend bugs found via dev-mode click-through (`v2/webview/frontend/`, both fixed)
+
+- `onExtractDone` never called `enableStep("classify")`, so `goToStep`'s
+  guard silently no-opped and clicking "Classify cells →" did nothing after
+  extraction finished. Fixed by adding the missing `enableStep("classify")`
+  call. (Audited every other `goToStep` call site for the same missing-gate
+  pattern at the same time — this was the only instance.)
+- The Trajectory step's frame label/overlay stayed blank on first entry
+  (`get_track_frame_range`/`get_trajectory_overlay` were only ever called
+  from the track-number `<select>`'s `change` handler, never on initial
+  navigation into the step). Fixed by adding `enterTrajectoryStep()`, which
+  auto-loads the first track only the first time the step is entered
+  (doesn't clobber the user's position on re-entry).

@@ -1,0 +1,9 @@
+CLAUDE.local.md
+CLAUDE.md
+.DS_Store
+.claude
+.vscode
+.github
+.idea
+__pycache__
+EPI_Quant.code-workspace
