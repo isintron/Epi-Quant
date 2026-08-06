@@ -15,4 +15,5 @@ __pycache__/
 *.pyc
 
 # Output of test data generation (ignored at any directory depth)
-test_data/tmp/
+test_data/
+tmp/

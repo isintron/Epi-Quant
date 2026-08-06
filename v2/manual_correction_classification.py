@@ -232,6 +232,68 @@ def compute_leading_edge(
     return cells_info
 
 
+def find_boundary_cells(
+    outlines: np.ndarray,
+    frame_number: int,
+    clustering_data: pd.DataFrame,
+    threshold: float = 3,
+    cluster_pair: Optional[tuple[int, int]] = None,
+) -> set[str]:
+    """`Cell_Index` strings for cells that directly touch (within
+    `threshold` pixels) a cell of the *other* cluster in `cluster_pair` --
+    the physical interface between the two populations, a thin
+    one-cell-wide line (matches the manuscript's Fig. 2E leading-edge
+    visualization).
+
+    This is deliberately separate from `compute_leading_edge`'s stored
+    `leading_edge` column: that column is a per-cell distance used for the
+    mes/epi tracking split (`cell_tracking.split_by_leading_edge`), not
+    itself an "is this cell on the boundary" flag, and a first cut at this
+    function tried to derive one from it via a distance-percentile cutoff --
+    which picks a broad, arbitrary-looking region rather than the actual
+    touching cells. This version instead directly reuses `get_adjacent_cells`
+    (the same pairwise-contour-proximity check `compute_leading_edge` already
+    runs internally to find `all_matching_points`) and returns the cells
+    that showed up in at least one adjacent pair. Pure visualization helper:
+    doesn't touch `cells_info`, persists nothing, safe to call every overlay
+    render.
+
+    `cluster_pair` resolution mirrors `compute_leading_edge`'s exactly (only
+    auto-resolves for a 2-cluster `clustering_data`, else pass explicitly;
+    same `ValueError`s).
+    """
+    unique_labels = set(clustering_data["Cluster_Label"].unique())
+    if cluster_pair is None:
+        if len(unique_labels) != 2:
+            raise ValueError(
+                f"clustering_data has {len(unique_labels)} distinct Cluster_Label values "
+                f"({sorted(unique_labels)}); pass cluster_pair explicitly to select which two to compare."
+            )
+        cluster_pair = (1, 0) if unique_labels == {0, 1} else tuple(sorted(unique_labels))
+    else:
+        missing = [c for c in cluster_pair if c not in unique_labels]
+        if missing:
+            raise ValueError(f"cluster_pair value(s) {missing} not present in clustering_data['Cluster_Label'].")
+
+    large_label, small_label = cluster_pair
+    cell_type_dict = clustering_data.set_index("Cell_Index")["Cluster_Label"].to_dict()
+
+    small_cells_contours: dict[int, np.ndarray] = {}
+    large_cells_contours: dict[int, np.ndarray] = {}
+    for cell_id in np.unique(outlines):
+        if cell_id == 0:
+            continue
+        cluster_label = cell_type_dict.get(f"Cell{frame_number}_{cell_id}", None)
+        if cluster_label == large_label:
+            large_cells_contours[cell_id] = np.array(np.where(outlines == cell_id)).T
+        elif cluster_label == small_label:
+            small_cells_contours[cell_id] = np.array(np.where(outlines == cell_id)).T
+
+    adjacent_pairs = get_adjacent_cells(small_cells_contours, large_cells_contours, threshold=threshold)
+    boundary_cell_ids = {cid for pair in adjacent_pairs for cid in pair}
+    return {f"Cell{frame_number}_{cid}" for cid in boundary_cell_ids}
+
+
 def update_clustering_data(clustering_data: pd.DataFrame, cell_index: str, classification_result: int) -> pd.DataFrame:
     """Manually reassign `cell_index` to cluster `classification_result` (any
     int — a valid `Cluster_Label` value, not restricted to 0/1): sets

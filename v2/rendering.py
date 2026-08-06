@@ -108,6 +108,9 @@ def render_classification_overlay(
     clustering_data: pd.DataFrame,
     color_map: dict[int, str],
     unclassified_color: str = "#808080",
+    hidden_labels: Optional[set[int]] = None,
+    border_cell_indices: Optional[set[str]] = None,
+    border_color: str = "#ff00ff",
 ) -> Image.Image:
     """Tint each cell in `outlines` by its cluster's color from `color_map`
     (`{Cluster_Label: "#rrggbb"}`). Cells present in the mask but missing
@@ -115,6 +118,13 @@ def render_classification_overlay(
     `unclassified_color`. Generalizes v1's hardcoded 2-color
     `img[outlines==cell_id] = color` pattern (`gui_comparison.py:462-472`)
     to an arbitrary N-entry color map.
+
+    `hidden_labels`: cluster labels to skip entirely (left as the untinted
+    base image) -- lets the UI isolate one cluster at a time.
+
+    `border_cell_indices`: `Cell_Index` strings (e.g. from a `leading_edge`
+    column) to paint `border_color` instead of their cluster color -- the
+    UI's "cluster borders" highlight, independent of the hide/show state.
     """
     img = base_image.copy()
     cell_type_dict = clustering_data.set_index("Cell_Index")["Cluster_Label"].to_dict()
@@ -122,8 +132,14 @@ def render_classification_overlay(
     for cell_id in np.unique(outlines):
         if cell_id == 0:
             continue
-        cluster_label = cell_type_dict.get(f"Cell{frame_number}_{cell_id}")
-        hex_color = color_map.get(cluster_label, unclassified_color)
+        cell_index = f"Cell{frame_number}_{cell_id}"
+        cluster_label = cell_type_dict.get(cell_index)
+        if hidden_labels and cluster_label in hidden_labels:
+            continue
+        if border_cell_indices and cell_index in border_cell_indices:
+            hex_color = border_color
+        else:
+            hex_color = color_map.get(cluster_label, unclassified_color)
         img[outlines == cell_id] = _hex_to_rgb(hex_color)
 
     return Image.fromarray(img)
@@ -209,7 +225,7 @@ def encode_png_base64(image: Image.Image) -> str:
     frontend as an `<img src="data:image/png;base64,...">`."""
     buf = BytesIO()
     image.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 if __name__ == "__main__":

@@ -197,6 +197,37 @@ button:disabled {
   gap: 12px;
   margin: 12px 0;
   font-size: 14px;
+  flex-wrap: wrap;
+}
+
+.frame-nav .fps-input {
+  width: 48px;
+}
+
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+
+.zoom-controls .zoom-level {
+  min-width: 44px;
+  text-align: center;
+  color: var(--text);
+}
+
+.zoom-controls .zoom-slider {
+  width: 140px;
+}
+
+.render-mode-controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 8px;
+  font-size: 14px;
 }
 
 .image-click-wrap {
@@ -211,7 +242,11 @@ button:disabled {
 .frame-preview {
   display: block;
   max-width: 100%;
-  cursor: crosshair;
+  cursor: grab;
+}
+
+.frame-preview:active {
+  cursor: grabbing;
 }
 
 .next-step-choices {

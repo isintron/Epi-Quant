@@ -16,9 +16,13 @@
 
   const mockState = {
     frameCount: 5,
+    // Deliberately sparse/non-contiguous, like a real "unrelated samples"
+    // dataset (e.g. cp_dataset_puzzle-like_cells' [1, 9, 19]) -- exercises
+    // frame-nav's index-based stepping rather than the easy 1..N case.
+    frameNumbers: [1, 3, 7, 12, 19],
     clusterLegend: [
-      { cluster_label: 0, cell_type: "cluster_1", color: "#e41a1c", count: 120 },
-      { cluster_label: 1, cell_type: "cluster_2", color: "#377eb8", count: 30 },
+      { cluster_label: 0, cell_type: "cluster_1", color: "#e41a1c", count: 120, hidden: false },
+      { cluster_label: 1, cell_type: "cluster_2", color: "#377eb8", count: 30, hidden: false },
     ],
     trackNumbers: [1, 2, 3, 4, 5],
     hasLeadingEdge: false,
@@ -42,6 +46,18 @@
         },
       };
     },
+    async get_existing_results() {
+      return { extraction: false, classification: false, tracking: false };
+    },
+    async load_existing_extraction() {
+      return { frame_count: mockState.frameCount, cell_count: 500 };
+    },
+    async load_existing_classification() {
+      return { cluster_sizes: { cluster_1: 120, cluster_2: 30 }, k_used: 2 };
+    },
+    async load_existing_tracking() {
+      return { track_count: mockState.trackNumbers.length };
+    },
     async start_extraction(_maskType, _bgRatio, _excludeEdge) {
       (async () => {
         for (let p = 0; p <= 100; p += 25) {
@@ -54,6 +70,9 @@
     },
     async get_frame_count() {
       return mockState.frameCount;
+    },
+    async get_frame_numbers() {
+      return mockState.frameNumbers;
     },
     async get_raw_frame_image(_frame) {
       return MOCK_PNG;
@@ -76,7 +95,17 @@
     async get_cluster_legend() {
       return mockState.clusterLegend;
     },
-    async get_classification_overlay(_frame) {
+    async set_hidden_clusters(hiddenLabels) {
+      const hiddenSet = new Set(hiddenLabels);
+      mockState.clusterLegend.forEach((c) => { c.hidden = hiddenSet.has(c.cluster_label); });
+    },
+    async set_show_cluster_borders(_enabled) {
+      return null;
+    },
+    async set_border_color(_color) {
+      return null;
+    },
+    async get_classification_overlay(_frame, _renderMode) {
       return MOCK_PNG;
     },
     async get_cell_at_pixel(frame, _x, _y) {
@@ -108,7 +137,7 @@
       })();
       return true;
     },
-    async get_tracking_overlay(_frame) {
+    async get_tracking_overlay(_frame, _renderMode) {
       return MOCK_PNG;
     },
     async get_tracking_cell_at_pixel(frame, _x, _y) {
@@ -123,13 +152,16 @@
     async save_tracking() {
       return null;
     },
+    async set_track_colors(_matchedColor, _unmatchedColor) {
+      return null;
+    },
     async get_track_numbers() {
       return mockState.trackNumbers;
     },
     async get_track_frame_range(_track) {
       return { min_frame: 1, max_frame: mockState.frameCount };
     },
-    async get_trajectory_overlay(_track, _frame) {
+    async get_trajectory_overlay(_track, _frame, _renderMode) {
       return MOCK_PNG;
     },
   };

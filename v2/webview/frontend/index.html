@@ -48,6 +48,12 @@
       <button id="set-project-btn" class="primary-btn">Set Project</button>
     </div>
     <div id="setup-status" class="status-line"></div>
+
+    <div id="existing-results-prompt" class="next-step-choices" style="display:none">
+      <span id="existing-results-summary" class="status-line"></span>
+      <button id="load-existing-btn" class="primary-btn">Load Existing Results</button>
+      <button id="start-fresh-btn" class="secondary-btn">Start Fresh</button>
+    </div>
   </section>
 
   <section id="step-extract" class="step-section">
@@ -79,9 +85,20 @@
 
     <div id="extract-preview" style="display:none">
       <div class="frame-nav">
+        <button id="extract-first-frame" class="secondary-btn">|&larr; First</button>
         <button id="extract-prev-frame" class="secondary-btn">&larr; Prev</button>
+        <button id="extract-play-pause" class="secondary-btn">&#9654; Play</button>
+        <label>FPS <input type="number" id="extract-fps-input" class="small-input fps-input" value="2" min="0.5" max="30" step="0.5"></label>
         <span id="extract-frame-label"></span>
         <button id="extract-next-frame" class="secondary-btn">Next &rarr;</button>
+        <button id="extract-last-frame" class="secondary-btn">Last &rarr;|</button>
+      </div>
+      <div class="zoom-controls">
+        <button id="extract-zoom-out" class="secondary-btn">&minus;</button>
+        <input type="range" id="extract-zoom-slider" class="zoom-slider" min="25" max="400" step="25" value="100">
+        <span id="extract-zoom-level" class="zoom-level">100%</span>
+        <button id="extract-zoom-in" class="secondary-btn">+</button>
+        <button id="extract-zoom-reset" class="secondary-btn">Reset</button>
       </div>
       <div class="image-click-wrap"><img id="extract-preview-img" class="frame-preview"></div>
     </div>
@@ -123,17 +140,36 @@
 
       <h3>Preview</h3>
       <div class="frame-nav">
+        <button id="classify-first-frame" class="secondary-btn">|&larr; First</button>
         <button id="classify-prev-frame" class="secondary-btn">&larr; Prev</button>
+        <button id="classify-play-pause" class="secondary-btn">&#9654; Play</button>
+        <label>FPS <input type="number" id="classify-fps-input" class="small-input fps-input" value="2" min="0.5" max="30" step="0.5"></label>
         <span id="classify-frame-label"></span>
         <button id="classify-next-frame" class="secondary-btn">Next &rarr;</button>
+        <button id="classify-last-frame" class="secondary-btn">Last &rarr;|</button>
+      </div>
+      <div class="zoom-controls">
+        <button id="classify-zoom-out" class="secondary-btn">&minus;</button>
+        <input type="range" id="classify-zoom-slider" class="zoom-slider" min="25" max="400" step="25" value="100">
+        <span id="classify-zoom-level" class="zoom-level">100%</span>
+        <button id="classify-zoom-in" class="secondary-btn">+</button>
+        <button id="classify-zoom-reset" class="secondary-btn">Reset</button>
+      </div>
+      <div class="render-mode-controls">
+        <label class="radio-label"><input type="radio" name="classify-render-mode" value="mask" checked> Filled mask</label>
+        <label class="radio-label"><input type="radio" name="classify-render-mode" value="outline"> Outlines</label>
       </div>
       <div class="image-click-wrap"><img id="classify-overlay-img" class="frame-preview"></div>
       <div id="classify-cell-info" class="status-line"></div>
 
       <div class="next-step-choices">
         <button id="go-to-correct-classification" class="secondary-btn">Manually correct classification →</button>
-        <button id="compute-leading-edge-btn" class="secondary-btn" style="display:none">Compute Leading Edge (2-cluster boundary)</button>
+        <button id="compute-leading-edge-btn" class="secondary-btn" style="display:none">Compute Cluster Borders (2-cluster boundary)</button>
         <button id="go-to-track-from-classify" class="primary-btn">Continue to Track →</button>
+      </div>
+      <div class="field-row">
+        <label class="checkbox-label"><input type="checkbox" id="show-cluster-borders-toggle"> Show cluster borders</label>
+        <label>Border color <input type="color" id="border-color-input" value="#ff00ff"></label>
       </div>
       <div id="leading-edge-status" class="status-line"></div>
     </div>
@@ -143,9 +179,24 @@
     <h2>Correct Classification</h2>
     <p class="hint">Click a cell in the image, then pick its correct cluster.</p>
     <div class="frame-nav">
+      <button id="correct-class-first-frame" class="secondary-btn">|&larr; First</button>
       <button id="correct-class-prev-frame" class="secondary-btn">&larr; Prev</button>
+      <button id="correct-class-play-pause" class="secondary-btn">&#9654; Play</button>
+      <label>FPS <input type="number" id="correct-class-fps-input" class="small-input fps-input" value="2" min="0.5" max="30" step="0.5"></label>
       <span id="correct-class-frame-label"></span>
       <button id="correct-class-next-frame" class="secondary-btn">Next &rarr;</button>
+      <button id="correct-class-last-frame" class="secondary-btn">Last &rarr;|</button>
+    </div>
+    <div class="zoom-controls">
+      <button id="correct-class-zoom-out" class="secondary-btn">&minus;</button>
+      <input type="range" id="correct-class-zoom-slider" class="zoom-slider" min="25" max="400" step="25" value="100">
+      <span id="correct-class-zoom-level" class="zoom-level">100%</span>
+      <button id="correct-class-zoom-in" class="secondary-btn">+</button>
+      <button id="correct-class-zoom-reset" class="secondary-btn">Reset</button>
+    </div>
+    <div class="render-mode-controls">
+      <label class="radio-label"><input type="radio" name="correct-class-render-mode" value="mask" checked> Filled mask</label>
+      <label class="radio-label"><input type="radio" name="correct-class-render-mode" value="outline"> Outlines</label>
     </div>
     <div class="image-click-wrap"><img id="correct-class-overlay-img" class="frame-preview"></div>
     <div id="correct-class-selected-cell" class="status-line"></div>
@@ -173,10 +224,29 @@
   <section id="step-correct-tracking" class="step-section">
     <h2>Correct Tracking</h2>
     <p class="hint">Click a cell to inspect its track. Matched/unmatched colors are set below.</p>
+    <div class="field-row">
+      <label>Matched color <input type="color" id="matched-color-input" value="#ffd633"></label>
+      <label>Unmatched color <input type="color" id="unmatched-color-input" value="#3388ff"></label>
+    </div>
     <div class="frame-nav">
+      <button id="correct-track-first-frame" class="secondary-btn">|&larr; First</button>
       <button id="correct-track-prev-frame" class="secondary-btn">&larr; Prev</button>
+      <button id="correct-track-play-pause" class="secondary-btn">&#9654; Play</button>
+      <label>FPS <input type="number" id="correct-track-fps-input" class="small-input fps-input" value="2" min="0.5" max="30" step="0.5"></label>
       <span id="correct-track-frame-label"></span>
       <button id="correct-track-next-frame" class="secondary-btn">Next &rarr;</button>
+      <button id="correct-track-last-frame" class="secondary-btn">Last &rarr;|</button>
+    </div>
+    <div class="zoom-controls">
+      <button id="correct-track-zoom-out" class="secondary-btn">&minus;</button>
+      <input type="range" id="correct-track-zoom-slider" class="zoom-slider" min="25" max="400" step="25" value="100">
+      <span id="correct-track-zoom-level" class="zoom-level">100%</span>
+      <button id="correct-track-zoom-in" class="secondary-btn">+</button>
+      <button id="correct-track-zoom-reset" class="secondary-btn">Reset</button>
+    </div>
+    <div class="render-mode-controls">
+      <label class="radio-label"><input type="radio" name="correct-track-render-mode" value="mask" checked> Filled mask</label>
+      <label class="radio-label"><input type="radio" name="correct-track-render-mode" value="outline"> Outlines</label>
     </div>
     <div class="image-click-wrap"><img id="correct-track-overlay-img" class="frame-preview"></div>
     <div id="correct-track-selected-cell" class="status-line"></div>
@@ -197,12 +267,30 @@
     <h2>Trajectory View</h2>
     <div class="field-row">
       <label>Track number</label>
-      <select id="track-number-select"></select>
+      <input type="number" id="track-number-input" list="track-number-list" placeholder="Search track #">
+      <datalist id="track-number-list"></datalist>
+      <button id="trajectory-prev-track" class="secondary-btn">&larr; Prev Track</button>
+      <button id="trajectory-next-track" class="secondary-btn">Next Track &rarr;</button>
     </div>
     <div class="frame-nav">
+      <button id="trajectory-first-frame" class="secondary-btn">|&larr; First</button>
       <button id="trajectory-prev-frame" class="secondary-btn">&larr; Prev</button>
+      <button id="trajectory-play-pause" class="secondary-btn">&#9654; Play</button>
+      <label>FPS <input type="number" id="trajectory-fps-input" class="small-input fps-input" value="2" min="0.5" max="30" step="0.5"></label>
       <span id="trajectory-frame-label"></span>
       <button id="trajectory-next-frame" class="secondary-btn">Next &rarr;</button>
+      <button id="trajectory-last-frame" class="secondary-btn">Last &rarr;|</button>
+    </div>
+    <div class="zoom-controls">
+      <button id="trajectory-zoom-out" class="secondary-btn">&minus;</button>
+      <input type="range" id="trajectory-zoom-slider" class="zoom-slider" min="25" max="400" step="25" value="100">
+      <span id="trajectory-zoom-level" class="zoom-level">100%</span>
+      <button id="trajectory-zoom-in" class="secondary-btn">+</button>
+      <button id="trajectory-zoom-reset" class="secondary-btn">Reset</button>
+    </div>
+    <div class="render-mode-controls">
+      <label class="radio-label"><input type="radio" name="trajectory-render-mode" value="mask" checked> Filled mask</label>
+      <label class="radio-label"><input type="radio" name="trajectory-render-mode" value="outline"> Outlines</label>
     </div>
     <div class="image-click-wrap"><img id="trajectory-overlay-img" class="frame-preview"></div>
     <div id="trajectory-status" class="status-line"></div>

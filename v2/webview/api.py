@@ -70,6 +70,13 @@ class EpiQuantAPI:
         self.cells_info: Optional[pd.DataFrame] = None
         self.clustering_data: Optional[pd.DataFrame] = None
         self.cluster_color_map: dict[int, str] = {}
+        self.hidden_cluster_labels: set[int] = set()
+        self.show_cluster_borders: bool = False
+        # frame_number -> boundary cell indices, from `find_boundary_cells`'s
+        # all-pairs KDTree adjacency scan (a few seconds per frame on a
+        # ~1000-cell frame) -- cleared whenever clustering changes so a
+        # correction can't leave a stale border set behind.
+        self._border_cell_cache: dict[int, Optional[set]] = {}
 
         self.tracking_data: Optional[pd.DataFrame] = None
         self.original_tracking_data: Optional[pd.DataFrame] = None
@@ -77,6 +84,7 @@ class EpiQuantAPI:
         self.matched_color = "#ffd633"
         self.unmatched_color = "#3388ff"
         self.highlight_color = "#ff3333"
+        self.border_color = "#ff00ff"
 
     def set_window(self, window) -> None:
         self.window = window
@@ -105,15 +113,45 @@ class EpiQuantAPI:
                 return os.path.join(self.npy_folder, filename)
         return None
 
-    def _load_frame(self, frame_number: int) -> Optional[tuple[np.ndarray, np.ndarray]]:
-        """Returns `(outlines, base_image)` for `frame_number`, or `None` if
-        the frame's `.npy` can't be found."""
+    def _load_frame(self, frame_number: int) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Returns `(fill_labels, boundary_labels, base_image)` for
+        `frame_number`, or `None` if the frame's `.npy` can't be found.
+
+        `fill_labels` must be a *filled* per-cell mask for rendering.py's
+        hit-testing/tinting to work (each cell's whole interior sharing one
+        ID, not just its border). Native Cellpose `.npy` output's own
+        `'outlines'` key is deceptively named: it's the ~2-5%-of-pixels
+        boundary line, not a filled mask -- `'masks'` is the filled one
+        (same cell IDs, verified against test_data). `convert_tiff_masks_to_npy`'s
+        synthetic dicts have no `'masks'` key because their `'outlines'` is
+        already a filled labeled mask (`load_tiff_mask`'s output) -- so
+        falling back to `'outlines'` when `'masks'` is absent is correct for
+        that path too.
+
+        `boundary_labels` is always the raw `'outlines'` key as-is: the thin
+        boundary-line array. Two distinct uses need it kept separate from
+        `fill_labels` rather than unified:
+        - `manual_correction_classification.compute_leading_edge`'s contour
+          distance algorithm was ported from v1, which always ran against
+          this boundary array -- swapping in the filled mask there would
+          silently change the leading-edge numbers reported in the
+          manuscript, so `compute_leading_edge_all_frames` below always
+          passes `boundary_labels`, never `fill_labels`.
+        - `rendering.py`'s overlay functions can render either as the fully
+          filled region (`render_mode="mask"`, the default -- easy at-a-glance
+          cluster membership) or as just the boundary line tinted, leaving
+          the grayscale interior visible (`render_mode="outline"`, closer to
+          v1's own look, so touching same-cluster cells stay visually
+          distinguishable instead of fusing into one blob).
+        """
         npy_path = self._npy_path_for_frame(frame_number)
         if npy_path is None:
             return None
         dat = np.load(npy_path, allow_pickle=True).item()
         base_image = rendering.load_base_image(dat, self.image_folder, frame_number)
-        return dat["outlines"], base_image
+        fill_labels = dat["masks"] if "masks" in dat else dat["outlines"]
+        boundary_labels = dat["outlines"]
+        return fill_labels, boundary_labels, base_image
 
     # ---- Setup --------------------------------------------------------
 
@@ -131,6 +169,59 @@ class EpiQuantAPI:
         self.output_dirs = common.setup_output_dirs(output_base_dir)
         fmt = data_input.detect_mask_format(mask_folder)
         return {"format": fmt, "output_dirs": self.output_dirs}
+
+    def get_existing_results(self) -> dict:
+        """Which pipeline stages already have on-disk output under the
+        current `self.output_dirs`, so the frontend can offer to load them
+        instead of recomputing. Each stage's file is written as a side
+        effect of its own compute step (not only on an explicit "Save"), so
+        this reflects the last *run*, not just the last saved correction."""
+        cells_info_path = os.path.join(self.output_dirs["cell_classification_output"], "Cells_info.xlsx")
+        clustering_path = os.path.join(self.output_dirs["cell_classification_output"], "cells_clustering_results.xlsx")
+        tracking_path = os.path.join(
+            self.output_dirs["cell_track_output"], "all_cell_tracking", "all_cell_merged_tracking_results.xlsx",
+        )
+        return {
+            "extraction": os.path.isfile(cells_info_path),
+            "classification": os.path.isfile(clustering_path),
+            "tracking": os.path.isfile(tracking_path),
+        }
+
+    def load_existing_extraction(self) -> dict:
+        """Load a previously written `Cells_info.xlsx` instead of re-running
+        `extract_cell_info`. Still resolves `self.npy_folder` -- cheap for
+        already-`.npy` input (a pass-through format check), and per-frame
+        rendering/hit-testing needs it regardless of whether features were
+        recomputed."""
+        self.npy_folder = data_input.prepare_segmentation_folder(self.mask_folder, image_folder=self.image_folder)
+        path = os.path.join(self.output_dirs["cell_classification_output"], "Cells_info.xlsx")
+        self.cells_info = pd.read_excel(path, sheet_name="Cell")
+        return {"frame_count": self.get_frame_count(), "cell_count": len(self.cells_info)}
+
+    def load_existing_classification(self) -> dict:
+        """Load a previously written `cells_clustering_results.xlsx` instead
+        of re-running PCA + K-means."""
+        path = os.path.join(self.output_dirs["cell_classification_output"], "cells_clustering_results.xlsx")
+        clustering_df = pd.read_excel(path)
+        if "modified" not in clustering_df.columns:
+            clustering_df["modified"] = False
+        self.clustering_data = clustering_df
+        self._border_cell_cache.clear()
+        return {
+            "cluster_sizes": clustering_df["Cell_Type"].value_counts().to_dict(),
+            "k_used": int(clustering_df["Cluster_Label"].nunique()),
+        }
+
+    def load_existing_tracking(self) -> dict:
+        """Load a previously written `all_cell_merged_tracking_results.xlsx`
+        instead of re-running the Hungarian-tracking pipeline."""
+        path = os.path.join(
+            self.output_dirs["cell_track_output"], "all_cell_tracking", "all_cell_merged_tracking_results.xlsx",
+        )
+        tracking_df = pd.read_excel(path)
+        self.tracking_data = tracking_df
+        self.original_tracking_data = tracking_df.copy()
+        return {"track_count": int(len(tracking_df))}
 
     # ---- Extract --------------------------------------------------------
 
@@ -172,11 +263,30 @@ class EpiQuantAPI:
             return len(data_input.list_segmentation_files(self.npy_folder))
         return 0
 
+    def get_frame_numbers(self) -> list[int]:
+        """The actual sorted frame numbers with data -- NOT necessarily
+        `1..get_frame_count()` contiguous. Datasets like
+        `cp_dataset_puzzle-like_cells` are a folder of unrelated samples
+        (`Root_YX_019`, `N_294_..._001`, `N_435_..._009`), each keeping
+        whatever number is embedded in its own filename
+        (`_extract_frame_number`'s last-digit-run rule) rather than a
+        sequential frame counter -- e.g. `[1, 9, 19]`. The frontend must
+        step through this list, not assume `frame + 1` is ever a valid next
+        frame."""
+        if self.cells_info is not None:
+            frames = self.cells_info["Cell Index"].str.extract(r"Cell(\d+)_")[0].astype(int)
+            return sorted(frames.unique().tolist())
+        if self.npy_folder:
+            return sorted({
+                data_input._extract_frame_number(f) for f in data_input.list_segmentation_files(self.npy_folder)
+            })
+        return []
+
     def get_raw_frame_image(self, frame_number: int) -> Optional[str]:
         loaded = self._load_frame(frame_number)
         if loaded is None:
             return None
-        _outlines, base_image = loaded
+        _fill_labels, _boundary_labels, base_image = loaded
         from PIL import Image
         return rendering.encode_png_base64(Image.fromarray(base_image))
 
@@ -203,6 +313,7 @@ class EpiQuantAPI:
         )
         clustering_df["modified"] = False
         self.clustering_data = clustering_df
+        self._border_cell_cache.clear()
 
         return {
             "cluster_sizes": clustering_df["Cell_Type"].value_counts().to_dict(),
@@ -210,7 +321,12 @@ class EpiQuantAPI:
         }
 
     def set_cluster_colors(self, color_map: dict) -> None:
-        self.cluster_color_map = {int(k): v for k, v in color_map.items()}
+        """Updates just the given cluster(s)' colors -- must merge, not
+        replace, since the per-swatch color picker in the legend calls this
+        with a single `{cluster_label: color}` entry at a time; a full
+        replace would silently drop every other cluster's color back to
+        `unclassified_color` on each individual edit."""
+        self.cluster_color_map.update({int(k): v for k, v in color_map.items()})
 
     def get_cluster_legend(self) -> list[dict]:
         if self.clustering_data is None:
@@ -222,20 +338,72 @@ class EpiQuantAPI:
                 "cell_type": cell_type,
                 "color": self.cluster_color_map.get(int(label), "#808080"),
                 "count": int(count),
+                "hidden": int(label) in self.hidden_cluster_labels,
             }
             for (label, cell_type), count in counts.items()
         ]
         return sorted(legend, key=lambda entry: entry["cluster_label"])
 
-    def get_classification_overlay(self, frame_number: int) -> Optional[str]:
+    def set_hidden_clusters(self, hidden_labels: list) -> None:
+        self.hidden_cluster_labels = {int(v) for v in hidden_labels}
+
+    def set_show_cluster_borders(self, enabled: bool) -> None:
+        self.show_cluster_borders = bool(enabled)
+
+    def set_border_color(self, color: str) -> None:
+        self.border_color = color
+
+    def _get_border_cell_indices(self, frame_number: int, boundary_labels: np.ndarray) -> Optional[set]:
+        """`Cell_Index` strings to highlight as "cluster borders" for
+        `frame_number`: the cells that directly touch a cell of the other
+        cluster (the physical interface, matching the manuscript's Fig. 2E
+        leading-edge visualization), via
+        `manual_correction_classification.find_boundary_cells`. `None` if
+        there's nothing to highlight (not exactly 2 clusters, or no
+        `clustering_data` yet).
+
+        Deliberately NOT derived from `cells_info['leading_edge']` -- that
+        column is a per-cell distance used for the mes/epi tracking split
+        (`cell_tracking.split_by_leading_edge`), not an "is this cell on the
+        boundary" flag, and a first cut at this function tried a
+        distance-percentile cutoff on it, which picked a broad, arbitrary
+        blob rather than the actual touching cells. `find_boundary_cells`
+        doesn't need `cells_info`/a prior "Compute Cluster Borders" run at
+        all -- it recomputes the same adjacency check live from
+        `clustering_data` + this frame's `boundary_labels`.
+        """
+        if self.clustering_data is None:
+            return None
+        if frame_number in self._border_cell_cache:
+            return self._border_cell_cache[frame_number]
+        try:
+            cells = manual_correction_classification.find_boundary_cells(
+                boundary_labels, frame_number, self.clustering_data,
+            )
+        except ValueError:
+            cells = None
+        result = cells or None
+        self._border_cell_cache[frame_number] = result
+        return result
+
+    def get_classification_overlay(self, frame_number: int, render_mode: str = "mask") -> Optional[str]:
         if self.clustering_data is None:
             return None
         loaded = self._load_frame(frame_number)
         if loaded is None:
             return None
-        outlines, base_image = loaded
+        fill_labels, boundary_labels, base_image = loaded
+        label_array = boundary_labels if render_mode == "outline" else fill_labels
+
+        border_cell_indices = (
+            self._get_border_cell_indices(frame_number, boundary_labels) if self.show_cluster_borders else None
+        )
+
         overlay = rendering.render_classification_overlay(
-            outlines, base_image, frame_number, self.clustering_data, self.cluster_color_map,
+            label_array, base_image, frame_number, self.clustering_data, self.cluster_color_map,
+            hidden_labels=self.hidden_cluster_labels or None,
+            border_cell_indices=border_cell_indices,
+            border_color=self.border_color,
         )
         return rendering.encode_png_base64(overlay)
 
@@ -243,8 +411,8 @@ class EpiQuantAPI:
         loaded = self._load_frame(frame_number)
         if loaded is None:
             return None
-        outlines, _base_image = loaded
-        cell_id = rendering.cell_id_at_pixel(outlines, int(x), int(y))
+        fill_labels, _boundary_labels, _base_image = loaded
+        cell_id = rendering.cell_id_at_pixel(fill_labels, int(x), int(y))
         if cell_id is None:
             return None
         cell_index = f"Cell{frame_number}_{cell_id}"
@@ -262,6 +430,7 @@ class EpiQuantAPI:
         manual_correction_classification.update_clustering_data(
             self.clustering_data, cell_index, int(new_cluster_label),
         )
+        self._border_cell_cache.clear()
         return self.get_cluster_legend()
 
     def save_classification(self) -> None:
@@ -289,9 +458,9 @@ class EpiQuantAPI:
             loaded = self._load_frame(frame_number)
             if loaded is None:
                 continue
-            outlines, _base_image = loaded
+            _fill_labels, boundary_labels, _base_image = loaded
             self.cells_info = manual_correction_classification.compute_leading_edge(
-                outlines, frame_number, self.cells_info, self.clustering_data, threshold=threshold,
+                boundary_labels, frame_number, self.cells_info, self.clustering_data, threshold=threshold,
             )
             processed += 1
             self._notify("onProgress", {
@@ -334,15 +503,20 @@ class EpiQuantAPI:
             logger.exception("Tracking failed")
             self._notify("onTrackError", {"message": str(e)})
 
-    def get_tracking_overlay(self, frame_number: int) -> Optional[str]:
+    def set_track_colors(self, matched_color: str, unmatched_color: str) -> None:
+        self.matched_color = matched_color
+        self.unmatched_color = unmatched_color
+
+    def get_tracking_overlay(self, frame_number: int, render_mode: str = "mask") -> Optional[str]:
         if self.tracking_data is None:
             return None
         loaded = self._load_frame(frame_number)
         if loaded is None:
             return None
-        outlines, base_image = loaded
+        fill_labels, boundary_labels, base_image = loaded
+        label_array = boundary_labels if render_mode == "outline" else fill_labels
         overlay = rendering.render_tracking_overlay(
-            outlines, base_image, frame_number, self.tracking_data, self.matched_color, self.unmatched_color,
+            label_array, base_image, frame_number, self.tracking_data, self.matched_color, self.unmatched_color,
         )
         return rendering.encode_png_base64(overlay)
 
@@ -350,8 +524,8 @@ class EpiQuantAPI:
         loaded = self._load_frame(frame_number)
         if loaded is None:
             return None
-        outlines, _base_image = loaded
-        cell_id = rendering.cell_id_at_pixel(outlines, int(x), int(y))
+        fill_labels, _boundary_labels, _base_image = loaded
+        cell_id = rendering.cell_id_at_pixel(fill_labels, int(x), int(y))
         if cell_id is None:
             return None
         cell_index = f"Cell{frame_number}_{cell_id}"
@@ -407,7 +581,7 @@ class EpiQuantAPI:
             return None
         return {"min_frame": min(frames), "max_frame": max(frames)}
 
-    def get_trajectory_overlay(self, track_number: int, frame_number: int) -> Optional[str]:
+    def get_trajectory_overlay(self, track_number: int, frame_number: int, render_mode: str = "mask") -> Optional[str]:
         if self.tracking_data is None:
             return None
         cell_ids = trajectory_visualization.get_track_cell_ids(self.tracking_data, int(track_number))
@@ -420,8 +594,9 @@ class EpiQuantAPI:
         loaded = self._load_frame(frame_number)
         if loaded is None:
             return None
-        outlines, base_image = loaded
-        overlay = rendering.render_cell_highlight(outlines, base_image, cell_id_num, self.highlight_color)
+        fill_labels, boundary_labels, base_image = loaded
+        label_array = boundary_labels if render_mode == "outline" else fill_labels
+        overlay = rendering.render_cell_highlight(label_array, base_image, cell_id_num, self.highlight_color)
         return rendering.encode_png_base64(overlay)
 
 

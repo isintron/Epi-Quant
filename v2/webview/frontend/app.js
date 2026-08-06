@@ -7,6 +7,11 @@ const state = {
   imageFolder: null,
   outputFolder: null,
   frameCount: 0,
+  // Actual sorted frame numbers with data -- NOT necessarily 1..frameCount
+  // contiguous (some datasets are unrelated samples, each keeping whatever
+  // number is embedded in its own filename, e.g. [1, 9, 19]). Frame-nav
+  // must step through this list rather than assume frame+1 is valid.
+  frameNumbers: [],
 
   // Per-step "currently displayed frame" -- kept separate since a user can
   // jump between steps and each should remember its own position.
@@ -23,6 +28,11 @@ const state = {
   trackingModeOptions: { has_leading_edge: false, split_available: false },
   trackNumbers: [],
   currentTrackNumber: null,
+
+  existingResults: { extraction: false, classification: false, tracking: false },
+
+  playIntervals: {}, // prefix -> setInterval id, for frame autoplay
+  zoomLevels: {}, // prefix -> current zoom percent
 };
 
 const enabledSteps = new Set(["setup"]);
@@ -93,10 +103,56 @@ async function handleSetProject() {
     state.outputFolder = outputFolder;
     setStatus("setup-status", `Detected format: ${result.format}. Output folders created.`, "success");
     enableStep("extract");
-    goToStep("extract");
+
+    const existing = await window.EpiQuantAPI.get_existing_results();
+    state.existingResults = existing;
+    if (existing.extraction || existing.classification || existing.tracking) {
+      const parts = ["extraction", "classification", "tracking"].filter((k) => existing[k]);
+      document.getElementById("existing-results-summary").textContent =
+        `Found existing results for: ${parts.join(", ")}.`;
+      document.getElementById("existing-results-prompt").style.display = "flex";
+    } else {
+      goToStep("extract");
+    }
   } catch (err) {
     setStatus("setup-status", `Error: ${err}`, "error");
   }
+}
+
+async function handleLoadExistingResults() {
+  const existing = state.existingResults;
+  document.getElementById("load-existing-btn").disabled = true;
+  setStatus("setup-status", "Loading existing results…");
+  try {
+    let furthestStep = "extract";
+    if (existing.extraction) {
+      const data = await window.EpiQuantAPI.load_existing_extraction();
+      await onExtractDone(data);
+      furthestStep = "classify";
+    }
+    if (existing.classification) {
+      const result = await window.EpiQuantAPI.load_existing_classification();
+      await afterClassificationReady(result);
+      furthestStep = "correct-classification";
+    }
+    if (existing.tracking) {
+      const data = await window.EpiQuantAPI.load_existing_tracking();
+      await onTrackDone(data);
+      furthestStep = "trajectory";
+    }
+    document.getElementById("existing-results-prompt").style.display = "none";
+    setStatus("setup-status", "Loaded existing results.", "success");
+    goToStep(furthestStep);
+  } catch (err) {
+    setStatus("setup-status", `Error loading existing results: ${err}`, "error");
+  } finally {
+    document.getElementById("load-existing-btn").disabled = false;
+  }
+}
+
+function handleStartFresh() {
+  document.getElementById("existing-results-prompt").style.display = "none";
+  goToStep("extract");
 }
 
 // ---------------------------------------------------------------------
@@ -131,13 +187,14 @@ function onProgress(data) {
 
 async function onExtractDone(data) {
   state.frameCount = data.frame_count;
-  state.extractFrame = 1;
+  state.frameNumbers = await window.EpiQuantAPI.get_frame_numbers();
+  state.extractFrame = state.frameNumbers[0] ?? 1;
   setStatus("extract-status", `Done: ${data.frame_count} frames, ${data.cell_count} cells extracted.`, "success");
   document.getElementById("start-extraction-btn").disabled = false;
   document.getElementById("extract-preview").style.display = "block";
   document.getElementById("extract-next-choices").style.display = "flex";
   enableStep("classify");
-  await showExtractFrame(1);
+  await showExtractFrame(state.extractFrame);
 }
 
 function onExtractError(data) {
@@ -145,9 +202,28 @@ function onExtractError(data) {
   document.getElementById("start-extraction-btn").disabled = false;
 }
 
+function frameLabel(frame) {
+  const idx = state.frameNumbers.indexOf(frame);
+  return idx === -1 ? `Frame ${frame}` : `Frame ${frame} (${idx + 1} / ${state.frameNumbers.length})`;
+}
+
+// `${prefix}-render-mode` radio group -- "mask" (filled regions, default) or
+// "outline" (boundary-line only, closer to v1's look, keeps touching
+// same-cluster cells visually distinguishable).
+function getRenderMode(prefix) {
+  const checked = document.querySelector(`input[name="${prefix}-render-mode"]:checked`);
+  return checked ? checked.value : "mask";
+}
+
+function wireRenderMode(prefix, onChange) {
+  document.querySelectorAll(`input[name="${prefix}-render-mode"]`).forEach((el) => {
+    el.addEventListener("change", onChange);
+  });
+}
+
 async function showExtractFrame(frame) {
   state.extractFrame = frame;
-  document.getElementById("extract-frame-label").textContent = `Frame ${frame} / ${state.frameCount}`;
+  document.getElementById("extract-frame-label").textContent = frameLabel(frame);
   const img = await window.EpiQuantAPI.get_raw_frame_image(frame);
   if (img) document.getElementById("extract-preview-img").src = img;
 }
@@ -163,6 +239,28 @@ function updateNClustersModeUI() {
   document.getElementById("n-clusters-input").disabled = isAuto;
 }
 
+async function afterClassificationReady(result) {
+  setStatus(
+    "classify-status",
+    `Done: k=${result.k_used}. Sizes: ${JSON.stringify(result.cluster_sizes)}`,
+    "success"
+  );
+  document.getElementById("classify-results").style.display = "block";
+
+  await populatePalettePresets();
+  await applyPaletteToAllClusters();
+  await refreshClusterLegend();
+
+  state.classifyFrame = state.frameNumbers[0] ?? 1;
+  await showClassifyFrame(state.classifyFrame);
+
+  const canBoundary = await window.EpiQuantAPI.can_compute_leading_edge();
+  document.getElementById("compute-leading-edge-btn").style.display = canBoundary ? "inline-block" : "none";
+
+  enableStep("correct-classification");
+  enableStep("track");
+}
+
 async function handleRunClassification() {
   const isAuto = document.getElementById("n-clusters-auto").checked;
   const nClusters = isAuto ? "auto" : parseInt(document.getElementById("n-clusters-input").value, 10);
@@ -175,25 +273,7 @@ async function handleRunClassification() {
   document.getElementById("run-classification-btn").disabled = true;
   try {
     const result = await window.EpiQuantAPI.run_classification(nClusters, kRange, null);
-    setStatus(
-      "classify-status",
-      `Done: k=${result.k_used}. Sizes: ${JSON.stringify(result.cluster_sizes)}`,
-      "success"
-    );
-    document.getElementById("classify-results").style.display = "block";
-
-    await populatePalettePresets();
-    await applyPaletteToAllClusters();
-    await refreshClusterLegend();
-
-    state.classifyFrame = 1;
-    await showClassifyFrame(1);
-
-    const canBoundary = await window.EpiQuantAPI.can_compute_leading_edge();
-    document.getElementById("compute-leading-edge-btn").style.display = canBoundary ? "inline-block" : "none";
-
-    enableStep("correct-classification");
-    enableStep("track");
+    await afterClassificationReady(result);
   } catch (err) {
     setStatus("classify-status", `Error: ${err}`, "error");
   } finally {
@@ -234,6 +314,20 @@ async function refreshClusterLegend() {
     const row = document.createElement("div");
     row.className = "cluster-legend-row";
 
+    const visibleCheckbox = document.createElement("input");
+    visibleCheckbox.type = "checkbox";
+    visibleCheckbox.checked = !entry.hidden;
+    visibleCheckbox.title = "Show this cluster";
+    visibleCheckbox.addEventListener("change", async (e) => {
+      const hiddenLabels = state.clusterLegend.filter((c) => c.hidden).map((c) => c.cluster_label);
+      const hiddenSet = new Set(hiddenLabels);
+      if (e.target.checked) hiddenSet.delete(entry.cluster_label);
+      else hiddenSet.add(entry.cluster_label);
+      await window.EpiQuantAPI.set_hidden_clusters([...hiddenSet]);
+      await refreshClusterLegend();
+      await showClassifyFrame(state.classifyFrame);
+    });
+
     const colorInput = document.createElement("input");
     colorInput.type = "color";
     colorInput.value = entry.color;
@@ -250,7 +344,7 @@ async function refreshClusterLegend() {
     count.className = "count";
     count.textContent = `${entry.count} cells`;
 
-    row.append(colorInput, label, count);
+    row.append(visibleCheckbox, colorInput, label, count);
     container.appendChild(row);
   });
   renderClusterPicker();
@@ -274,8 +368,8 @@ function renderClusterPicker() {
 
 async function showClassifyFrame(frame) {
   state.classifyFrame = frame;
-  document.getElementById("classify-frame-label").textContent = `Frame ${frame} / ${state.frameCount}`;
-  const img = await window.EpiQuantAPI.get_classification_overlay(frame);
+  document.getElementById("classify-frame-label").textContent = frameLabel(frame);
+  const img = await window.EpiQuantAPI.get_classification_overlay(frame, getRenderMode("classify"));
   if (img) document.getElementById("classify-overlay-img").src = img;
 }
 
@@ -308,8 +402,8 @@ async function handleComputeLeadingEdge() {
 
 async function showCorrectClassFrame(frame) {
   state.correctClassFrame = frame;
-  document.getElementById("correct-class-frame-label").textContent = `Frame ${frame} / ${state.frameCount}`;
-  const img = await window.EpiQuantAPI.get_classification_overlay(frame);
+  document.getElementById("correct-class-frame-label").textContent = frameLabel(frame);
+  const img = await window.EpiQuantAPI.get_classification_overlay(frame, getRenderMode("correct-class"));
   if (img) document.getElementById("correct-class-overlay-img").src = img;
   document.getElementById("correct-class-selected-cell").textContent = "";
   state.selectedCellForCorrection = null;
@@ -392,17 +486,16 @@ async function onTrackDone(data) {
   enableStep("trajectory");
 
   state.trackNumbers = await window.EpiQuantAPI.get_track_numbers();
-  const select = document.getElementById("track-number-select");
-  select.innerHTML = "";
+  const list = document.getElementById("track-number-list");
+  list.innerHTML = "";
   state.trackNumbers.forEach((tn) => {
     const opt = document.createElement("option");
     opt.value = tn;
-    opt.textContent = `Track ${tn}`;
-    select.appendChild(opt);
+    list.appendChild(opt);
   });
 
-  state.correctTrackFrame = 1;
-  await showCorrectTrackFrame(1);
+  state.correctTrackFrame = state.frameNumbers[0] ?? 1;
+  await showCorrectTrackFrame(state.correctTrackFrame);
 }
 
 function onTrackError(data) {
@@ -416,8 +509,8 @@ function onTrackError(data) {
 
 async function showCorrectTrackFrame(frame) {
   state.correctTrackFrame = frame;
-  document.getElementById("correct-track-frame-label").textContent = `Frame ${frame} / ${state.frameCount}`;
-  const img = await window.EpiQuantAPI.get_tracking_overlay(frame);
+  document.getElementById("correct-track-frame-label").textContent = frameLabel(frame);
+  const img = await window.EpiQuantAPI.get_tracking_overlay(frame, getRenderMode("correct-track"));
   if (img) document.getElementById("correct-track-overlay-img").src = img;
   document.getElementById("correct-track-selected-cell").textContent = "";
   document.getElementById("correct-track-reassign").style.display = "none";
@@ -478,15 +571,18 @@ async function handleSaveTrackingCorrections() {
 
 async function enterTrajectoryStep() {
   goToStep("trajectory");
-  const select = document.getElementById("track-number-select");
-  if (select.options.length > 0 && state.currentTrackNumber === null) {
-    await handleTrackNumberChange();
+  if (state.trackNumbers.length > 0 && state.currentTrackNumber === null) {
+    await loadTrack(state.trackNumbers[0]);
   }
 }
 
-async function handleTrackNumberChange() {
-  const tn = parseInt(document.getElementById("track-number-select").value, 10);
+async function loadTrack(tn) {
+  if (!state.trackNumbers.includes(tn)) {
+    setStatus("trajectory-status", `Track ${tn} not found.`, "error");
+    return;
+  }
   state.currentTrackNumber = tn;
+  document.getElementById("track-number-input").value = tn;
   const range = await window.EpiQuantAPI.get_track_frame_range(tn);
   if (!range) {
     setStatus("trajectory-status", "No frame data for this track.", "error");
@@ -496,10 +592,26 @@ async function handleTrackNumberChange() {
   await showTrajectoryFrame(range.min_frame);
 }
 
+async function handleTrackNumberInputChange() {
+  const tn = parseInt(document.getElementById("track-number-input").value, 10);
+  if (Number.isNaN(tn)) return;
+  await loadTrack(tn);
+}
+
+function handlePrevTrack() {
+  const idx = state.trackNumbers.indexOf(state.currentTrackNumber);
+  if (idx > 0) loadTrack(state.trackNumbers[idx - 1]);
+}
+
+function handleNextTrack() {
+  const idx = state.trackNumbers.indexOf(state.currentTrackNumber);
+  if (idx !== -1 && idx < state.trackNumbers.length - 1) loadTrack(state.trackNumbers[idx + 1]);
+}
+
 async function showTrajectoryFrame(frame) {
   state.trajectoryFrame = frame;
   document.getElementById("trajectory-frame-label").textContent = `Frame ${frame}`;
-  const img = await window.EpiQuantAPI.get_trajectory_overlay(state.currentTrackNumber, frame);
+  const img = await window.EpiQuantAPI.get_trajectory_overlay(state.currentTrackNumber, frame, getRenderMode("trajectory"));
   if (img) {
     document.getElementById("trajectory-overlay-img").src = img;
     setStatus("trajectory-status", "");
@@ -512,17 +624,156 @@ async function showTrajectoryFrame(frame) {
 // Wiring
 // ---------------------------------------------------------------------
 
-function wireFrameNav(prevId, nextId, getFrame, setFrame, showFn) {
-  document.getElementById(prevId).addEventListener("click", () => {
-    const f = Math.max(1, getFrame() - 1);
+function stopAutoplay(prefix) {
+  const intervalId = state.playIntervals[prefix];
+  if (intervalId) {
+    clearInterval(intervalId);
+    state.playIntervals[prefix] = null;
+  }
+  const playBtn = document.getElementById(`${prefix}-play-pause`);
+  if (playBtn) playBtn.innerHTML = "&#9654; Play";
+}
+
+function startAutoplay(prefix, stepFn) {
+  const fpsInput = document.getElementById(`${prefix}-fps-input`);
+  const fps = Math.max(0.5, parseFloat(fpsInput.value) || 2);
+  state.playIntervals[prefix] = setInterval(stepFn, 1000 / fps);
+  document.getElementById(`${prefix}-play-pause`).innerHTML = "&#10074;&#10074; Pause";
+}
+
+// Index of `frame` within `state.frameNumbers` (the actual, possibly sparse,
+// frame numbers with data) -- -1 falls back to 0 rather than propagating.
+function frameIndex(frame) {
+  const idx = state.frameNumbers.indexOf(frame);
+  return idx === -1 ? 0 : idx;
+}
+
+// `prefix` derives every control's id (`${prefix}-first-frame`, `-prev-frame`,
+// `-play-pause`, `-fps-input`, `-next-frame`, `-last-frame`) -- every frame-nav
+// in index.html already follows this naming convention. Steps through
+// `state.frameNumbers` by index rather than `frame +/- 1` -- some datasets'
+// frame numbers are sparse (e.g. `[1, 9, 19]`, see `get_frame_numbers`
+// docstring), so `frame + 1` is not reliably a valid next frame.
+function wireFrameNav(prefix, getFrame, setFrame, showFn) {
+  const goFirst = () => {
+    stopAutoplay(prefix);
+    const f = state.frameNumbers[0];
+    if (f === undefined) return;
     setFrame(f);
     showFn(f);
-  });
-  document.getElementById(nextId).addEventListener("click", () => {
-    const f = Math.min(state.frameCount || Infinity, getFrame() + 1);
+  };
+  const goPrev = () => {
+    const idx = Math.max(0, frameIndex(getFrame()) - 1);
+    const f = state.frameNumbers[idx];
+    if (f === undefined) return;
     setFrame(f);
     showFn(f);
+  };
+  const goNext = () => {
+    const idx = Math.min(state.frameNumbers.length - 1, frameIndex(getFrame()) + 1);
+    const f = state.frameNumbers[idx];
+    if (f === undefined) return;
+    setFrame(f);
+    showFn(f);
+    if (idx >= state.frameNumbers.length - 1) stopAutoplay(prefix);
+  };
+  const goLast = () => {
+    stopAutoplay(prefix);
+    const f = state.frameNumbers[state.frameNumbers.length - 1];
+    if (f === undefined) return;
+    setFrame(f);
+    showFn(f);
+  };
+
+  document.getElementById(`${prefix}-first-frame`).addEventListener("click", goFirst);
+  document.getElementById(`${prefix}-prev-frame`).addEventListener("click", () => { stopAutoplay(prefix); goPrev(); });
+  document.getElementById(`${prefix}-next-frame`).addEventListener("click", () => { stopAutoplay(prefix); goNext(); });
+  document.getElementById(`${prefix}-last-frame`).addEventListener("click", goLast);
+
+  document.getElementById(`${prefix}-play-pause`).addEventListener("click", () => {
+    if (state.playIntervals[prefix]) {
+      stopAutoplay(prefix);
+    } else {
+      startAutoplay(prefix, goNext);
+    }
   });
+  document.getElementById(`${prefix}-fps-input`).addEventListener("change", () => {
+    if (state.playIntervals[prefix]) {
+      stopAutoplay(prefix);
+      startAutoplay(prefix, goNext);
+    }
+  });
+}
+
+// `prefix` derives `${prefix}-zoom-in/out/reset/level/slider`; `imgId` is
+// the `<img>` being zoomed. 100% keeps today's default fit-to-container
+// look (CSS max-width:100%); any other level sets an explicit pixel width
+// off the image's natural size AND clears max-width (a large image's
+// zoomed width would otherwise still get clamped back down to the
+// container by the CSS max-width:100% rule -- that was the original bug),
+// so `.image-click-wrap`'s overflow:auto scrolls it. Persists across frame
+// navigation for free since a new frame's `src` doesn't reset the
+// element's inline `style.width`. Also wires click-drag panning inside the
+// wrap: a real drag (movement past a small threshold) scrolls the wrap and
+// swallows the resulting `click` so it doesn't misfire the section's
+// click-to-select-cell handler; a plain click (no movement) passes through
+// untouched.
+function wireZoom(prefix, imgId) {
+  const img = document.getElementById(imgId);
+  const levelEl = document.getElementById(`${prefix}-zoom-level`);
+  const slider = document.getElementById(`${prefix}-zoom-slider`);
+  const wrap = img.closest(".image-click-wrap");
+  state.zoomLevels[prefix] = 100;
+
+  const setZoom = (percent) => {
+    percent = Math.max(25, Math.min(400, percent));
+    state.zoomLevels[prefix] = percent;
+    if (percent === 100) {
+      img.style.width = "";
+      img.style.maxWidth = "";
+    } else {
+      img.style.maxWidth = "none";
+      if (img.naturalWidth) img.style.width = `${Math.round(img.naturalWidth * percent / 100)}px`;
+    }
+    levelEl.textContent = `${percent}%`;
+    slider.value = percent;
+  };
+
+  document.getElementById(`${prefix}-zoom-in`).addEventListener("click", () => setZoom(state.zoomLevels[prefix] + 25));
+  document.getElementById(`${prefix}-zoom-out`).addEventListener("click", () => setZoom(state.zoomLevels[prefix] - 25));
+  document.getElementById(`${prefix}-zoom-reset`).addEventListener("click", () => setZoom(100));
+  slider.addEventListener("input", () => setZoom(parseInt(slider.value, 10)));
+
+  let dragging = false;
+  let dragged = false;
+  let startX = 0, startY = 0, startScrollLeft = 0, startScrollTop = 0;
+
+  img.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    dragging = true;
+    dragged = false;
+    startX = e.clientX;
+    startY = e.clientY;
+    startScrollLeft = wrap.scrollLeft;
+    startScrollTop = wrap.scrollTop;
+    e.preventDefault(); // suppress the browser's native image-drag ghost
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragged = true;
+    wrap.scrollLeft = startScrollLeft - dx;
+    wrap.scrollTop = startScrollTop - dy;
+  });
+  window.addEventListener("mouseup", () => { dragging = false; });
+  img.addEventListener("click", (e) => {
+    if (dragged) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      dragged = false;
+    }
+  }, true);
 }
 
 function init() {
@@ -540,11 +791,14 @@ function init() {
   document.getElementById("browse-image-folder").addEventListener("click", () => browseInto("image-folder-input", "Select images folder"));
   document.getElementById("browse-output-folder").addEventListener("click", () => browseInto("output-folder-input", "Select output folder"));
   document.getElementById("set-project-btn").addEventListener("click", handleSetProject);
+  document.getElementById("load-existing-btn").addEventListener("click", handleLoadExistingResults);
+  document.getElementById("start-fresh-btn").addEventListener("click", handleStartFresh);
 
   // Extract
   document.getElementById("start-extraction-btn").addEventListener("click", handleStartExtraction);
   document.getElementById("extract-preview-img").addEventListener("click", () => {}); // raw preview, no click action
-  wireFrameNav("extract-prev-frame", "extract-next-frame", () => state.extractFrame, (f) => (state.extractFrame = f), showExtractFrame);
+  wireFrameNav("extract", () => state.extractFrame, (f) => (state.extractFrame = f), showExtractFrame);
+  wireZoom("extract", "extract-preview-img");
   document.getElementById("go-to-classify").addEventListener("click", () => goToStep("classify"));
   document.getElementById("skip-classification").addEventListener("click", async () => {
     enableStep("track");
@@ -566,23 +820,32 @@ function init() {
     await window.EpiQuantAPI.save_classification();
     setStatus("classify-status", "Saved.", "success");
   });
-  wireFrameNav("classify-prev-frame", "classify-next-frame", () => state.classifyFrame, (f) => (state.classifyFrame = f), showClassifyFrame);
+  wireFrameNav("classify", () => state.classifyFrame, (f) => (state.classifyFrame = f), showClassifyFrame);
+  wireZoom("classify", "classify-overlay-img");
+  wireRenderMode("classify", () => showClassifyFrame(state.classifyFrame));
   document.getElementById("classify-overlay-img").addEventListener("click", handleClassifyImageClick);
   document.getElementById("go-to-correct-classification").addEventListener("click", async () => {
     goToStep("correct-classification");
     await showCorrectClassFrame(state.classifyFrame);
   });
   document.getElementById("compute-leading-edge-btn").addEventListener("click", handleComputeLeadingEdge);
+  document.getElementById("show-cluster-borders-toggle").addEventListener("change", async (e) => {
+    await window.EpiQuantAPI.set_show_cluster_borders(e.target.checked);
+    await showClassifyFrame(state.classifyFrame);
+  });
+  document.getElementById("border-color-input").addEventListener("change", async (e) => {
+    await window.EpiQuantAPI.set_border_color(e.target.value);
+    await showClassifyFrame(state.classifyFrame);
+  });
   document.getElementById("go-to-track-from-classify").addEventListener("click", async () => {
     goToStep("track");
     await enterTrackStep();
   });
 
   // Correct Classification
-  wireFrameNav(
-    "correct-class-prev-frame", "correct-class-next-frame",
-    () => state.correctClassFrame, (f) => (state.correctClassFrame = f), showCorrectClassFrame
-  );
+  wireFrameNav("correct-class", () => state.correctClassFrame, (f) => (state.correctClassFrame = f), showCorrectClassFrame);
+  wireZoom("correct-class", "correct-class-overlay-img");
+  wireRenderMode("correct-class", () => showCorrectClassFrame(state.correctClassFrame));
   document.getElementById("correct-class-overlay-img").addEventListener("click", handleCorrectClassImageClick);
   document.getElementById("save-correction-classification-btn").addEventListener("click", handleSaveClassificationCorrections);
   document.getElementById("done-correcting-classification").addEventListener("click", async () => {
@@ -596,21 +859,29 @@ function init() {
   document.getElementById("go-to-trajectory").addEventListener("click", enterTrajectoryStep);
 
   // Correct Tracking
-  wireFrameNav(
-    "correct-track-prev-frame", "correct-track-next-frame",
-    () => state.correctTrackFrame, (f) => (state.correctTrackFrame = f), showCorrectTrackFrame
-  );
+  wireFrameNav("correct-track", () => state.correctTrackFrame, (f) => (state.correctTrackFrame = f), showCorrectTrackFrame);
+  wireZoom("correct-track", "correct-track-overlay-img");
+  wireRenderMode("correct-track", () => showCorrectTrackFrame(state.correctTrackFrame));
   document.getElementById("correct-track-overlay-img").addEventListener("click", handleCorrectTrackImageClick);
   document.getElementById("apply-track-correction-btn").addEventListener("click", handleApplyTrackCorrection);
   document.getElementById("save-tracking-btn").addEventListener("click", handleSaveTrackingCorrections);
   document.getElementById("done-correcting-tracking").addEventListener("click", enterTrajectoryStep);
+  document.getElementById("matched-color-input").addEventListener("change", async (e) => {
+    await window.EpiQuantAPI.set_track_colors(e.target.value, document.getElementById("unmatched-color-input").value);
+    await showCorrectTrackFrame(state.correctTrackFrame);
+  });
+  document.getElementById("unmatched-color-input").addEventListener("change", async (e) => {
+    await window.EpiQuantAPI.set_track_colors(document.getElementById("matched-color-input").value, e.target.value);
+    await showCorrectTrackFrame(state.correctTrackFrame);
+  });
 
   // Trajectory
-  document.getElementById("track-number-select").addEventListener("change", handleTrackNumberChange);
-  wireFrameNav(
-    "trajectory-prev-frame", "trajectory-next-frame",
-    () => state.trajectoryFrame, (f) => (state.trajectoryFrame = f), showTrajectoryFrame
-  );
+  document.getElementById("track-number-input").addEventListener("change", handleTrackNumberInputChange);
+  document.getElementById("trajectory-prev-track").addEventListener("click", handlePrevTrack);
+  document.getElementById("trajectory-next-track").addEventListener("click", handleNextTrack);
+  wireFrameNav("trajectory", () => state.trajectoryFrame, (f) => (state.trajectoryFrame = f), showTrajectoryFrame);
+  wireZoom("trajectory", "trajectory-overlay-img");
+  wireRenderMode("trajectory", () => showTrajectoryFrame(state.trajectoryFrame));
 
   // Global callbacks pushed from Python via window.evaluate_js
   window.onProgress = onProgress;
