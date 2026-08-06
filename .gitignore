@@ -1,9 +1,18 @@
-CLAUDE.local.md
-CLAUDE.md
+# system files
 .DS_Store
-.claude
-.vscode
+.vscode/
+.idea/
 .github
-.idea
-__pycache__
-EPI_Quant.code-workspace
+*.code-workspace
+
+# Claude
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+
+# Python
+__pycache__/
+*.pyc
+
+# Output of test data generation (ignored at any directory depth)
+test_data/tmp/
