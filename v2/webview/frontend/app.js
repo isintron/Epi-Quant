@@ -766,6 +766,7 @@ function wireZoom(prefix, imgId) {
   document.getElementById(`${prefix}-zoom-out`).addEventListener("click", () => setZoom(state.zoomLevels[prefix] - 25));
   document.getElementById(`${prefix}-zoom-reset`).addEventListener("click", () => setZoom(100));
   slider.addEventListener("input", () => setZoom(parseInt(slider.value, 10)));
+  slider.addEventListener("wheel", (e) => e.stopPropagation()); // let the slider keep its own native wheel-drag; only the image below should scroll frames
 
   let dragging = false;
   let dragged = false;
@@ -799,6 +800,28 @@ function wireZoom(prefix, imgId) {
   }, true);
 }
 
+// Mouse-wheel-over-the-image steps through frames (scroll down = next,
+// scroll up = prev), reusing the same image `wireZoom` already wires up
+// rather than adding a separate control. Debounced to one frame per ~120ms
+// so a single wheel notch/trackpad flick doesn't skip several frames --
+// mice fire one coarse deltaY per notch, but trackpads fire many small
+// deltas per gesture. `preventDefault()` stops the browser's native
+// scroll-the-overflowing-container behavior that would otherwise fire here
+// once zoomed in; panning while zoomed still works via click-drag.
+function wireFrameWheel(prefix, imgId) {
+  const img = document.getElementById(imgId);
+  let cooling = false;
+  img.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (cooling) return;
+    cooling = true;
+    setTimeout(() => { cooling = false; }, 120);
+    const btnId = e.deltaY > 0 ? `${prefix}-next-frame` : `${prefix}-prev-frame`;
+    const btn = document.getElementById(btnId);
+    if (btn) btn.click();
+  }, { passive: false });
+}
+
 function init() {
   if (window.usingMockApi) {
     document.getElementById("mock-banner").style.display = "block";
@@ -822,6 +845,7 @@ function init() {
   document.getElementById("extract-preview-img").addEventListener("click", () => {}); // raw preview, no click action
   wireFrameNav("extract", () => state.extractFrame, (f) => (state.extractFrame = f), showExtractFrame);
   wireZoom("extract", "extract-preview-img");
+  wireFrameWheel("extract", "extract-preview-img");
   document.getElementById("go-to-classify").addEventListener("click", () => goToStep("classify"));
   document.getElementById("skip-classification").addEventListener("click", async () => {
     enableStep("track");
@@ -845,6 +869,7 @@ function init() {
   });
   wireFrameNav("classify", () => state.classifyFrame, (f) => (state.classifyFrame = f), showClassifyFrame);
   wireZoom("classify", "classify-overlay-img");
+  wireFrameWheel("classify", "classify-overlay-img");
   wireRenderMode("classify", () => showClassifyFrame(state.classifyFrame));
   document.getElementById("classify-overlay-img").addEventListener("click", handleClassifyImageClick);
   document.getElementById("go-to-correct-classification").addEventListener("click", async () => {
@@ -868,6 +893,7 @@ function init() {
   // Correct Classification
   wireFrameNav("correct-class", () => state.correctClassFrame, (f) => (state.correctClassFrame = f), showCorrectClassFrame);
   wireZoom("correct-class", "correct-class-overlay-img");
+  wireFrameWheel("correct-class", "correct-class-overlay-img");
   wireRenderMode("correct-class", () => showCorrectClassFrame(state.correctClassFrame));
   document.getElementById("correct-class-overlay-img").addEventListener("click", handleCorrectClassImageClick);
   document.getElementById("save-correction-classification-btn").addEventListener("click", handleSaveClassificationCorrections);
@@ -884,6 +910,7 @@ function init() {
   // Correct Tracking
   wireFrameNav("correct-track", () => state.correctTrackFrame, (f) => (state.correctTrackFrame = f), showCorrectTrackFrame);
   wireZoom("correct-track", "correct-track-overlay-img");
+  wireFrameWheel("correct-track", "correct-track-overlay-img");
   wireRenderMode("correct-track", () => showCorrectTrackFrame(state.correctTrackFrame));
   document.getElementById("correct-track-show-labels").addEventListener("change", () => showCorrectTrackFrame(state.correctTrackFrame));
   wireColorMode("correct-track", () => {
@@ -912,6 +939,7 @@ function init() {
   document.getElementById("trajectory-next-track").addEventListener("click", handleNextTrack);
   wireFrameNav("trajectory", () => state.trajectoryFrame, (f) => (state.trajectoryFrame = f), showTrajectoryFrame);
   wireZoom("trajectory", "trajectory-overlay-img");
+  wireFrameWheel("trajectory", "trajectory-overlay-img");
   wireRenderMode("trajectory", () => showTrajectoryFrame(state.trajectoryFrame));
 
   // Global callbacks pushed from Python via window.evaluate_js
