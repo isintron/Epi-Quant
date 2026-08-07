@@ -221,6 +221,19 @@ function wireRenderMode(prefix, onChange) {
   });
 }
 
+// `${prefix}-color-mode` radio group -- "uniform" (matched/unmatched colors,
+// default) or "identity" (each track its own viridis color, rank-normalized).
+function getColorMode(prefix) {
+  const checked = document.querySelector(`input[name="${prefix}-color-mode"]:checked`);
+  return checked ? checked.value : "uniform";
+}
+
+function wireColorMode(prefix, onChange) {
+  document.querySelectorAll(`input[name="${prefix}-color-mode"]`).forEach((el) => {
+    el.addEventListener("change", onChange);
+  });
+}
+
 async function showExtractFrame(frame) {
   state.extractFrame = frame;
   document.getElementById("extract-frame-label").textContent = frameLabel(frame);
@@ -479,7 +492,8 @@ async function handleStartTracking() {
 }
 
 async function onTrackDone(data) {
-  setStatus("track-status", `Done: ${data.track_count} tracks.`, "success");
+  const dupNote = data.duplicates_cleaned ? ` (cleaned ${data.duplicates_cleaned} duplicate track claims from this file)` : "";
+  setStatus("track-status", `Done: ${data.track_count} tracks.${dupNote}`, "success");
   document.getElementById("start-tracking-btn").disabled = false;
   document.getElementById("track-next-choices").style.display = "flex";
   enableStep("correct-tracking");
@@ -510,7 +524,11 @@ function onTrackError(data) {
 async function showCorrectTrackFrame(frame) {
   state.correctTrackFrame = frame;
   document.getElementById("correct-track-frame-label").textContent = frameLabel(frame);
-  const img = await window.EpiQuantAPI.get_tracking_overlay(frame, getRenderMode("correct-track"));
+  const showLabels = document.getElementById("correct-track-show-labels").checked;
+  const identityPalette = document.getElementById("correct-track-identity-palette-select").value;
+  const img = await window.EpiQuantAPI.get_tracking_overlay(
+    frame, getRenderMode("correct-track"), showLabels, getColorMode("correct-track"), identityPalette
+  );
   if (img) document.getElementById("correct-track-overlay-img").src = img;
   document.getElementById("correct-track-selected-cell").textContent = "";
   document.getElementById("correct-track-reassign").style.display = "none";
@@ -534,6 +552,7 @@ async function handleCorrectTrackImageClick(event) {
     : `${result.cell_index}: unmatched (raw cell id ${result.cell_id}).`;
   document.getElementById("correct-track-reassign").style.display = "flex";
   document.getElementById("new-track-id-input").value = "";
+  document.getElementById("propagate-correction-checkbox").checked = false;
 }
 
 async function handleApplyTrackCorrection() {
@@ -545,11 +564,15 @@ async function handleApplyTrackCorrection() {
   }
 
   const isMatched = state.selectedTrackCell.track_id !== null && state.selectedTrackCell.track_id !== undefined;
+  const correctedCellIndex = state.selectedTrackCell.cell_index;
   let result;
   if (isMatched) {
-    result = await window.EpiQuantAPI.reassign_track(state.correctTrackFrame, state.selectedTrackCell.track_id, newId);
+    const propagate = document.getElementById("propagate-correction-checkbox").checked;
+    result = await window.EpiQuantAPI.reassign_track(
+      state.correctTrackFrame, state.selectedTrackCell.track_id, newId, propagate
+    );
   } else {
-    result = await window.EpiQuantAPI.add_tracking_id(state.correctTrackFrame, newId, state.selectedTrackCell.cell_index);
+    result = await window.EpiQuantAPI.add_tracking_id(state.correctTrackFrame, newId, correctedCellIndex);
   }
 
   if (result && result.error) {
@@ -862,6 +885,14 @@ function init() {
   wireFrameNav("correct-track", () => state.correctTrackFrame, (f) => (state.correctTrackFrame = f), showCorrectTrackFrame);
   wireZoom("correct-track", "correct-track-overlay-img");
   wireRenderMode("correct-track", () => showCorrectTrackFrame(state.correctTrackFrame));
+  document.getElementById("correct-track-show-labels").addEventListener("change", () => showCorrectTrackFrame(state.correctTrackFrame));
+  wireColorMode("correct-track", () => {
+    const isIdentity = getColorMode("correct-track") === "identity";
+    document.getElementById("correct-track-uniform-colors").style.display = isIdentity ? "none" : "flex";
+    document.getElementById("correct-track-identity-palette").style.display = isIdentity ? "flex" : "none";
+    showCorrectTrackFrame(state.correctTrackFrame);
+  });
+  document.getElementById("correct-track-identity-palette-select").addEventListener("change", () => showCorrectTrackFrame(state.correctTrackFrame));
   document.getElementById("correct-track-overlay-img").addEventListener("click", handleCorrectTrackImageClick);
   document.getElementById("apply-track-correction-btn").addEventListener("click", handleApplyTrackCorrection);
   document.getElementById("save-tracking-btn").addEventListener("click", handleSaveTrackingCorrections);

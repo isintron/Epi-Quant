@@ -103,6 +103,54 @@ def update_tracking_data(
     return tracking_data
 
 
+def merge_tracks_from_frame(
+    tracking_data: pd.DataFrame, frame_number: int, old_id: int, new_id: int,
+) -> pd.DataFrame:
+    """From `frame_number` onward (inclusive), move every cell currently
+    claimed by track `old_id` onto track `new_id` instead, clearing
+    `old_id`'s claim for those frames. `frame_number` itself is included,
+    so this alone both corrects that frame and propagates the correction
+    forward -- no separate `update_tracking_data` call needed first.
+
+    Use when a single-frame mismatch cascades: track `old_id` picks up a
+    cell at `frame_number` that's actually the continuation of track
+    `new_id` (e.g. `new_id` lost its own match there), and every frame
+    after that stays wrongly attached to `old_id` too, since the Hungarian
+    matching just keeps extending whichever track a cell already belongs
+    to. Correcting only `frame_number` (`update_tracking_data`) fixes one
+    frame but leaves the tracks split for the rest of the sequence;
+    merging from `frame_number` onward reunites them.
+
+    Frames before `frame_number` are untouched on both tracks -- if
+    `old_id` was a genuinely different track before the mismatch, its
+    earlier history is preserved under `old_id`, only its future is
+    reassigned. Returns `tracking_data` (mutated in place and returned for
+    convenience).
+
+    Raises `ValueError` if `old_id`/`new_id` aren't found in `tracking_data`'s
+    `Index` column.
+    """
+    id_col = tracking_data.columns[0]
+    frame_cols = [c for c in tracking_data.columns if c.startswith("Frame")]
+    later_cols = [c for c in frame_cols if int(c[len("Frame"):]) >= frame_number]
+
+    old_rows = tracking_data.index[tracking_data[id_col] == int(old_id)]
+    new_rows = tracking_data.index[tracking_data[id_col] == int(new_id)]
+    if old_rows.empty:
+        raise ValueError(f"Track {old_id} not found in the tracking data.")
+    if new_rows.empty:
+        raise ValueError(f"Track {new_id} not found in the tracking data.")
+    old_pos, new_pos = old_rows[0], new_rows[0]
+
+    for col in later_cols:
+        value = tracking_data.at[old_pos, col]
+        if pd.notna(value):
+            tracking_data.at[new_pos, col] = value
+            tracking_data.at[old_pos, col] = None
+
+    return tracking_data
+
+
 def add_tracking_id(
     tracking_data: pd.DataFrame, frame_number: int, new_index: int, cell_id_str: str,
 ) -> pd.DataFrame:

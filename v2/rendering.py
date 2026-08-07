@@ -33,6 +33,7 @@ the API boundary.
 """
 
 import base64
+import colorsys
 from io import BytesIO
 from typing import Optional
 
@@ -68,6 +69,40 @@ def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     """`"#rrggbb"` (or `"rrggbb"`) -> `(r, g, b)` ints 0-255."""
     hex_color = hex_color.lstrip("#")
     return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _golden_angle_colors(n: int) -> list[tuple[int, int, int]]:
+    """`n` maximally-distinct RGB colors via the golden-angle HSV hue
+    rotation (hue advances ~137.508 degrees per label, wrapped mod 360) --
+    MorpholibJ's default "Golden angle" LUT for label/instance images,
+    reused here since it (unlike a small fixed qualitative palette) never
+    visibly repeats even across hundreds of labels.
+    """
+    golden_angle = 137.508
+    colors = []
+    for i in range(n):
+        hue = (i * golden_angle) % 360
+        r, g, b = colorsys.hsv_to_rgb(hue / 360, 0.65, 0.95)
+        colors.append((int(r * 255), int(g * 255), int(b * 255)))
+    return colors
+
+
+def assign_identity_colors(track_ids: list, palette: str = "golden_angle") -> dict[object, tuple[int, int, int]]:
+    """Map each id in `track_ids` to a distinct RGB color. `palette` is
+    either `"golden_angle"` (see `_golden_angle_colors`, scales to any
+    count without visibly repeating) or one of `PALETTE_PRESET_NAMES` (the
+    same qualitative presets used for cluster colors elsewhere; cycles once
+    there are more ids than palette entries).
+    """
+    n = len(track_ids)
+    if palette == "golden_angle":
+        colors = _golden_angle_colors(n)
+    else:
+        cmap = colormaps[palette]
+        raw_colors = cmap.colors if hasattr(cmap, "colors") else [cmap(i) for i in range(cmap.N)]
+        base_rgb = [tuple(int(c * 255) for c in col[:3]) for col in raw_colors]
+        colors = [base_rgb[i % len(base_rgb)] for i in range(n)]
+    return dict(zip(track_ids, colors))
 
 
 def load_base_image(npy_dict: dict, image_folder: Optional[str], frame_number: int) -> np.ndarray:
@@ -153,6 +188,8 @@ def render_tracking_overlay(
     matched_color: str,
     unmatched_color: str,
     label_cells: bool = True,
+    track_color_mode: str = "uniform",
+    identity_palette: str = "golden_angle",
 ) -> Image.Image:
     """Tint each cell by whether it's matched (present in `tracking_data`'s
     `Frame{frame_number}` column) or unmatched, generalizing v1's
@@ -161,15 +198,37 @@ def render_tracking_overlay(
     `Index` (matched cells) or the raw `cell_id` (unmatched cells -- so the
     user has something to reference when assigning it to a track) at each
     cell's centroid.
+
+    `track_color_mode`: `"uniform"` (default) uses `matched_color`/
+    `unmatched_color` as above. `"identity"` instead gives each matched
+    cell its own track's color from `assign_identity_colors` (`palette`
+    either `"golden_angle"`, the default -- scales to any track count
+    without visibly repeating -- or one of `PALETTE_PRESET_NAMES`, cycled),
+    so individual cells/tracks are visually distinguishable at a glance
+    rather than all matched cells sharing one color; unmatched cells still
+    get `unmatched_color`.
     """
     img = base_image.copy()
     frame_col = f"Frame{frame_number}"
     id_col = tracking_data.columns[0]
 
+    # First-claim-wins, matching `api.py`'s `get_tracking_cell_at_pixel`
+    # (`match.iloc[0]`) -- a legacy tracking file predating the
+    # `_merge_tracking_pairs` fix could still have two rows claiming the
+    # same cell; resolving both lookups the same way keeps which track
+    # "wins" consistent between clicking a cell and reading its on-image
+    # label, instead of one being first-match and the other silently being
+    # last-match (a dict overwrite via `.iterrows()`).
     matched_lookup: dict[str, object] = {}
     if frame_col in tracking_data.columns:
         for _, row in tracking_data[[id_col, frame_col]].dropna(subset=[frame_col]).iterrows():
-            matched_lookup[row[frame_col]] = row[id_col]
+            if row[frame_col] not in matched_lookup:
+                matched_lookup[row[frame_col]] = row[id_col]
+
+    identity_color_by_track: dict[object, tuple[int, int, int]] = {}
+    if track_color_mode == "identity":
+        all_track_ids = sorted(tracking_data[id_col].dropna().unique())
+        identity_color_by_track = assign_identity_colors(all_track_ids, identity_palette)
 
     labels: list[tuple[int, int, str]] = []
     for cell_id in np.unique(outlines):
@@ -178,7 +237,11 @@ def render_tracking_overlay(
         cell_index = f"Cell{frame_number}_{cell_id}"
         track_id = matched_lookup.get(cell_index)
         is_matched = track_id is not None
-        img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)
+
+        if is_matched and track_color_mode == "identity":
+            img[outlines == cell_id] = identity_color_by_track[track_id]
+        else:
+            img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)
 
         if label_cells:
             positions = np.where(outlines == cell_id)

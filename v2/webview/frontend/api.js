@@ -56,7 +56,7 @@
       return { cluster_sizes: { cluster_1: 120, cluster_2: 30 }, k_used: 2 };
     },
     async load_existing_tracking() {
-      return { track_count: mockState.trackNumbers.length };
+      return { track_count: mockState.trackNumbers.length, duplicates_cleaned: 0 };
     },
     async start_extraction(_maskType, _bgRatio, _excludeEdge) {
       (async () => {
@@ -137,13 +137,13 @@
       })();
       return true;
     },
-    async get_tracking_overlay(_frame, _renderMode) {
+    async get_tracking_overlay(_frame, _renderMode, _showLabels, _colorMode, _identityPalette) {
       return MOCK_PNG;
     },
     async get_tracking_cell_at_pixel(frame, _x, _y) {
       return { cell_index: `Cell${frame}_1`, cell_id: 1, track_id: 1 };
     },
-    async reassign_track(_frame, _oldId, _newId) {
+    async reassign_track(_frame, _oldId, _newId, _propagate) {
       return { success: true };
     },
     async add_tracking_id(_frame, _newIndex, _cellIdStr) {

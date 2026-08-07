@@ -214,14 +214,20 @@ class EpiQuantAPI:
 
     def load_existing_tracking(self) -> dict:
         """Load a previously written `all_cell_merged_tracking_results.xlsx`
-        instead of re-running the Hungarian-tracking pipeline."""
+        instead of re-running the Hungarian-tracking pipeline. Files written
+        before the `_merge_tracking_pairs` fix (see `cell_tracking.py`) can
+        carry duplicate/ambiguous claims on a single cell -- clean those up
+        on load (in memory only; not written back to disk unless the user
+        later hits Save Corrections) and report the count so the frontend
+        can surface a notice."""
         path = os.path.join(
             self.output_dirs["cell_track_output"], "all_cell_tracking", "all_cell_merged_tracking_results.xlsx",
         )
         tracking_df = pd.read_excel(path)
+        tracking_df, duplicates_cleaned = cell_tracking.dedupe_tracking_data(tracking_df)
         self.tracking_data = tracking_df
         self.original_tracking_data = tracking_df.copy()
-        return {"track_count": int(len(tracking_df))}
+        return {"track_count": int(len(tracking_df)), "duplicates_cleaned": duplicates_cleaned}
 
     # ---- Extract --------------------------------------------------------
 
@@ -507,7 +513,10 @@ class EpiQuantAPI:
         self.matched_color = matched_color
         self.unmatched_color = unmatched_color
 
-    def get_tracking_overlay(self, frame_number: int, render_mode: str = "mask") -> Optional[str]:
+    def get_tracking_overlay(
+        self, frame_number: int, render_mode: str = "mask", show_labels: bool = True,
+        track_color_mode: str = "uniform", identity_palette: str = "golden_angle",
+    ) -> Optional[str]:
         if self.tracking_data is None:
             return None
         loaded = self._load_frame(frame_number)
@@ -517,6 +526,7 @@ class EpiQuantAPI:
         label_array = boundary_labels if render_mode == "outline" else fill_labels
         overlay = rendering.render_tracking_overlay(
             label_array, base_image, frame_number, self.tracking_data, self.matched_color, self.unmatched_color,
+            label_cells=show_labels, track_color_mode=track_color_mode, identity_palette=identity_palette,
         )
         return rendering.encode_png_base64(overlay)
 
@@ -537,11 +547,22 @@ class EpiQuantAPI:
                 track_id = int(match.iloc[0, 0])
         return {"cell_index": cell_index, "cell_id": int(cell_id), "track_id": track_id}
 
-    def reassign_track(self, frame_number: int, old_id: int, new_id: int) -> dict:
+    def reassign_track(self, frame_number: int, old_id: int, new_id: int, propagate: bool = False) -> dict:
+        """`propagate=True` merges `old_id`'s cells from `frame_number`
+        onward into `new_id` (`manual_correction_tracking
+        .merge_tracks_from_frame`) instead of only fixing that one frame --
+        for a mismatch that cascades forward (a wrong track number that
+        then keeps extending itself frame after frame), a single-frame fix
+        leaves every later frame still wrongly attached to `old_id`."""
         try:
-            manual_correction_tracking.update_tracking_data(
-                self.tracking_data, self.original_tracking_data, int(frame_number), int(old_id), int(new_id),
-            )
+            if propagate:
+                manual_correction_tracking.merge_tracks_from_frame(
+                    self.tracking_data, int(frame_number), int(old_id), int(new_id),
+                )
+            else:
+                manual_correction_tracking.update_tracking_data(
+                    self.tracking_data, self.original_tracking_data, int(frame_number), int(old_id), int(new_id),
+                )
             return {"success": True}
         except ValueError as e:
             return {"error": str(e)}

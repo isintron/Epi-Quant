@@ -224,9 +224,25 @@
   <section id="step-correct-tracking" class="step-section">
     <h2>Correct Tracking</h2>
     <p class="hint">Click a cell to inspect its track. Matched/unmatched colors are set below.</p>
-    <div class="field-row">
+    <div class="render-mode-controls">
+      <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="uniform" checked> Matched/Unmatched colors</label>
+      <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="identity"> Cell identity</label>
+    </div>
+    <div class="field-row" id="correct-track-uniform-colors">
       <label>Matched color <input type="color" id="matched-color-input" value="#ffd633"></label>
       <label>Unmatched color <input type="color" id="unmatched-color-input" value="#3388ff"></label>
+    </div>
+    <div class="field-row" id="correct-track-identity-palette" style="display:none">
+      <label>LUT
+        <select id="correct-track-identity-palette-select">
+          <option value="golden_angle" selected>Golden Angle</option>
+          <option value="tab10">tab10</option>
+          <option value="Set2">Set2</option>
+          <option value="Dark2">Dark2</option>
+          <option value="Paired">Paired</option>
+          <option value="tab20">tab20</option>
+        </select>
+      </label>
     </div>
     <div class="frame-nav">
       <button id="correct-track-first-frame" class="secondary-btn">|&larr; First</button>
@@ -247,6 +263,7 @@
     <div class="render-mode-controls">
       <label class="radio-label"><input type="radio" name="correct-track-render-mode" value="mask" checked> Filled mask</label>
       <label class="radio-label"><input type="radio" name="correct-track-render-mode" value="outline"> Outlines</label>
+      <label class="checkbox-label"><input type="checkbox" id="correct-track-show-labels" checked> Show cell labels</label>
     </div>
     <div class="image-click-wrap"><img id="correct-track-overlay-img" class="frame-preview"></div>
     <div id="correct-track-selected-cell" class="status-line"></div>
@@ -254,6 +271,7 @@
     <div id="correct-track-reassign" class="field-row" style="display:none">
       <label>Reassign to track #</label>
       <input type="number" id="new-track-id-input" class="small-input">
+      <label class="checkbox-label"><input type="checkbox" id="propagate-correction-checkbox"> Propagate to later frames</label>
       <button id="apply-track-correction-btn" class="secondary-btn">Apply</button>
     </div>
 

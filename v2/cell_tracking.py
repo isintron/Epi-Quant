@@ -125,11 +125,31 @@ def load_and_process_data(file_path: str) -> pd.DataFrame:
     return data
 
 
-def _merge_tracking_pairs(frame_output_dir: str, folder_prefix: str) -> pd.DataFrame:
+def _merge_tracking_pairs(frame_output_dir: str, folder_prefix: str, start_index: int) -> pd.DataFrame:
     """Stitch all `{folder_prefix}Matching_Results_new_{i}_{i+1}.xlsx` files
     in `frame_output_dir` into one wide `Index, Frame{start}..Frame{last}`
     DataFrame, writes `{folder_prefix}merged_tracking_results.xlsx`, and
-    returns it. Ported from src/gui_main.py:1762-1803."""
+    returns it.
+
+    Incremental "open tracks" stitch — walks pair files in ascending frame
+    order, keeping a mapping of "cell string at the current end of an open
+    track" -> that track's row. A cell that continues an open track extends
+    that row; a cell with no open track (including every cell at the very
+    first pair, where no tracks are open yet) starts a brand-new track.
+
+    Replaces the originally-ported "seed a table from the first pair file,
+    then look up later pairs by value" approach (src/gui_main.py:1762-1803),
+    which had two bugs: (1) a cell whose first valid match was at frame
+    i > start had no row to attach to yet and was silently dropped — cells
+    first appearing mid-movie were never tracked; (2) `Index` numbering was
+    inherited from the first pair file's own provisional numbers, which
+    only ever covered frame-1-onward tracks. `Index` is assigned once here,
+    over the complete stitched set, and duplicate/ambiguous claims on a
+    single physical cell can't arise by construction: each pair file's own
+    second-frame values are already unique (Hungarian assignment gives each
+    column at most one row), and `open_tracks` is consumed via `.pop()`, so
+    no cell string can ever be attached to two different tracks at once.
+    """
     matching_files = [
         f for f in os.listdir(frame_output_dir)
         if re.match(rf"{folder_prefix}Matching_Results_new_\d+_\d+\.xlsx", f)
@@ -137,34 +157,76 @@ def _merge_tracking_pairs(frame_output_dir: str, folder_prefix: str) -> pd.DataF
     matching_frames = sorted(
         set(int(re.search(r"\d+", f).group(0)) for f in matching_files if re.search(r"\d+", f))
     )
-    start_frame = min(matching_frames) if matching_frames else 1
+    if not matching_frames:
+        data_final = pd.DataFrame()
+        data_final.to_excel(os.path.join(frame_output_dir, f"{folder_prefix}merged_tracking_results.xlsx"), index=False)
+        return data_final
+
+    start_frame = min(matching_frames)
     files_count = len(matching_frames)
 
-    if matching_files:
-        first_file_path = os.path.join(
-            frame_output_dir, f"{folder_prefix}Matching_Results_new_{start_frame}_{start_frame + 1}.xlsx"
-        )
-        data_final = load_and_process_data(first_file_path)
-        data_final.columns = ["Index", f"Frame{start_frame}", f"Frame{start_frame + 1}"]
+    tracks: list[dict[str, str]] = []
+    open_tracks: dict[str, int] = {}
 
-        all_new_cols = [f"Frame{i + 1}" for i in range(start_frame + 1, start_frame + files_count - 1)]
-        extra_columns_df = pd.DataFrame({col: [None] * len(data_final) for col in all_new_cols})
-        data_final = pd.concat([data_final, extra_columns_df], axis=1)
+    for i in range(start_frame, start_frame + files_count):
+        pair_path = os.path.join(frame_output_dir, f"{folder_prefix}Matching_Results_new_{i}_{i + 1}.xlsx")
+        if not os.path.exists(pair_path):
+            continue
+        data_next = load_and_process_data(pair_path)
+        data_next.columns = ["Index", f"Frame{i}", f"Frame{i + 1}"]
+        frame_i_col, frame_i1_col = f"Frame{i}", f"Frame{i + 1}"
 
-        for i in range(start_frame + 1, start_frame + files_count - 1):
-            next_file_path = os.path.join(frame_output_dir, f"{folder_prefix}Matching_Results_new_{i}_{i + 1}.xlsx")
-            data_next = load_and_process_data(next_file_path)
-            data_next.columns = ["Index", f"Frame{i}", f"Frame{i + 1}"]
+        for _, row in data_next.iterrows():
+            cell_i, cell_i1 = row[frame_i_col], row[frame_i1_col]
+            if cell_i in open_tracks:
+                track_idx = open_tracks.pop(cell_i)
+            else:
+                track_idx = len(tracks)
+                tracks.append({})
+            tracks[track_idx][frame_i_col] = cell_i
+            tracks[track_idx][frame_i1_col] = cell_i1
+            open_tracks[cell_i1] = track_idx
 
-            for _, row in data_next.iterrows():
-                match_index = data_final[data_final[f"Frame{i}"] == row[f"Frame{i}"]].index
-                if not match_index.empty:
-                    data_final.at[match_index[0], f"Frame{i + 1}"] = row[f"Frame{i + 1}"]
-    else:
-        data_final = pd.DataFrame()
+    frame_columns = [f"Frame{n}" for n in range(start_frame, start_frame + files_count + 1)]
+    data_final = pd.DataFrame(tracks, columns=frame_columns)
+    data_final.insert(0, "Index", range(start_index, start_index + len(data_final)))
 
     data_final.to_excel(os.path.join(frame_output_dir, f"{folder_prefix}merged_tracking_results.xlsx"), index=False)
     return data_final
+
+
+def dedupe_tracking_data(tracking_data: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Repair a tracking table that may have duplicate/ambiguous claims on a
+    single physical cell (possible in files written before the
+    `_merge_tracking_pairs` fix above; fresh tracking runs can't produce
+    these). For every `Frame{n}` column, keeps only the lowest-`Index` row's
+    claim on each cell string and nulls the rest. Returns
+    `(tracking_data, duplicates_removed_count)` -- `tracking_data` is
+    mutated in place and also returned for convenience; the count lets the
+    caller decide whether to surface a notice."""
+    id_col = tracking_data.columns[0]
+    frame_cols = [c for c in tracking_data.columns if c.startswith("Frame")]
+    removed = 0
+
+    for col in frame_cols:
+        seen: dict[str, int] = {}  # cell string -> its lowest-Index row's positional index
+        for pos in tracking_data.index:
+            value = tracking_data.at[pos, col]
+            if pd.isna(value):
+                continue
+            if value not in seen:
+                seen[value] = pos
+                continue
+            # Duplicate claim: keep whichever row has the lower Index, null the other.
+            keep_pos = seen[value]
+            if tracking_data.at[pos, id_col] < tracking_data.at[keep_pos, id_col]:
+                tracking_data.at[keep_pos, col] = None
+                seen[value] = pos
+            else:
+                tracking_data.at[pos, col] = None
+            removed += 1
+
+    return tracking_data, removed
 
 
 def track_cells(
@@ -225,6 +287,7 @@ def track_cells(
 
     if start_index is None:
         start_index = auto_start_index
+    merge_start_index = start_index  # `start_index` below is mutated per-pair; the merge needs the original seed.
 
     frame_output_dir = os.path.join(output_dir, output_subfolder)
     os.makedirs(frame_output_dir, exist_ok=True)
@@ -262,7 +325,7 @@ def track_cells(
         )
         start_index += len(matching_result)
 
-    return _merge_tracking_pairs(frame_output_dir, folder_prefix)
+    return _merge_tracking_pairs(frame_output_dir, folder_prefix, start_index=merge_start_index)
 
 
 def split_by_leading_edge(cells_info: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
