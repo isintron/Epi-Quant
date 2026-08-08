@@ -181,68 +181,290 @@ dropdown) is completely untouched.
 | `pca_kmeans.py`                       | Module 2 — PCA + K-means classification (`gui_main.bio_compute_cell_pca` / `bio_clustering_k_mean`)                      |
 | `manual_correction_classification.py` | Module 4a — classification correction +`leading_edge` computation (`gui_comparison.py`)                                  |
 | `cell_tracking.py`                    | Module 3 — Hungarian-algorithm tracking (`gui_main.run_cell_tracking` + tracking orchestration)                            |
-| `manual_correction_tracking.py`       | Module 4b — tracking correction (`gui_cell_track.py`)                                                                      |
+| `manual_correction_tracking.py`       | Module 4b — tracking correction (`gui_cell_track.py`), plus swap-safe correction / suggest-match / smart-stop propagate (new, see below) |
 | `trajectory_visualization.py`         | Module 5 — trajectory replay + displacement field (`gui_plot_track.py`, `gui_cell_direction.py`) + lifetime-map scaffold |
 | `rendering.py`                        | Overlay compositing for the webview UI (see below) — cluster/tracking/trajectory tinting, click-to-cell pixel lookup, PNG encoding |
+| `adjacency.py`                        | Same-frame cell-adjacency (neighbor) graph via mask-dilation overlap — new, shared by the tracking-correction termination check and `gap_analysis/packing_analysis.py` (see below) |
 | `webview/`                            | The pywebview desktop UI itself (see "pywebview UI" section below)                                                            |
 | `gap_analysis/`                       | Stub modules for manuscript analyses with no v1 implementation (see below)                                                    |
 
 Build/dependency order: `common` → `data_input` → `pca_kmeans` →
 `manual_correction_classification` (parity-check gate here, see below) →
 `cell_tracking` → `manual_correction_tracking` → `trajectory_visualization`.
-`gap_analysis/` has no real dependencies on the above. `rendering.py` depends
-on `data_input.py` only; `webview/` depends on everything.
+`gap_analysis/` has no real dependencies on the above except `packing_analysis.py`,
+which imports `adjacency.py`. `rendering.py` depends on `data_input.py` only;
+`webview/` depends on everything.
+
+## Track-correction improvements: swap safety, match suggestions, smart-stop propagate
+
+Follow-up to the "Propagate to later frames" feature above: cells mismatched
+from the very start of a run can churn through a chain of different wrong
+track IDs frame after frame (e.g. 69 → 63 → 64 …), and a single
+propagate-forward fix only reunites one hand-off point. Four additions to
+`manual_correction_tracking.py` (plus `adjacency.py`, new) address this,
+compared against EPySeg/Tissue Analyzer's tracking-correction code
+(`/Users/a72670/EPySeg`) for design precedent.
+
+**`swap_tracks_at_frame(tracking_data, frame_number, id_a, id_b)`** — fixes a
+real data-loss bug in `update_tracking_data`: for a genuine two-cell ID swap,
+calling it twice silently destroys one side (it overwrites `new_id`'s current
+frame-value with `old_id`'s value, with no read/preservation of what
+`new_id` held before). `swap_tracks_at_frame` reads both tracks' LIVE values
+(not the frozen `original_tracking_data`) and atomically exchanges them;
+raises `ValueError` if either side is unmatched at that frame (a one-sided
+case is a relabel, not a swap — kept as an explicit, separate operation
+rather than folded into `update_tracking_data`, mirroring EPySeg's
+`track_correction.py` presence-based swap/relabel dispatch). Wired to a new
+"Swap two tracks" panel in the webview UI, separate from the existing
+reassign dialog.
+
+**`suggest_match_candidates(cells_info, tracking_data, frame_number,
+selected_cell_index, top_k=3)`** — ranks frame `frame_number + 1`'s currently
+unmatched cells by centroid distance from the selected cell, as a suggestion
+only (a human still clicks "Use this" to apply via `add_tracking_id`). Note:
+**not** a revival of the "local re-track" feature removed earlier (see the
+changelog above) — that re-ran Hungarian matching on spatial proximity,
+which just reproduces whatever wrong answer Hungarian already gave; this
+function never decides anything on its own, it only narrows the candidate
+pool a human picks from.
+
+**`adjacency.build_neighbor_graph(fill_labels, dilation_px=2)`** (new
+module) — the first same-population cell-adjacency graph in this codebase
+(`manual_correction_classification.get_adjacent_cells` is cross-cluster-only).
+Dilates each cell's own bounding-box-restricted mask and checks which other
+labels fall inside; a thin wrapper in `gap_analysis/packing_analysis.py`
+delegates to it, incidentally filling that manuscript-analysis stub
+(Fig.5G/6B) as a byproduct — `compute_neighbor_count_distribution`/
+`compute_area_vs_neighbor_count` remain unimplemented.
+
+**`find_propagation_stop_frame(...)`** + `merge_tracks_from_frame`'s new
+optional `end_frame` parameter — a "smart-stop propagate" advanced workflow,
+kept separate from the existing "Propagate to later frames" checkbox (which
+keeps its unconditional to-the-end behavior). Given a correction at
+`frame_number`, walks forward using `adjacency`'s neighbor graph to find how
+far the corrected cell's local neighborhood stays unsettled (some neighbor
+unmatched), stopping when it settles (neighbor becomes matched) or
+disappears (heuristic: no plausible nearby continuation within a
+displacement gate, or an ambiguous large jump onto territory that's already
+one of the corrected cell's own neighbors — flagged in code as a judgment
+call with no labeled extrusion ground truth; the computed stop frame and its
+diagnostic trail are always shown to the user before `merge_tracks_from_frame`
+is actually called with that bound). Verified against real data
+(`test_data/pupae_E-cad`, `test_data/AS_dorsal view_E-cad`): the neighbor
+graph builds in well under a second even on ~2800-cell/24-frame real
+segmentation, and the walk correctly resolves both a genuine "matched" and a
+forced "unsettled" scenario.
 
 ## pywebview UI (`v2/webview/`) — handoff notes
 
-**Status: first version built and backend-verified; frontend needs a real
-click-through by a human before calling it done.** If you're picking this up
-in a new conversation, read `~/.claude/skills/epi-quant-webview-ui/SKILL.md`
-first — it has the file layout, the `EpiQuantAPI` naming convention, the
-progress-wiring template, and an "add a new pipeline step" checklist. This
-section is just the current status/outstanding-work summary.
+**Status (updated 2026-08-08): substantially matured through several rounds
+of real user testing + fixes (see "Extended session changelog" below) — a
+real crash, a real click-to-cell bug, and a real tracking-correctness bug
+have all been found and fixed by actually using the app, not just code
+review. Still not click-tested through an actual native `pywebview` window
+in the current handoff — everything below was verified via direct backend
+Python calls against real `test_data/` + the dev-mode mock in a real
+browser.** If you're picking this up in a new conversation, read
+`~/.claude/skills/epi-quant-webview-ui/SKILL.md` first — it has the file
+layout, the `EpiQuantAPI` naming convention, the progress-wiring template,
+and an "add a new pipeline step" checklist (still accurate, unchanged by
+this round). This section is just the current status/outstanding-work
+summary.
 
-**What exists**: `rendering.py` (overlay compositing + click-to-cell lookup,
-new this round, informed by but not copied from v1's PyQt5/matplotlib
-drawing code) and `webview/api.py`+`app.py`+`frontend/` (vanilla HTML/CSS/JS,
-no build step) implement the full pipeline: Setup → Extract → Classify
-(skippable, n_clusters manual or `"auto"`, per-cluster HEX colors + preset
-palettes) → Correct Classification (click-to-reassign) → Track (single
-population, or leading-edge-boundary split for exactly 2 clusters) → Correct
-Tracking (click-to-reassign/add) → basic Trajectory view (outline highlight
-per frame, no vector-field/streamline rendering — that's deferred).
+**What exists**: `rendering.py` (overlay compositing + click-to-cell lookup)
+and `webview/api.py`+`app.py`+`frontend/` (vanilla HTML/CSS/JS, no build
+step) implement the full pipeline: Setup (+ "Load Existing Results" to skip
+recompute if a prior run's output is found) → Extract → Classify (skippable,
+n_clusters manual or `"auto"`, per-cluster HEX colors + preset palettes,
+per-cluster show/hide, "cluster borders" interface highlight) → Correct
+Classification (click-to-reassign) → Track (single population, or
+leading-edge-boundary split for exactly 2 clusters) → Correct Tracking
+(click-to-reassign/add, "propagate to later frames" for a mismatch that
+cascades forward) → Trajectory view (single-cell highlight per frame). Every
+frame-preview panel (Extract/Classify/Correct Classification/Correct
+Tracking/Trajectory) has: zoom (buttons/slider/drag-pan), mouse-wheel frame
+scrubbing, First/Prev/Play(adjustable FPS)/Next/Last, and a filled-mask vs.
+boundary-outline render toggle. Correct Tracking additionally has a
+matched/unmatched vs. per-cell-identity (Golden Angle or a reused qualitative
+LUT) color mode and a cell-label visibility toggle.
 
 **Verified**: the entire backend, via `api.py`'s own `if __name__ ==
 "__main__"` smoke-test harness (`python v2/webview/api.py --mask-folder ...
---image-folder ... --output-dir ... [--classify --n-clusters 2]`), run
-against all three real datasets:
-- `test_data/AS_dorsal view_E-cad` and `test_data/embryos_GBE_GAP43` —
-  skip-classification → track directly, both passed.
-- `test_data/AS_LE_lateral view_E-cad` — full classify(k=2) → manual cluster
-  correction → leading-edge → boundary-split tracking → manual track
-  correction, all passed, output files spot-checked on disk.
-
-The frontend was visually exercised via a **dev-mode mock** (`api.js` falls
-back to fixture data when `window.pywebview` is absent) served over a local
-`http.server` and driven with the Browser tool — this caught and fixed two
-real bugs (see Bug Fix Changelog below) but only proves the JS wiring/layout
-works with fake 1×1-pixel images, not real interaction.
+--image-folder ... --output-dir ... [--classify --n-clusters 2]`), re-run
+repeatedly against all real datasets across this round's fixes, most
+recently `test_data/pupae_E-cad`, `test_data/AS_dorsal view_E-cad`, and
+`test_data/AS_LE_lateral view_E-cad` (86 frames, 226 tracks post-fix) —
+all pass end to end including manual classification/tracking corrections.
+The frontend was exercised via the **dev-mode mock** (`api.js` falls back to
+fixture data when `window.pywebview` is absent) served over a local
+`http.server` and driven with the Browser tool for every new control added
+this round — this proves the JS wiring/layout and call parameters are
+correct, but still only against fake 1×1-pixel mock images, not real
+rendered ones in a real window.
 
 **Not yet verified — do this next**: run the actual app
 (`pip install -r v2/webview/requirements.txt && python v2/webview/app.py`)
 and click through it for real, especially:
-1. Click-to-cell on full-size real images (the natural-vs-CSS pixel scaling
-   in `app.js`'s `imagePixelFromClick` was only checked by reading the code
-   and testing the underlying Python function in isolation, never through an
-   actual browser click on a real rendered image).
+1. Click-to-cell on full-size real images through an actual browser click
+   (the underlying hit-testing bug — see changelog — is fixed and verified
+   at the Python level with real pixel coordinates, but never through a
+   literal mouse click on a real rendered image in a live window).
 2. The native folder-picker dialogs (`select_folder`, wraps
    `webview.create_file_dialog`) — untested, since the dev-mode mock stubs
    this out entirely.
 3. Whether progress bars/status text update smoothly during the longer real
-   runs (extraction/tracking on `AS_LE_lateral view_E-cad` took several
+   runs (tracking `AS_LE_lateral view_E-cad`'s 86 frames took several
    minutes in the backend-only harness — the `window.evaluate_js` push
    wiring was never watched live in a real window).
-4. General visual polish — this was built to be functional, not pretty.
+4. General visual/layout polish for the many new controls added this round
+   (zoom row, render-mode radios, color-mode radios + LUT picker, autoplay
+   row) — never seen in a real window, only the dev-mode mock's 800×450
+   Browser-tool viewport.
+5. **Re-benchmark the manuscript's tracking cell-loss numbers** — see the
+   "Tracking correctness" entry in the changelog below; this is not optional
+   busywork, the previously-reported ~10%/~60% comparison was measured
+   against the buggy merge algorithm.
+
+### Extended session changelog (2026-08-08) — found via real usage, not code review
+
+Everything below was found by the user actually running the app against
+real `test_data/` (mainly `pupae_E-cad`, `AS_dorsal view_E-cad`,
+`AS_LE_lateral view_E-cad`, `cp_dataset_puzzle-like_cells`) and reporting
+what broke, not by reading code — treat this list as the "what's actually
+been battle-tested" record for the webview UI.
+
+**Rendering/display bugs:**
+- App **crashed on Classify**: `pca_kmeans.py` calls `plt.figure()` (to save
+  PCA plots) from a background thread (pywebview's `js_api` calls don't run
+  on the main thread); macOS requires `NSWindow` creation on the main
+  thread, so this raised `NSInternalInconsistencyException` and killed the
+  app. Every figure in that module is `savefig`'d and never `.show()`n, so
+  forcing `matplotlib.use("Agg")` (a non-interactive backend, no window
+  creation at all) is safe. Fixed.
+- **Images didn't preview at all** in Classify/Correct Tracking:
+  `rendering.encode_png_base64` returned a bare base64 string instead of a
+  `data:image/png;base64,...` URI (its own docstring already said it should
+  return the latter). Without the `data:` scheme, the browser treated the
+  huge base64 blob as a relative URL and tried to GET it from the local
+  server, overflowing the request line (`414 Request-URI Too Long` in the
+  terminal log — that's what gave this away). The dev-mode mock's fixture
+  already had the correct prefix, which is exactly why this only showed up
+  against real data. Fixed at the single `encode_png_base64` boundary.
+- **Clicking a cell almost always said "No cell at that position"**: native
+  Cellpose `.npy` output's `'outlines'` key is the ~2–5%-of-pixels *boundary
+  line*, not a filled mask (despite the name and despite `v1`/`data_input.py`
+  consistently treating it as "the labeled mask" for feature extraction,
+  which works there because that code explicitly re-fills the polygon via
+  `cv2.fillPoly` from the boundary points — `rendering.py` does no such
+  reconstruction). `'masks'` is the actual filled per-cell array (verified:
+  same cell IDs, ~30% pixel coverage vs. `outlines`' ~2–5%, on every real
+  dataset checked). `api.py`'s `_load_frame` now prefers `'masks'`, falling
+  back to `'outlines'` only for `convert_tiff_masks_to_npy`'s synthetic
+  dicts (which have no `'masks'` key because their `'outlines'` is already
+  filled — that path was already correct). Both a **filled label array**
+  (`fill_labels`, used for hit-testing and the default "mask" render mode)
+  and the **boundary-only array** (`boundary_labels`, used for the
+  "outline" render mode option and, critically, still passed unchanged into
+  `manual_correction_classification.compute_leading_edge`, which was
+  ported from v1 against the boundary-only convention — swapping that one
+  input would have silently changed the `leading_edge` numbers) are now
+  returned separately from `_load_frame`.
+- **Frame Prev/Next silently did nothing past the first frame** for
+  `cp_dataset_puzzle-like_cells` (three unrelated sample images, not a time
+  series — real frame numbers `[1, 9, 19]`, not `1..3`). The frontend
+  assumed frame `N`'s "next" is always `N+1`; a new `get_frame_numbers()`
+  API method returns the actual (possibly sparse) sorted frame list, and
+  all frame-nav (First/Prev/Next/Last/autoplay) now steps by index into
+  that list.
+- **Editing one cluster's color in the legend silently reset every other
+  cluster's color to gray**: `set_cluster_colors` replaced the whole
+  `cluster_color_map` instead of merging, but the per-swatch color picker
+  only ever sends one `{cluster_label: color}` entry at a time. Fixed to
+  `.update()`.
+- **"Show cluster borders" didn't visibly do anything**, then (after a first
+  fix attempt) highlighted an oddly large, not-boundary-shaped region: the
+  `leading_edge` column is a continuous KDTree distance (or a ±1 fallback
+  sentinel for frames with no detected interface), never a boolean, so an
+  initial `== True` check was comparing floats to Python's `True` (~never
+  true) — no highlight at all. A distance-percentile heuristic replaced that
+  but wasn't right either (matches manuscript Fig. 2E: the actual physical
+  interface is a thin, one-cell-wide line, not a broad region). The final
+  fix reuses `get_adjacent_cells` — the exact pairwise-contour-proximity
+  check `compute_leading_edge` already runs internally — via a new
+  `find_boundary_cells`, which returns only cells that genuinely touch a
+  cell of the other cluster. This is a new *visualization-only* helper;
+  it doesn't touch the persisted `leading_edge` column or the tracking
+  split logic. It's also expensive (~2s on a ~1000-cell frame, all-pairs
+  KDTree scan) — cached per-frame, invalidated on any classification change.
+
+**Tracking correctness (the big one — changes reported numbers, see below):**
+- **Reassigning one track's ID sometimes silently changed a *different*
+  track's displayed ID**, and **cells that first appear mid-movie (not
+  present in frame 1) were never tracked at all** — both traced to the same
+  root cause in `cell_tracking._merge_tracking_pairs`: its ported "seed a
+  table from the first frame-pair, then look up later pairs by matching
+  values" stitching algorithm silently dropped any cell whose first valid
+  match was at frame *i > 1* (no row existed yet for it to attach to), and
+  could leave two rows both claiming the same physical cell — which two
+  *different* pieces of correction/display code then resolved inconsistently
+  (`api.py`'s click lookup took the first match, `rendering.py`'s on-image
+  label took the last, via a dict overwrite), so an edit nulling one
+  duplicate could flip which "phantom" claim became visible elsewhere.
+  Rewritten as an incremental "open tracks" stitch (walks pair files in
+  frame order, extending or starting a track per cell, `Index` assigned
+  once over the complete result) — mid-sequence starts are now included,
+  and duplicate claims can't arise by construction. **Explicitly confirmed
+  by the user to be worth the tradeoff of changing tracking output**: track
+  counts increase (verified on `AS_dorsal view_E-cad`: 174 → 185 tracks;
+  `AS_LE_lateral view_E-cad`: 226 tracks post-fix, previously untested at
+  this scale) since previously-dropped cells now get tracks, and any
+  dataset's cell-loss % will shift accordingly. **This means the
+  manuscript's reported ~10%-cell-loss-vs.-~60%-nearest-neighbor benchmark
+  (measured against the old buggy merge) should be re-run before being
+  treated as final** — see `CLAUDE.local.md`'s working agreement.
+- A **local re-track feature was built, tested, and then removed** after
+  the user found it didn't actually fix mismatched pairs in practice — it
+  re-ran Hungarian matching on a spatial+temporal neighborhood around a
+  correction, which doesn't address the actual failure mode (a wrong track
+  ID that then keeps extending itself frame after frame). Replaced with
+  `manual_correction_tracking.merge_tracks_from_frame(tracking_data,
+  frame_number, old_id, new_id)`: from `frame_number` onward, moves every
+  cell `old_id` currently claims onto `new_id`, clearing `old_id`'s claim —
+  i.e. splices the mis-tracked tail of one track onto the correct one,
+  wired in as a "Propagate to later frames" checkbox next to the existing
+  reassign-to-track UI. Verified against the user's own example (track 15
+  correct through frame 5, track 11 wrongly picks up the same cell frames
+  6–8): after propagating, track 15 correctly spans through frame 8, track
+  11 is empty from frame 6 on, frame 5 is untouched.
+
+**New features (additive, don't affect existing numbers):**
+- "Load Existing Results" on the Setup step — if a prior run's
+  `Cells_info.xlsx`/`cells_clustering_results.xlsx`/tracking `.xlsx` already
+  exist in the chosen output folder, offers to load them instead of
+  recomputing; legacy tracking files get `dedupe_tracking_data`-cleaned on
+  load with a status notice if it found anything to clean.
+  `EpiQuantAPI.get_existing_results`/`load_existing_extraction`/
+  `load_existing_classification`/`load_existing_tracking`.
+- Per-panel zoom (buttons + slider + click-drag pan) and mouse-wheel frame
+  scrubbing (debounced to one frame per ~120ms so a fast trackpad flick
+  doesn't skip several) on all five frame-preview panels.
+- First/Last frame buttons and autoplay (Play/Pause, adjustable FPS) on all
+  five panels, alongside the existing Prev/Next.
+- Filled-mask vs. boundary-outline render-mode toggle for Classify/Correct
+  Classification/Correct Tracking/Trajectory (reuses the same `fill_labels`/
+  `boundary_labels` split from the click-to-cell fix above — hit-testing
+  always uses `fill_labels` regardless of display mode).
+- Per-cluster show/hide checkboxes in the Classify legend, and a "cluster
+  borders" highlight toggle with an adjustable border color.
+- Correct Tracking: matched/unmatched color pickers actually wired up (the
+  UI hint text referenced them before they existed), a cell-label
+  visibility toggle, and a "Cell identity" color mode (each track/cell its
+  own color) with a LUT picker — the qualitative presets already used for
+  cluster colors (tab10/Set2/Dark2/Paired/tab20, cycling past their size),
+  plus a new Golden Angle generator (MorpholibJ's default label-image LUT:
+  HSV hue advances ~137.508° per label, scales to any track count without
+  visibly repeating) as the default. A first version used a continuous
+  viridis colormap instead of LUTs; replaced per user feedback.
 
 ## Deferred (not touched this round)
 

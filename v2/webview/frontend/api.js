@@ -149,6 +149,21 @@
     async add_tracking_id(_frame, _newIndex, _cellIdStr) {
       return { success: true };
     },
+    async swap_tracks(_frame, _idA, _idB) {
+      return { success: true };
+    },
+    async suggest_match_candidates(frame, _cellIndex, _topK) {
+      return { candidates: [
+        { cell_index: `Cell${frame + 1}_2`, cell_id: 2, distance: 4.2 },
+        { cell_index: `Cell${frame + 1}_3`, cell_id: 3, distance: 11.7 },
+      ] };
+    },
+    async compute_propagation_stop_frame(frame, _oldId, _newId, _maxFramesAhead) {
+      return { stop_frame: frame + 2, reason: "settled", unsettled_neighbors_by_frame: { [frame + 1]: [`Cell${frame + 1}_4`] } };
+    },
+    async apply_smart_stop_merge(_frame, _oldId, _newId, _endFrame) {
+      return { success: true };
+    },
     async save_tracking() {
       return null;
     },

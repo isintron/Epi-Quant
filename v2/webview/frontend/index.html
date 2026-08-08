@@ -268,12 +268,36 @@
     <div class="image-click-wrap"><img id="correct-track-overlay-img" class="frame-preview"></div>
     <div id="correct-track-selected-cell" class="status-line"></div>
 
+    <div id="correct-track-suggest" class="field-row" style="display:none">
+      <button id="suggest-match-btn" class="secondary-btn">Suggest match →</button>
+      <span id="correct-track-suggest-hint" class="hint"></span>
+    </div>
+    <ul id="correct-track-suggest-list" class="status-line" style="display:none"></ul>
+
     <div id="correct-track-reassign" class="field-row" style="display:none">
       <label>Reassign to track #</label>
       <input type="number" id="new-track-id-input" class="small-input">
       <label class="checkbox-label"><input type="checkbox" id="propagate-correction-checkbox"> Propagate to later frames</label>
       <button id="apply-track-correction-btn" class="secondary-btn">Apply</button>
     </div>
+
+    <div id="correct-track-smart-stop" class="field-row" style="display:none">
+      <button id="compute-stop-frame-btn" class="secondary-btn">Smart-stop propagate (advanced): compute suggested stop frame</button>
+    </div>
+    <div id="smart-stop-result" class="status-line"></div>
+    <div class="field-row">
+      <button id="apply-smart-stop-btn" class="secondary-btn" style="display:none">Merge through frame</button>
+    </div>
+
+    <div class="field-row">
+      <label class="checkbox-label"><input type="checkbox" id="track-swap-mode-checkbox"> Swap mode: click two matched cells in this frame to swap their tracks</label>
+    </div>
+    <div class="field-row">
+      <label>Track A <input type="number" id="swap-track-a-input" class="small-input"></label>
+      <label>Track B <input type="number" id="swap-track-b-input" class="small-input"></label>
+      <button id="apply-track-swap-btn" class="secondary-btn">Swap</button>
+    </div>
+    <div id="correct-track-swap-status" class="status-line"></div>
 
     <div class="field-row">
       <button id="save-tracking-btn" class="secondary-btn">Save Corrections</button>

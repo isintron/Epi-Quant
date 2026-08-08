@@ -24,6 +24,8 @@ const state = {
   clusterLegend: [],
   selectedCellForCorrection: null, // {cell_index, cluster_label, cell_type}
   selectedTrackCell: null, // {cell_index, cell_id, track_id}
+  trackSwapSelection: [], // up to 2 {track_id, cell_index} picked while swap mode is on, same frame only
+  smartStopPending: null, // {oldId, newId, stopFrame} once a stop frame has been computed, awaiting Apply
 
   trackingModeOptions: { has_leading_edge: false, split_available: false },
   trackNumbers: [],
@@ -532,17 +534,80 @@ async function showCorrectTrackFrame(frame) {
   if (img) document.getElementById("correct-track-overlay-img").src = img;
   document.getElementById("correct-track-selected-cell").textContent = "";
   document.getElementById("correct-track-reassign").style.display = "none";
+  document.getElementById("correct-track-suggest").style.display = "none";
+  document.getElementById("correct-track-suggest-list").style.display = "none";
+  resetSmartStopPanel();
   state.selectedTrackCell = null;
+  resetTrackSwapSelection();
+}
+
+function resetSmartStopPanel() {
+  state.smartStopPending = null;
+  document.getElementById("correct-track-smart-stop").style.display = "none";
+  document.getElementById("smart-stop-result").textContent = "";
+  document.getElementById("apply-smart-stop-btn").style.display = "none";
+}
+
+function resetTrackSwapSelection() {
+  state.trackSwapSelection = [];
+  document.getElementById("swap-track-a-input").value = "";
+  document.getElementById("swap-track-b-input").value = "";
+  document.getElementById("correct-track-swap-status").textContent = "";
+}
+
+function handleSwapCellClick(result) {
+  if (!result || result.track_id === null || result.track_id === undefined) {
+    setStatus("correct-track-swap-status", "Click a matched cell to swap -- unmatched cells can't be swapped.", "error");
+    return;
+  }
+  if (state.trackSwapSelection.some((c) => c.track_id === result.track_id)) {
+    setStatus("correct-track-swap-status", `Track #${result.track_id} is already selected.`, "error");
+    return;
+  }
+  state.trackSwapSelection.push(result);
+  if (state.trackSwapSelection.length > 2) state.trackSwapSelection.shift();
+
+  const [a, b] = state.trackSwapSelection;
+  document.getElementById("swap-track-a-input").value = a ? a.track_id : "";
+  document.getElementById("swap-track-b-input").value = b ? b.track_id : "";
+  setStatus(
+    "correct-track-swap-status",
+    b ? `Ready to swap track #${a.track_id} and track #${b.track_id}.` : `Selected track #${a.track_id} -- click a second matched cell.`,
+    "success"
+  );
+}
+
+async function handleApplyTrackSwap() {
+  const idA = parseInt(document.getElementById("swap-track-a-input").value, 10);
+  const idB = parseInt(document.getElementById("swap-track-b-input").value, 10);
+  if (Number.isNaN(idA) || Number.isNaN(idB)) {
+    setStatus("correct-track-swap-status", "Enter two valid track numbers.", "error");
+    return;
+  }
+  const result = await window.EpiQuantAPI.swap_tracks(state.correctTrackFrame, idA, idB);
+  if (result && result.error) {
+    setStatus("correct-track-swap-status", `Error: ${result.error}`, "error");
+    return;
+  }
+  await showCorrectTrackFrame(state.correctTrackFrame);
+  setStatus("correct-track-swap-status", "Swapped.", "success");
 }
 
 async function handleCorrectTrackImageClick(event) {
   const img = event.target;
   const { x, y } = imagePixelFromClick(img, event);
   const result = await window.EpiQuantAPI.get_tracking_cell_at_pixel(state.correctTrackFrame, x, y);
+  if (document.getElementById("track-swap-mode-checkbox").checked) {
+    handleSwapCellClick(result);
+    return;
+  }
   if (!result) {
     document.getElementById("correct-track-selected-cell").textContent = "No cell at that position.";
     state.selectedTrackCell = null;
     document.getElementById("correct-track-reassign").style.display = "none";
+    document.getElementById("correct-track-suggest").style.display = "none";
+    document.getElementById("correct-track-suggest-list").style.display = "none";
+    resetSmartStopPanel();
     return;
   }
   state.selectedTrackCell = result;
@@ -553,6 +618,17 @@ async function handleCorrectTrackImageClick(event) {
   document.getElementById("correct-track-reassign").style.display = "flex";
   document.getElementById("new-track-id-input").value = "";
   document.getElementById("propagate-correction-checkbox").checked = false;
+
+  resetSmartStopPanel();
+  document.getElementById("correct-track-smart-stop").style.display = isMatched ? "flex" : "none";
+
+  document.getElementById("correct-track-suggest").style.display = "flex";
+  document.getElementById("correct-track-suggest-list").style.display = "none";
+  document.getElementById("correct-track-suggest-list").innerHTML = "";
+  document.getElementById("correct-track-suggest-hint").textContent = isMatched
+    ? ""
+    : "Select a matched cell to find its likely continuation.";
+  document.getElementById("suggest-match-btn").disabled = !isMatched;
 }
 
 async function handleApplyTrackCorrection() {
@@ -581,6 +657,81 @@ async function handleApplyTrackCorrection() {
     setStatus("correct-track-selected-cell", "Applied.", "success");
     await showCorrectTrackFrame(state.correctTrackFrame);
   }
+}
+
+async function handleComputeStopFrame() {
+  if (!state.selectedTrackCell) return;
+  const oldId = state.selectedTrackCell.track_id;
+  const newId = parseInt(document.getElementById("new-track-id-input").value, 10);
+  if (Number.isNaN(newId)) {
+    setStatus("smart-stop-result", "Enter a target track # above first.", "error");
+    return;
+  }
+
+  const result = await window.EpiQuantAPI.compute_propagation_stop_frame(state.correctTrackFrame, oldId, newId, 20);
+  if (result && result.error) {
+    setStatus("smart-stop-result", `Error: ${result.error}`, "error");
+    document.getElementById("apply-smart-stop-btn").style.display = "none";
+    return;
+  }
+  state.smartStopPending = { oldId, newId, stopFrame: result.stop_frame };
+  const trailNote = Object.keys(result.unsettled_neighbors_by_frame || {}).length
+    ? ` Unsettled neighbors by frame: ${JSON.stringify(result.unsettled_neighbors_by_frame)}`
+    : "";
+  setStatus("smart-stop-result", `Suggested stop frame: ${result.stop_frame} (${result.reason}).${trailNote}`, "success");
+  const applyBtn = document.getElementById("apply-smart-stop-btn");
+  applyBtn.textContent = `Merge through frame ${result.stop_frame}`;
+  applyBtn.style.display = "inline-block";
+}
+
+async function handleApplySmartStop() {
+  if (!state.smartStopPending) return;
+  const { oldId, newId, stopFrame } = state.smartStopPending;
+  const result = await window.EpiQuantAPI.apply_smart_stop_merge(state.correctTrackFrame, oldId, newId, stopFrame);
+  if (result && result.error) {
+    setStatus("smart-stop-result", `Error: ${result.error}`, "error");
+    return;
+  }
+  await showCorrectTrackFrame(state.correctTrackFrame);
+  setStatus("smart-stop-result", `Merged through frame ${stopFrame}.`, "success");
+}
+
+async function handleSuggestMatch() {
+  if (!state.selectedTrackCell || state.selectedTrackCell.track_id === null || state.selectedTrackCell.track_id === undefined) return;
+  const result = await window.EpiQuantAPI.suggest_match_candidates(state.correctTrackFrame, state.selectedTrackCell.cell_index, 3);
+  const list = document.getElementById("correct-track-suggest-list");
+  list.innerHTML = "";
+  list.style.display = "block";
+
+  if (result && result.error) {
+    setStatus("correct-track-suggest-list", `Error: ${result.error}`, "error");
+    return;
+  }
+  const candidates = (result && result.candidates) || [];
+  if (candidates.length === 0) {
+    list.textContent = "No unmatched candidates found in the next frame.";
+    return;
+  }
+  const trackId = state.selectedTrackCell.track_id;
+  candidates.forEach((candidate) => {
+    const item = document.createElement("li");
+    item.textContent = `${candidate.cell_index} (${candidate.distance.toFixed(1)}px) `;
+    const useBtn = document.createElement("button");
+    useBtn.className = "secondary-btn";
+    useBtn.textContent = "Use this";
+    useBtn.addEventListener("click", async () => {
+      const addResult = await window.EpiQuantAPI.add_tracking_id(state.correctTrackFrame + 1, trackId, candidate.cell_index);
+      if (addResult && addResult.error) {
+        setStatus("correct-track-suggest-list", `Error: ${addResult.error}`, "error");
+      } else {
+        setStatus("correct-track-selected-cell", `Attached ${candidate.cell_index} to track #${trackId} at frame ${state.correctTrackFrame + 1}.`, "success");
+        list.style.display = "none";
+        list.innerHTML = "";
+      }
+    });
+    item.appendChild(useBtn);
+    list.appendChild(item);
+  });
 }
 
 async function handleSaveTrackingCorrections() {
@@ -922,6 +1073,11 @@ function init() {
   document.getElementById("correct-track-identity-palette-select").addEventListener("change", () => showCorrectTrackFrame(state.correctTrackFrame));
   document.getElementById("correct-track-overlay-img").addEventListener("click", handleCorrectTrackImageClick);
   document.getElementById("apply-track-correction-btn").addEventListener("click", handleApplyTrackCorrection);
+  document.getElementById("suggest-match-btn").addEventListener("click", handleSuggestMatch);
+  document.getElementById("compute-stop-frame-btn").addEventListener("click", handleComputeStopFrame);
+  document.getElementById("apply-smart-stop-btn").addEventListener("click", handleApplySmartStop);
+  document.getElementById("track-swap-mode-checkbox").addEventListener("change", resetTrackSwapSelection);
+  document.getElementById("apply-track-swap-btn").addEventListener("click", handleApplyTrackSwap);
   document.getElementById("save-tracking-btn").addEventListener("click", handleSaveTrackingCorrections);
   document.getElementById("done-correcting-tracking").addEventListener("click", enterTrajectoryStep);
   document.getElementById("matched-color-input").addEventListener("change", async (e) => {

@@ -567,6 +567,49 @@ class EpiQuantAPI:
         except ValueError as e:
             return {"error": str(e)}
 
+    def compute_propagation_stop_frame(
+        self, frame_number: int, old_id: int, new_id: int, max_frames_ahead: int = 20,
+    ) -> dict:
+        if self.tracking_data is None or self.cells_info is None:
+            return {"error": "No tracking data loaded."}
+        try:
+            return manual_correction_tracking.find_propagation_stop_frame(
+                self.tracking_data, self.cells_info,
+                lambda f: (self._load_frame(f) or (None, None, None))[0],
+                int(frame_number), int(old_id), int(new_id), max_frames_ahead=int(max_frames_ahead),
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+
+    def apply_smart_stop_merge(self, frame_number: int, old_id: int, new_id: int, end_frame: int) -> dict:
+        try:
+            manual_correction_tracking.merge_tracks_from_frame(
+                self.tracking_data, int(frame_number), int(old_id), int(new_id), end_frame=int(end_frame),
+            )
+            return {"success": True}
+        except ValueError as e:
+            return {"error": str(e)}
+
+    def swap_tracks(self, frame_number: int, id_a: int, id_b: int) -> dict:
+        try:
+            manual_correction_tracking.swap_tracks_at_frame(
+                self.tracking_data, int(frame_number), int(id_a), int(id_b),
+            )
+            return {"success": True}
+        except ValueError as e:
+            return {"error": str(e)}
+
+    def suggest_match_candidates(self, frame_number: int, cell_index: str, top_k: int = 3) -> dict:
+        if self.cells_info is None or self.tracking_data is None:
+            return {"candidates": []}
+        try:
+            candidates = manual_correction_tracking.suggest_match_candidates(
+                self.cells_info, self.tracking_data, int(frame_number), cell_index, top_k=int(top_k),
+            )
+            return {"candidates": candidates}
+        except (KeyError, ValueError) as e:
+            return {"error": str(e)}
+
     def add_tracking_id(self, frame_number: int, new_index: int, cell_id_str: str) -> dict:
         try:
             manual_correction_tracking.add_tracking_id(
@@ -705,6 +748,19 @@ if __name__ == "__main__":
             other_track = track_numbers[1] if len(track_numbers) > 1 else tn
             print("reassign_track (expect a graceful dict, error or success):",
                   api.reassign_track(frame_range["min_frame"], old_id, other_track))
+
+            print("swap_tracks (expect a graceful dict, error or success):",
+                  api.swap_tracks(frame_range["min_frame"], old_id, other_track))
+
+            first_cell_at_min_frame = api.cells_info[
+                api.cells_info["Cell Index"].str.startswith(f"Cell{frame_range['min_frame']}_")
+            ]["Cell Index"].iloc[0]
+            print("suggest_match_candidates (expect a graceful dict):",
+                  api.suggest_match_candidates(frame_range["min_frame"], first_cell_at_min_frame))
+
+            print("compute_propagation_stop_frame (expect a graceful dict):",
+                  api.compute_propagation_stop_frame(frame_range["min_frame"], old_id, other_track))
+
             api.save_tracking()
             print("Saved tracking.")
 
