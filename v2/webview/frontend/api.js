@@ -167,15 +167,15 @@
     async apply_smart_stop_merge(_frame, _oldId, _newId, _endFrame) {
       return { success: true, displaced: null };
     },
-    async compute_confirmed_identity_moves(frame, trackId, _maxFramesAhead) {
-      return {
-        stop_frame: frame + 3,
-        reason: "settled",
-        moves: [
-          { frame: frame + 1, from_track_id: 12, cell_index: `Cell${frame + 1}_5` },
-          { frame: frame + 2, from_track_id: null, cell_index: `Cell${frame + 2}_6` },
-        ],
-      };
+    async compute_confirmed_identity_moves(frame, trackId, _maxFramesAhead, restrictToUnmatched) {
+      const moves = [
+        { frame: frame + 1, from_track_id: null, cell_index: `Cell${frame + 1}_5`, distance: 7.1 },
+        { frame: frame + 2, from_track_id: null, cell_index: `Cell${frame + 2}_6`, distance: 30.7 },
+      ];
+      if (restrictToUnmatched === false) {
+        moves.push({ frame: frame + 3, from_track_id: 12, cell_index: `Cell${frame + 3}_4`, distance: 25.0 });
+      }
+      return { stop_frame: frame + 3, reason: "settled", moves };
     },
     async apply_confirmed_identity_moves(_trackId, _moves) {
       return { success: true, displaced_list: [] };

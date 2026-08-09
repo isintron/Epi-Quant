@@ -594,12 +594,19 @@ class EpiQuantAPI:
 
     def compute_confirmed_identity_moves(
         self, frame_number: int, track_id: int, max_frames_ahead: int = 20,
+        restrict_to_unmatched: bool = True,
     ) -> dict:
         """Diagnostic-only: plans (but does not apply) the position-based
         propagation used after a Suggest-match attach, in case the same
         physical cell was subsequently claimed by a sequence of DIFFERENT
         wrong tracks rather than one consistently-wrong one (see
-        `manual_correction_tracking.find_confirmed_identity_moves`)."""
+        `manual_correction_tracking.find_confirmed_identity_moves`).
+
+        `restrict_to_unmatched` (default `True`) keeps the walk to cells no
+        track already claims -- see that function's docstring for why this
+        matters (without it the walk can drift onto a neighbour another
+        track legitimately owns and then follow the wrong cell for every
+        later frame)."""
         if self.tracking_data is None or self.cells_info is None:
             return {"error": "No tracking data loaded."}
         try:
@@ -607,6 +614,7 @@ class EpiQuantAPI:
                 self.tracking_data, self.cells_info,
                 lambda f: (self._load_frame(f) or (None, None, None))[0],
                 int(frame_number), int(track_id), max_frames_ahead=int(max_frames_ahead),
+                restrict_to_unmatched=bool(restrict_to_unmatched),
             )
         except ValueError as e:
             return {"error": str(e)}

@@ -808,7 +808,10 @@ function resetSuggestCheckButton() {
 async function handleCheckSuggestHolds() {
   if (state.suggestCheckTrackId === null || state.suggestCheckTrackId === undefined) return;
   const trackId = state.suggestCheckTrackId;
-  const result = await window.EpiQuantAPI.compute_confirmed_identity_moves(state.correctTrackFrame, trackId, 20);
+  const restrictToUnmatched = document.getElementById("restrict-unmatched-checkbox").checked;
+  const result = await window.EpiQuantAPI.compute_confirmed_identity_moves(
+    state.correctTrackFrame, trackId, 20, restrictToUnmatched
+  );
   const list = document.getElementById("suggest-check-moves-list");
   const applyBtn = document.getElementById("apply-confirmed-moves-btn");
 
@@ -823,11 +826,10 @@ async function handleCheckSuggestHolds() {
   list.innerHTML = "";
 
   if (moves.length === 0) {
-    setStatus(
-      "suggest-check-result",
-      `Holds through frame ${result.stop_frame} (${result.reason}) -- no further corrections needed.`,
-      "success"
-    );
+    const hint = result.reason === "no_unmatched_continuation"
+      ? " The nearest cell there already belongs to another track -- untick \"Pair with unmatched cells only\" to allow taking it."
+      : " No further corrections needed.";
+    setStatus("suggest-check-result", `Holds through frame ${result.stop_frame} (${result.reason}).${hint}`, "success");
     list.style.display = "none";
     applyBtn.style.display = "none";
     state.confirmedMovesPending = null;
@@ -843,7 +845,8 @@ async function handleCheckSuggestHolds() {
     const item = document.createElement("li");
     const fromText = move.from_track_id === null || move.from_track_id === undefined
       ? "unmatched" : `track #${move.from_track_id}`;
-    item.textContent = `Frame ${move.frame}: currently ${fromText} → would become track #${trackId} (${move.cell_index})`;
+    const distanceText = move.distance === undefined || move.distance === null ? "" : `, ${move.distance}px`;
+    item.textContent = `Frame ${move.frame}: currently ${fromText} → would become track #${trackId} (${move.cell_index}${distanceText})`;
     list.appendChild(item);
   });
   list.style.display = "block";

@@ -376,6 +376,37 @@ cleared. Kept entirely separate from the existing neighbor-based
 "Smart-stop propagate" (per the user's confirmed scope decision) — that
 feature and its backing functions are untouched.
 
+**Restricted pairing (follow-up fix).** Real-data testing on
+`test_data/AS_dorsal view_E-cad` exposed a drift bug in the walk above: a
+plain nearest-centroid pick can land on a neighbouring cell that another
+track legitimately owns just because it happens to be a few pixels closer,
+and since the anchor position then updates to that wrong cell, every later
+frame follows the wrong track too. Measured instance — reconstructing the
+reported case (track 18 anchored at frame 2, its frames 3-8 claims
+cleared), at frame 4 three cells sat inside the 49.5px gate: 25.0px (owned
+by track 5), 28.4px (owned by track 11), and 30.7px — the genuine
+continuation and the only unclaimed one. The walk took the 25.0px cell and
+then followed track 5's cells for frames 5-8: **5 of 6 moves wrong**.
+
+`find_confirmed_identity_moves` now takes `restrict_to_unmatched=True`
+(default), limiting candidates to cells no track claims. On that same
+reconstruction it produces **6 of 6 moves correct**. The restriction is
+principled rather than a tie-break: a cell some track already claims is
+*accounted for* — that track asserts continuity through it — whereas an
+unclaimed cell is by definition one Hungarian failed to account for, which
+is exactly what an anchor needing repair is looking for. When no unclaimed
+cell is in the gate the walk stops with `reason="no_unmatched_continuation"`
+rather than stealing, and the UI says so and points at the checkbox.
+
+Passing `restrict_to_unmatched=False` restores the old behaviour, which is
+what the multiple-different-wrong-tracks churn case needs (there the
+genuine continuation IS claimed, by a different wrong track each frame) —
+exposed as a "Pair with unmatched cells only" checkbox next to "Check how
+far this holds". Each move now also carries its centroid `distance`, shown
+in the moves list so a reviewer can judge a borderline pick. Both modes are
+covered by smoke tests, including a fixture mirroring the measured
+2.0px-owned vs 3.0px-unclaimed competition.
+
 ## pywebview UI (`v2/webview/`) — handoff notes
 
 **Status (updated 2026-08-08): substantially matured through several rounds

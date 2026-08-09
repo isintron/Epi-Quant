@@ -592,6 +592,7 @@ def find_confirmed_identity_moves(
     track_id: int,
     max_frames_ahead: int = 20,
     drift_gate_multiplier: float = 1.5,
+    restrict_to_unmatched: bool = True,
 ) -> dict:
     """Starting from `track_id`'s own (human-confirmed) cell at
     `frame_number` -- typically just attached via `suggest_match_candidates`
@@ -616,23 +617,50 @@ def find_confirmed_identity_moves(
     gated step at a time, it never re-runs Hungarian or guesses an initial
     match on its own.
 
+    **`restrict_to_unmatched` (default `True`) -- "restricted pairing".**
+    Candidates at each later frame are limited to cells no track currently
+    claims, instead of every cell in the frame. This fixes a real drift bug
+    found on `test_data/AS_dorsal view_E-cad`: a plain nearest-centroid pick
+    can land on a neighbouring cell that another track legitimately owns
+    merely because it happens to be a few pixels closer, and since the
+    anchor position then updates to that wrong cell, every subsequent frame
+    follows the wrong track too. Measured instance -- at one frame three
+    cells sat inside the gate (49.5px): 25.0px (owned by track 5), 28.4px
+    (owned by track 11), and 30.7px, the genuine continuation and the only
+    unclaimed one. Restricting to unclaimed candidates picks it correctly.
+
+    The restriction is principled, not just a tie-break: a cell some track
+    already claims is *accounted for* -- that track asserts continuity
+    through it -- whereas an unclaimed cell is by definition one the
+    Hungarian matching failed to account for, which is exactly what an
+    anchor needing this repair is looking for. Set `restrict_to_unmatched=False`
+    to allow taking cells away from other tracks, which is what the
+    multiple-different-wrong-tracks churn case needs (there the genuine
+    continuation IS claimed, by a different wrong track each frame).
+
     Per frame, in order:
-    - no cell within the gate, or the frame has no cells at all -> stop,
-      `reason="disappeared"`.
+    - the frame has no cells at all, or nothing at all within the gate ->
+      stop, `reason="disappeared"`.
     - the nearest cell is already claimed by `track_id` itself -> stop,
       `reason="settled"` (Hungarian recovered on its own; nothing left to
       fix).
-    - the nearest cell is unclaimed -> record a move with
-      `from_track_id=None` (a plain attach), keep walking.
-    - the nearest cell is claimed by a DIFFERENT track -> record a move
-      naming that track, keep walking (the churn case).
+    - `restrict_to_unmatched` and no *unclaimed* cell within the gate ->
+      stop, `reason="no_unmatched_continuation"` (something is there, but
+      taking it would mean stealing another track's cell -- deliberately
+      left to the human, who can re-run with the restriction off).
+    - otherwise record a move for the nearest eligible cell -- with
+      `from_track_id=None` when unclaimed (a plain attach), or naming the
+      track it is taken from (only reachable with the restriction off) --
+      and keep walking.
     - `max_frames_ahead` exhausted, or a `Frame{n}` column doesn't exist in
       `tracking_data` -> stop, `reason="reached_max_frames_ahead"` or
       `"track_ended"` respectively.
 
     Returns `{"stop_frame": int, "reason": str, "moves": [{"frame": int,
-    "from_track_id": Optional[int], "cell_index": str}, ...]}` -- a plan
-    only; nothing is written here. Falls back to
+    "from_track_id": Optional[int], "cell_index": str, "distance": float},
+    ...]}` -- a plan only; nothing is written here. `distance` is the
+    centroid displacement that justified each step, surfaced so a reviewer
+    can judge a borderline pick. Falls back to
     `_centroid_and_radius_from_mask` for any cell missing from `cells_info`,
     matching this module's other functions.
 
@@ -688,19 +716,37 @@ def find_confirmed_identity_moves(
             frame_cells["Center X Coordinate"].astype(float) - last_x,
             frame_cells["Center Y Coordinate"].astype(float) - last_y,
         )
-        nearest_index = distances.idxmin()
-        nearest_distance = float(distances.loc[nearest_index])
         gate = drift_gate_multiplier * last_radius
-        if nearest_distance > gate:
+
+        overall_nearest = distances.idxmin()
+        if float(distances.loc[overall_nearest]) > gate:
             return {"stop_frame": f - 1, "reason": "disappeared", "moves": moves}
 
-        claiming_rows = tracking_data.index[tracking_data[frame_col] == nearest_index]
-        claiming_track_id = int(tracking_data.at[claiming_rows[0], id_col]) if not claiming_rows.empty else None
+        claimed_by = {
+            row[frame_col]: int(row[id_col])
+            for _, row in tracking_data[[id_col, frame_col]].dropna(subset=[frame_col]).iterrows()
+        }
 
-        if claiming_track_id == int(track_id):
+        # Whoever is physically nearest already being us means the tracking
+        # recovered on its own from here -- checked before any restriction,
+        # since it ends the walk either way.
+        if claimed_by.get(overall_nearest) == int(track_id):
             return {"stop_frame": f, "reason": "settled", "moves": moves}
 
-        moves.append({"frame": f, "from_track_id": claiming_track_id, "cell_index": nearest_index})
+        if restrict_to_unmatched:
+            eligible = distances[[i for i in distances.index if i not in claimed_by]]
+            if eligible.empty or float(eligible.min()) > gate:
+                return {"stop_frame": f - 1, "reason": "no_unmatched_continuation", "moves": moves}
+            nearest_index = eligible.idxmin()
+        else:
+            nearest_index = overall_nearest
+
+        moves.append({
+            "frame": f,
+            "from_track_id": claimed_by.get(nearest_index),
+            "cell_index": nearest_index,
+            "distance": round(float(distances.loc[nearest_index]), 1),
+        })
         last_x = float(frame_cells.at[nearest_index, "Center X Coordinate"])
         last_y = float(frame_cells.at[nearest_index, "Center Y Coordinate"])
         last_radius = float(frame_cells.at[nearest_index, "Circumscribed Circle Radius"])
@@ -1227,15 +1273,23 @@ if __name__ == "__main__":
         "Frame4": [None, None, None, "Cell4_A"],
         "Frame5": ["Cell5_A", None, None, None],
     })
-    plan = find_confirmed_identity_moves(
+    # Every continuation here is claimed by a wrong track, so this needs the
+    # restriction OFF -- with it on (the default) the walk must refuse to
+    # steal them and stop immediately instead.
+    restricted_plan = find_confirmed_identity_moves(
         churn_tracking, churn_cells_info, lambda f: None, frame_number=1, track_id=18,
     )
-    print("\nfind_confirmed_identity_moves (churn through 3 wrong tracks):", plan)
+    assert restricted_plan["moves"] == [] and restricted_plan["reason"] == "no_unmatched_continuation", restricted_plan
+    print("\nfind_confirmed_identity_moves (churn, restricted): correctly refused to steal claimed cells.")
+
+    plan = find_confirmed_identity_moves(
+        churn_tracking, churn_cells_info, lambda f: None, frame_number=1, track_id=18,
+        restrict_to_unmatched=False,
+    )
+    print("find_confirmed_identity_moves (churn through 3 wrong tracks):", plan)
     assert plan["reason"] == "settled" and plan["stop_frame"] == 5, plan
-    assert plan["moves"] == [
-        {"frame": 2, "from_track_id": 12, "cell_index": "Cell2_A"},
-        {"frame": 3, "from_track_id": 14, "cell_index": "Cell3_A"},
-        {"frame": 4, "from_track_id": 16, "cell_index": "Cell4_A"},
+    assert [(m["frame"], m["from_track_id"], m["cell_index"]) for m in plan["moves"]] == [
+        (2, 12, "Cell2_A"), (3, 14, "Cell3_A"), (4, 16, "Cell4_A"),
     ], plan["moves"]
 
     churn_tracking, churn_displaced = apply_confirmed_identity_moves(churn_tracking, 18, plan["moves"])
@@ -1262,7 +1316,9 @@ if __name__ == "__main__":
         unclaimed_tracking, unclaimed_cells_info, lambda f: None, frame_number=1, track_id=9, max_frames_ahead=1,
     )
     print("\nfind_confirmed_identity_moves (unclaimed continuation):", unclaimed_plan)
-    assert unclaimed_plan["moves"] == [{"frame": 2, "from_track_id": None, "cell_index": "Cell2_B"}], unclaimed_plan
+    assert [(m["frame"], m["from_track_id"], m["cell_index"]) for m in unclaimed_plan["moves"]] == [
+        (2, None, "Cell2_B"),
+    ], unclaimed_plan
     assert unclaimed_plan["reason"] == "reached_max_frames_ahead"
 
     # Disappearance case: no cell at all in the next frame.
@@ -1275,5 +1331,38 @@ if __name__ == "__main__":
     )
     print("find_confirmed_identity_moves (disappeared):", gone_plan)
     assert gone_plan == {"stop_frame": 1, "reason": "disappeared", "moves": []}, gone_plan
+
+    # Restricted pairing vs. drift onto a neighbour another track owns --
+    # the shape of a real failure measured on `test_data/AS_dorsal view_E-cad`:
+    # at frame 2 a cell owned by track 5 sits slightly CLOSER (2.0) to the
+    # anchor than the genuine unclaimed continuation (3.0), both inside the
+    # gate. Unrestricted, the walk takes the owned one and then follows that
+    # wrong cell onward; restricted, it correctly takes the unclaimed one.
+    drift_cells_info = pd.DataFrame([
+        {"Cell Index": "Cell1_anchor", "Center X Coordinate": 0.0, "Center Y Coordinate": 0.0, "Circumscribed Circle Radius": 4.0},
+        {"Cell Index": "Cell2_neighbor", "Center X Coordinate": 2.0, "Center Y Coordinate": 0.0, "Circumscribed Circle Radius": 4.0},
+        {"Cell Index": "Cell2_true", "Center X Coordinate": 3.0, "Center Y Coordinate": 0.0, "Circumscribed Circle Radius": 4.0},
+    ])
+    drift_tracking = pd.DataFrame({
+        "Index": [18, 5],
+        "Frame1": ["Cell1_anchor", None],
+        "Frame2": [None, "Cell2_neighbor"],
+    })
+    drift_restricted = find_confirmed_identity_moves(
+        drift_tracking, drift_cells_info, lambda f: None, frame_number=1, track_id=18, max_frames_ahead=1,
+    )
+    print("\nfind_confirmed_identity_moves (restricted, neighbour owned by track 5):", drift_restricted)
+    assert [m["cell_index"] for m in drift_restricted["moves"]] == ["Cell2_true"], drift_restricted
+    assert drift_restricted["moves"][0]["from_track_id"] is None
+    assert drift_restricted["moves"][0]["distance"] == 3.0
+
+    drift_unrestricted = find_confirmed_identity_moves(
+        drift_tracking, drift_cells_info, lambda f: None, frame_number=1, track_id=18, max_frames_ahead=1,
+        restrict_to_unmatched=False,
+    )
+    print("find_confirmed_identity_moves (unrestricted, same fixture):", drift_unrestricted)
+    assert [m["cell_index"] for m in drift_unrestricted["moves"]] == ["Cell2_neighbor"], drift_unrestricted
+    assert drift_unrestricted["moves"][0]["from_track_id"] == 5
+    print("Restricted pairing correctly avoids stealing the neighbour; unrestricted still can.")
 
     print("\nAll manual_correction_tracking smoke tests passed.")
