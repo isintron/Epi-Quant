@@ -177,7 +177,7 @@
 
   <section id="step-correct-classification" class="step-section">
     <h2>Correct Classification</h2>
-    <p class="hint">Click a cell in the image, then pick its correct cluster.</p>
+    <p class="hint">Pick a target cluster below, then click cells to reassign them instantly.</p>
     <div class="frame-nav">
       <button id="correct-class-first-frame" class="secondary-btn">|&larr; First</button>
       <button id="correct-class-prev-frame" class="secondary-btn">&larr; Prev</button>
@@ -223,7 +223,7 @@
 
   <section id="step-correct-tracking" class="step-section">
     <h2>Correct Tracking</h2>
-    <p class="hint">Click a cell to inspect its track. Matched/unmatched colors are set below.</p>
+    <p class="hint">Click a cell to inspect its track. Visualization methods are set below.</p>
     <div class="render-mode-controls">
       <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="uniform" checked> Matched/Unmatched colors</label>
       <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="identity"> Cell identity</label>
@@ -264,6 +264,7 @@
       <label class="radio-label"><input type="radio" name="correct-track-render-mode" value="mask" checked> Filled mask</label>
       <label class="radio-label"><input type="radio" name="correct-track-render-mode" value="outline"> Outlines</label>
       <label class="checkbox-label"><input type="checkbox" id="correct-track-show-labels" checked> Show cell labels</label>
+      <label>Label size <input type="number" id="correct-track-label-size-input" class="small-input" value="10" min="6" max="30"></label>
     </div>
     <div class="image-click-wrap"><img id="correct-track-overlay-img" class="frame-preview"></div>
     <div id="correct-track-selected-cell" class="status-line"></div>
@@ -273,16 +274,21 @@
       <span id="correct-track-suggest-hint" class="hint"></span>
     </div>
     <ul id="correct-track-suggest-list" class="status-line" style="display:none"></ul>
+    <div id="correct-track-suggest-check" class="field-row" style="display:none">
+      <button id="check-suggest-holds-btn" class="secondary-btn">Check how far this holds →</button>
+    </div>
+    <div id="suggest-check-result" class="status-line"></div>
+    <ul id="suggest-check-moves-list" class="status-line" style="display:none"></ul>
+    <div class="field-row">
+      <button id="apply-confirmed-moves-btn" class="secondary-btn" style="display:none">Apply corrections</button>
+    </div>
 
     <div id="correct-track-reassign" class="field-row" style="display:none">
       <label>Reassign to track #</label>
-      <input type="number" id="new-track-id-input" class="small-input">
-      <label class="checkbox-label"><input type="checkbox" id="propagate-correction-checkbox"> Propagate to later frames</label>
+      <input type="number" id="new-track-id-input" class="track-id-input">
+      <label class="checkbox-label"><input type="checkbox" id="propagate-correction-checkbox"> Propagate to later</label>
       <button id="apply-track-correction-btn" class="secondary-btn">Apply</button>
-    </div>
-
-    <div id="correct-track-smart-stop" class="field-row" style="display:none">
-      <button id="compute-stop-frame-btn" class="secondary-btn">Smart-stop propagate (advanced): compute suggested stop frame</button>
+      <button id="compute-stop-frame-btn" class="secondary-btn" style="display:none">Smart-stop propagate</button>
     </div>
     <div id="smart-stop-result" class="status-line"></div>
     <div class="field-row">
@@ -295,6 +301,7 @@
     <div class="field-row">
       <label>Track A <input type="number" id="swap-track-a-input" class="small-input"></label>
       <label>Track B <input type="number" id="swap-track-b-input" class="small-input"></label>
+      <label class="checkbox-label"><input type="checkbox" id="swap-propagate-checkbox"> Propagate to later</label>
       <button id="apply-track-swap-btn" class="secondary-btn">Swap</button>
     </div>
     <div id="correct-track-swap-status" class="status-line"></div>

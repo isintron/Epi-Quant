@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 from matplotlib import colormaps
 from matplotlib.colors import rgb2hex
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from data_input import _find_matching_image
 
@@ -190,6 +190,7 @@ def render_tracking_overlay(
     label_cells: bool = True,
     track_color_mode: str = "uniform",
     identity_palette: str = "golden_angle",
+    label_font_size: int = 10,
 ) -> Image.Image:
     """Tint each cell by whether it's matched (present in `tracking_data`'s
     `Frame{frame_number}` column) or unmatched, generalizing v1's
@@ -197,7 +198,9 @@ def render_tracking_overlay(
     user-controlled colors. If `label_cells`, draws the resolved track
     `Index` (matched cells) or the raw `cell_id` (unmatched cells -- so the
     user has something to reference when assigning it to a track) at each
-    cell's centroid.
+    cell's centroid, at `label_font_size` (via `ImageFont.load_default`'s
+    `size` argument, supported since Pillow 10.1 -- no bundled font file
+    needed).
 
     `track_color_mode`: `"uniform"` (default) uses `matched_color`/
     `unmatched_color` as above. `"identity"` instead gives each matched
@@ -251,8 +254,9 @@ def render_tracking_overlay(
     pil_img = Image.fromarray(img)
     if label_cells:
         draw = ImageDraw.Draw(pil_img)
+        font = ImageFont.load_default(size=label_font_size)
         for cx, cy, text in labels:
-            draw.text((cx, cy), text, fill="white")
+            draw.text((cx, cy), text, fill="white", font=font)
 
     return pil_img
 

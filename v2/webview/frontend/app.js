@@ -22,10 +22,13 @@ const state = {
   trajectoryFrame: 1,
 
   clusterLegend: [],
-  selectedCellForCorrection: null, // {cell_index, cluster_label, cell_type}
+  selectedCellForCorrection: null, // {cell_index, cluster_label, cell_type} -- last-clicked cell, informational only
+  activeReassignCluster: null, // cluster_label picked as the reassignment target; persists across clicks/frames until toggled off
   selectedTrackCell: null, // {cell_index, cell_id, track_id}
   trackSwapSelection: [], // up to 2 {track_id, cell_index} picked while swap mode is on, same frame only
   smartStopPending: null, // {oldId, newId, stopFrame} once a stop frame has been computed, awaiting Apply
+  suggestCheckTrackId: null, // track id awaiting a "Check how far this holds" diagnostic, after a Suggest-match apply
+  confirmedMovesPending: null, // {trackId, moves} once a moves plan has been computed, awaiting Apply
 
   trackingModeOptions: { has_leading_edge: false, split_available: false },
   trackNumbers: [],
@@ -61,6 +64,14 @@ function setStatus(elId, message, kind) {
   const el = document.getElementById(elId);
   el.textContent = message;
   el.className = "status-line" + (kind ? " " + kind : "");
+}
+
+// Collision-guard notices (see manual_correction_tracking.py's
+// _evict_future_if_colliding): never silently absorbed, always appended to
+// whatever success message the caller is already showing.
+function describeDisplacement(displaced) {
+  if (!displaced) return "";
+  return ` (Track #${displaced.evicted_track_id} already had different data from frame ${displaced.from_frame} on -- moved it to new track #${displaced.new_track_id}.)`;
 }
 
 // ---------------------------------------------------------------------
@@ -370,13 +381,21 @@ function renderClusterPicker() {
   picker.innerHTML = "";
   state.clusterLegend.forEach((entry) => {
     const btn = document.createElement("button");
-    btn.className = "secondary-btn";
+    btn.className = "secondary-btn" + (state.activeReassignCluster === entry.cluster_label ? " active" : "");
     const swatch = document.createElement("span");
     swatch.className = "swatch";
     swatch.style.background = entry.color;
     btn.appendChild(swatch);
     btn.appendChild(document.createTextNode(entry.cell_type));
-    btn.addEventListener("click", () => applyClusterReassignment(entry.cluster_label));
+    btn.addEventListener("click", () => {
+      const alreadyActive = state.activeReassignCluster === entry.cluster_label;
+      state.activeReassignCluster = alreadyActive ? null : entry.cluster_label;
+      renderClusterPicker();
+      setStatus(
+        "correct-class-selected-cell",
+        alreadyActive ? "" : `Target cluster: ${entry.cell_type}. Click cells in the image to reassign them.`,
+      );
+    });
     picker.appendChild(btn);
   });
 }
@@ -429,23 +448,30 @@ async function handleCorrectClassImageClick(event) {
   const { x, y } = imagePixelFromClick(img, event);
   const result = await window.EpiQuantAPI.get_cell_at_pixel(state.correctClassFrame, x, y);
   if (!result) {
-    document.getElementById("correct-class-selected-cell").textContent = "No cell at that position.";
+    setStatus("correct-class-selected-cell", "No cell at that position.", "error");
     state.selectedCellForCorrection = null;
     return;
   }
   state.selectedCellForCorrection = result;
-  document.getElementById("correct-class-selected-cell").textContent =
-    `Selected ${result.cell_index} (currently ${result.cell_type || "unclassified"}). Pick a new cluster below.`;
-}
 
-async function applyClusterReassignment(newLabel) {
-  if (!state.selectedCellForCorrection) return;
-  const legend = await window.EpiQuantAPI.reassign_cluster(state.selectedCellForCorrection.cell_index, newLabel);
+  if (state.activeReassignCluster === null || state.activeReassignCluster === undefined) {
+    setStatus(
+      "correct-class-selected-cell",
+      `${result.cell_index}: currently ${result.cell_type || "unclassified"}. Pick a target cluster below first.`,
+    );
+    return;
+  }
+  if (result.cluster_label === state.activeReassignCluster) {
+    setStatus("correct-class-selected-cell", `${result.cell_index} is already in this cluster.`);
+    return;
+  }
+
+  const targetLabel = state.activeReassignCluster;
+  const legend = await window.EpiQuantAPI.reassign_cluster(result.cell_index, targetLabel);
   state.clusterLegend = legend;
-  document.getElementById("correct-class-selected-cell").textContent =
-    `Reassigned ${state.selectedCellForCorrection.cell_index} -> cluster ${newLabel}.`;
   await refreshClusterLegend();
   await showCorrectClassFrame(state.correctClassFrame);
+  setStatus("correct-class-selected-cell", `Reassigned ${result.cell_index} -> cluster ${targetLabel}.`, "success");
 }
 
 async function handleSaveClassificationCorrections() {
@@ -523,27 +549,34 @@ function onTrackError(data) {
 // Correct Tracking
 // ---------------------------------------------------------------------
 
+async function refreshCorrectTrackImage() {
+  const showLabels = document.getElementById("correct-track-show-labels").checked;
+  const identityPalette = document.getElementById("correct-track-identity-palette-select").value;
+  const labelFontSize = parseInt(document.getElementById("correct-track-label-size-input").value, 10) || 10;
+  const img = await window.EpiQuantAPI.get_tracking_overlay(
+    state.correctTrackFrame, getRenderMode("correct-track"), showLabels, getColorMode("correct-track"),
+    identityPalette, labelFontSize
+  );
+  if (img) document.getElementById("correct-track-overlay-img").src = img;
+}
+
 async function showCorrectTrackFrame(frame) {
   state.correctTrackFrame = frame;
   document.getElementById("correct-track-frame-label").textContent = frameLabel(frame);
-  const showLabels = document.getElementById("correct-track-show-labels").checked;
-  const identityPalette = document.getElementById("correct-track-identity-palette-select").value;
-  const img = await window.EpiQuantAPI.get_tracking_overlay(
-    frame, getRenderMode("correct-track"), showLabels, getColorMode("correct-track"), identityPalette
-  );
-  if (img) document.getElementById("correct-track-overlay-img").src = img;
+  await refreshCorrectTrackImage();
   document.getElementById("correct-track-selected-cell").textContent = "";
   document.getElementById("correct-track-reassign").style.display = "none";
   document.getElementById("correct-track-suggest").style.display = "none";
   document.getElementById("correct-track-suggest-list").style.display = "none";
   resetSmartStopPanel();
+  resetSuggestCheckButton();
   state.selectedTrackCell = null;
   resetTrackSwapSelection();
 }
 
 function resetSmartStopPanel() {
   state.smartStopPending = null;
-  document.getElementById("correct-track-smart-stop").style.display = "none";
+  document.getElementById("compute-stop-frame-btn").style.display = "none";
   document.getElementById("smart-stop-result").textContent = "";
   document.getElementById("apply-smart-stop-btn").style.display = "none";
 }
@@ -552,6 +585,7 @@ function resetTrackSwapSelection() {
   state.trackSwapSelection = [];
   document.getElementById("swap-track-a-input").value = "";
   document.getElementById("swap-track-b-input").value = "";
+  document.getElementById("swap-propagate-checkbox").checked = false;
   document.getElementById("correct-track-swap-status").textContent = "";
 }
 
@@ -584,13 +618,23 @@ async function handleApplyTrackSwap() {
     setStatus("correct-track-swap-status", "Enter two valid track numbers.", "error");
     return;
   }
-  const result = await window.EpiQuantAPI.swap_tracks(state.correctTrackFrame, idA, idB);
+  const propagate = document.getElementById("swap-propagate-checkbox").checked;
+  const result = await window.EpiQuantAPI.swap_tracks(state.correctTrackFrame, idA, idB, propagate);
   if (result && result.error) {
     setStatus("correct-track-swap-status", `Error: ${result.error}`, "error");
     return;
   }
+  let message = "Swapped.";
+  if (propagate && result) {
+    const swappedCount = (result.swapped_frames || []).length;
+    const skippedCount = (result.skipped_frames || []).length;
+    message = `Swapped ${swappedCount} frame(s) from frame ${state.correctTrackFrame} on.`;
+    if (skippedCount) {
+      message += ` (${skippedCount} frame(s) skipped -- one side was unmatched there: ${result.skipped_frames.join(", ")}.)`;
+    }
+  }
   await showCorrectTrackFrame(state.correctTrackFrame);
-  setStatus("correct-track-swap-status", "Swapped.", "success");
+  setStatus("correct-track-swap-status", message, "success");
 }
 
 async function handleCorrectTrackImageClick(event) {
@@ -608,6 +652,7 @@ async function handleCorrectTrackImageClick(event) {
     document.getElementById("correct-track-suggest").style.display = "none";
     document.getElementById("correct-track-suggest-list").style.display = "none";
     resetSmartStopPanel();
+  resetSuggestCheckButton();
     return;
   }
   state.selectedTrackCell = result;
@@ -620,15 +665,13 @@ async function handleCorrectTrackImageClick(event) {
   document.getElementById("propagate-correction-checkbox").checked = false;
 
   resetSmartStopPanel();
-  document.getElementById("correct-track-smart-stop").style.display = isMatched ? "flex" : "none";
+  resetSuggestCheckButton();
+  document.getElementById("compute-stop-frame-btn").style.display = isMatched ? "inline-block" : "none";
 
   document.getElementById("correct-track-suggest").style.display = "flex";
   document.getElementById("correct-track-suggest-list").style.display = "none";
   document.getElementById("correct-track-suggest-list").innerHTML = "";
-  document.getElementById("correct-track-suggest-hint").textContent = isMatched
-    ? ""
-    : "Select a matched cell to find its likely continuation.";
-  document.getElementById("suggest-match-btn").disabled = !isMatched;
+  document.getElementById("correct-track-suggest-hint").textContent = "";
 }
 
 async function handleApplyTrackCorrection() {
@@ -654,8 +697,9 @@ async function handleApplyTrackCorrection() {
   if (result && result.error) {
     setStatus("correct-track-selected-cell", `Error: ${result.error}`, "error");
   } else {
-    setStatus("correct-track-selected-cell", "Applied.", "success");
+    const note = describeDisplacement(result && result.displaced);
     await showCorrectTrackFrame(state.correctTrackFrame);
+    setStatus("correct-track-selected-cell", `Applied.${note}`, "success");
   }
 }
 
@@ -692,12 +736,13 @@ async function handleApplySmartStop() {
     setStatus("smart-stop-result", `Error: ${result.error}`, "error");
     return;
   }
+  const note = describeDisplacement(result && result.displaced);
   await showCorrectTrackFrame(state.correctTrackFrame);
-  setStatus("smart-stop-result", `Merged through frame ${stopFrame}.`, "success");
+  setStatus("smart-stop-result", `Merged through frame ${stopFrame}.${note}`, "success");
 }
 
 async function handleSuggestMatch() {
-  if (!state.selectedTrackCell || state.selectedTrackCell.track_id === null || state.selectedTrackCell.track_id === undefined) return;
+  if (!state.selectedTrackCell) return;
   const result = await window.EpiQuantAPI.suggest_match_candidates(state.correctTrackFrame, state.selectedTrackCell.cell_index, 3);
   const list = document.getElementById("correct-track-suggest-list");
   list.innerHTML = "";
@@ -709,29 +754,120 @@ async function handleSuggestMatch() {
   }
   const candidates = (result && result.candidates) || [];
   if (candidates.length === 0) {
-    list.textContent = "No unmatched candidates found in the next frame.";
+    list.textContent = "No orphaned tracks found in the previous frame.";
     return;
   }
-  const trackId = state.selectedTrackCell.track_id;
+  const selectedCell = state.selectedTrackCell;
+  const currentTrackId = selectedCell.track_id !== null && selectedCell.track_id !== undefined ? selectedCell.track_id : null;
+
   candidates.forEach((candidate) => {
     const item = document.createElement("li");
-    item.textContent = `${candidate.cell_index} (${candidate.distance.toFixed(1)}px) `;
+    item.textContent = `Track #${candidate.track_id} (last seen ${candidate.cell_index}, ${candidate.distance.toFixed(1)}px away) `;
     const useBtn = document.createElement("button");
     useBtn.className = "secondary-btn";
     useBtn.textContent = "Use this";
     useBtn.addEventListener("click", async () => {
-      const addResult = await window.EpiQuantAPI.add_tracking_id(state.correctTrackFrame + 1, trackId, candidate.cell_index);
-      if (addResult && addResult.error) {
-        setStatus("correct-track-suggest-list", `Error: ${addResult.error}`, "error");
-      } else {
-        setStatus("correct-track-selected-cell", `Attached ${candidate.cell_index} to track #${trackId} at frame ${state.correctTrackFrame + 1}.`, "success");
-        list.style.display = "none";
-        list.innerHTML = "";
+      // Unmatched source -> attach directly; already (wrongly) matched
+      // source -> move its claim onto the candidate track instead.
+      const applyResult = currentTrackId === null
+        ? await window.EpiQuantAPI.add_tracking_id(state.correctTrackFrame, candidate.track_id, selectedCell.cell_index)
+        : await window.EpiQuantAPI.reassign_track(state.correctTrackFrame, currentTrackId, candidate.track_id, false);
+
+      if (applyResult && applyResult.error) {
+        setStatus("correct-track-suggest-list", `Error: ${applyResult.error}`, "error");
+        return;
       }
+      const note = describeDisplacement(applyResult && applyResult.displaced);
+      list.style.display = "none";
+      list.innerHTML = "";
+      await refreshCorrectTrackImage();
+      showSuggestCheckButton(candidate.track_id);
+      setStatus("correct-track-selected-cell", `Attached ${selectedCell.cell_index} to track #${candidate.track_id}.${note}`, "success");
     });
     item.appendChild(useBtn);
     list.appendChild(item);
   });
+}
+
+function showSuggestCheckButton(trackId) {
+  state.suggestCheckTrackId = trackId;
+  document.getElementById("correct-track-suggest-check").style.display = "flex";
+  document.getElementById("suggest-check-result").textContent = "";
+}
+
+function resetSuggestCheckButton() {
+  state.suggestCheckTrackId = null;
+  state.confirmedMovesPending = null;
+  document.getElementById("correct-track-suggest-check").style.display = "none";
+  document.getElementById("suggest-check-result").textContent = "";
+  document.getElementById("suggest-check-moves-list").style.display = "none";
+  document.getElementById("suggest-check-moves-list").innerHTML = "";
+  document.getElementById("apply-confirmed-moves-btn").style.display = "none";
+}
+
+async function handleCheckSuggestHolds() {
+  if (state.suggestCheckTrackId === null || state.suggestCheckTrackId === undefined) return;
+  const trackId = state.suggestCheckTrackId;
+  const result = await window.EpiQuantAPI.compute_confirmed_identity_moves(state.correctTrackFrame, trackId, 20);
+  const list = document.getElementById("suggest-check-moves-list");
+  const applyBtn = document.getElementById("apply-confirmed-moves-btn");
+
+  if (result && result.error) {
+    setStatus("suggest-check-result", `Error: ${result.error}`, "error");
+    list.style.display = "none";
+    applyBtn.style.display = "none";
+    return;
+  }
+
+  const moves = result.moves || [];
+  list.innerHTML = "";
+
+  if (moves.length === 0) {
+    setStatus(
+      "suggest-check-result",
+      `Holds through frame ${result.stop_frame} (${result.reason}) -- no further corrections needed.`,
+      "success"
+    );
+    list.style.display = "none";
+    applyBtn.style.display = "none";
+    state.confirmedMovesPending = null;
+    return;
+  }
+
+  setStatus(
+    "suggest-check-result",
+    `Found ${moves.length} correction(s) needed through frame ${result.stop_frame} (${result.reason}):`,
+    "success"
+  );
+  moves.forEach((move) => {
+    const item = document.createElement("li");
+    const fromText = move.from_track_id === null || move.from_track_id === undefined
+      ? "unmatched" : `track #${move.from_track_id}`;
+    item.textContent = `Frame ${move.frame}: currently ${fromText} → would become track #${trackId} (${move.cell_index})`;
+    list.appendChild(item);
+  });
+  list.style.display = "block";
+
+  state.confirmedMovesPending = { trackId, moves };
+  applyBtn.textContent = `Apply ${moves.length} correction(s)`;
+  applyBtn.style.display = "inline-block";
+}
+
+async function handleApplyConfirmedMoves() {
+  if (!state.confirmedMovesPending) return;
+  const { trackId, moves } = state.confirmedMovesPending;
+  const result = await window.EpiQuantAPI.apply_confirmed_identity_moves(trackId, moves);
+  if (result && result.error) {
+    setStatus("suggest-check-result", `Error: ${result.error}`, "error");
+    return;
+  }
+  const notes = (result.displaced_list || []).map(describeDisplacement).join("");
+  document.getElementById("suggest-check-moves-list").style.display = "none";
+  document.getElementById("suggest-check-moves-list").innerHTML = "";
+  document.getElementById("apply-confirmed-moves-btn").style.display = "none";
+  state.confirmedMovesPending = null;
+  await refreshCorrectTrackImage();
+  setStatus("suggest-check-result", `Applied ${moves.length} correction(s).${notes}`, "success");
 }
 
 async function handleSaveTrackingCorrections() {
@@ -1064,6 +1200,7 @@ function init() {
   wireFrameWheel("correct-track", "correct-track-overlay-img");
   wireRenderMode("correct-track", () => showCorrectTrackFrame(state.correctTrackFrame));
   document.getElementById("correct-track-show-labels").addEventListener("change", () => showCorrectTrackFrame(state.correctTrackFrame));
+  document.getElementById("correct-track-label-size-input").addEventListener("change", refreshCorrectTrackImage);
   wireColorMode("correct-track", () => {
     const isIdentity = getColorMode("correct-track") === "identity";
     document.getElementById("correct-track-uniform-colors").style.display = isIdentity ? "none" : "flex";
@@ -1074,6 +1211,8 @@ function init() {
   document.getElementById("correct-track-overlay-img").addEventListener("click", handleCorrectTrackImageClick);
   document.getElementById("apply-track-correction-btn").addEventListener("click", handleApplyTrackCorrection);
   document.getElementById("suggest-match-btn").addEventListener("click", handleSuggestMatch);
+  document.getElementById("check-suggest-holds-btn").addEventListener("click", handleCheckSuggestHolds);
+  document.getElementById("apply-confirmed-moves-btn").addEventListener("click", handleApplyConfirmedMoves);
   document.getElementById("compute-stop-frame-btn").addEventListener("click", handleComputeStopFrame);
   document.getElementById("apply-smart-stop-btn").addEventListener("click", handleApplySmartStop);
   document.getElementById("track-swap-mode-checkbox").addEventListener("change", resetTrackSwapSelection);

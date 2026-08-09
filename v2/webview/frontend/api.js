@@ -137,32 +137,48 @@
       })();
       return true;
     },
-    async get_tracking_overlay(_frame, _renderMode, _showLabels, _colorMode, _identityPalette) {
+    async get_tracking_overlay(_frame, _renderMode, _showLabels, _colorMode, _identityPalette, _labelFontSize) {
       return MOCK_PNG;
     },
     async get_tracking_cell_at_pixel(frame, _x, _y) {
       return { cell_index: `Cell${frame}_1`, cell_id: 1, track_id: 1 };
     },
     async reassign_track(_frame, _oldId, _newId, _propagate) {
-      return { success: true };
+      return { success: true, displaced: null };
     },
     async add_tracking_id(_frame, _newIndex, _cellIdStr) {
-      return { success: true };
+      return { success: true, displaced: null };
     },
-    async swap_tracks(_frame, _idA, _idB) {
+    async swap_tracks(frame, _idA, _idB, propagate) {
+      if (propagate) {
+        return { success: true, swapped_frames: [frame, frame + 1], skipped_frames: [] };
+      }
       return { success: true };
     },
     async suggest_match_candidates(frame, _cellIndex, _topK) {
       return { candidates: [
-        { cell_index: `Cell${frame + 1}_2`, cell_id: 2, distance: 4.2 },
-        { cell_index: `Cell${frame + 1}_3`, cell_id: 3, distance: 11.7 },
+        { track_id: 2, cell_index: `Cell${frame - 1}_2`, distance: 4.2 },
+        { track_id: 3, cell_index: `Cell${frame - 1}_3`, distance: 11.7 },
       ] };
     },
     async compute_propagation_stop_frame(frame, _oldId, _newId, _maxFramesAhead) {
       return { stop_frame: frame + 2, reason: "settled", unsettled_neighbors_by_frame: { [frame + 1]: [`Cell${frame + 1}_4`] } };
     },
     async apply_smart_stop_merge(_frame, _oldId, _newId, _endFrame) {
-      return { success: true };
+      return { success: true, displaced: null };
+    },
+    async compute_confirmed_identity_moves(frame, trackId, _maxFramesAhead) {
+      return {
+        stop_frame: frame + 3,
+        reason: "settled",
+        moves: [
+          { frame: frame + 1, from_track_id: 12, cell_index: `Cell${frame + 1}_5` },
+          { frame: frame + 2, from_track_id: null, cell_index: `Cell${frame + 2}_6` },
+        ],
+      };
+    },
+    async apply_confirmed_identity_moves(_trackId, _moves) {
+      return { success: true, displaced_list: [] };
     },
     async save_tracking() {
       return null;

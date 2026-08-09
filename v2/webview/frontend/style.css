@@ -122,9 +122,15 @@ input[type="text"], input[type="number"], select {
 }
 
 .small-input {
-  flex: none;
-  width: 70px;
-  min-width: unset;
+  flex: none !important;
+  width: 70px !important;
+  min-width: unset !important;
+}
+
+.track-id-input {
+  flex: none !important;
+  width: 60px !important;
+  min-width: unset !important;
 }
 
 .k-range-row {
@@ -302,6 +308,11 @@ button:disabled {
   height: 14px;
   border-radius: 3px;
   display: inline-block;
+}
+
+.cluster-picker button.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
 }
 
 .hint {

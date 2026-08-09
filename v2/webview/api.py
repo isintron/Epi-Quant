@@ -516,6 +516,7 @@ class EpiQuantAPI:
     def get_tracking_overlay(
         self, frame_number: int, render_mode: str = "mask", show_labels: bool = True,
         track_color_mode: str = "uniform", identity_palette: str = "golden_angle",
+        label_font_size: int = 10,
     ) -> Optional[str]:
         if self.tracking_data is None:
             return None
@@ -527,6 +528,7 @@ class EpiQuantAPI:
         overlay = rendering.render_tracking_overlay(
             label_array, base_image, frame_number, self.tracking_data, self.matched_color, self.unmatched_color,
             label_cells=show_labels, track_color_mode=track_color_mode, identity_palette=identity_palette,
+            label_font_size=label_font_size,
         )
         return rendering.encode_png_base64(overlay)
 
@@ -556,14 +558,14 @@ class EpiQuantAPI:
         leaves every later frame still wrongly attached to `old_id`."""
         try:
             if propagate:
-                manual_correction_tracking.merge_tracks_from_frame(
+                self.tracking_data, displaced = manual_correction_tracking.merge_tracks_from_frame(
                     self.tracking_data, int(frame_number), int(old_id), int(new_id),
                 )
             else:
-                manual_correction_tracking.update_tracking_data(
+                self.tracking_data, displaced = manual_correction_tracking.update_tracking_data(
                     self.tracking_data, self.original_tracking_data, int(frame_number), int(old_id), int(new_id),
                 )
-            return {"success": True}
+            return {"success": True, "displaced": displaced}
         except ValueError as e:
             return {"error": str(e)}
 
@@ -583,15 +585,52 @@ class EpiQuantAPI:
 
     def apply_smart_stop_merge(self, frame_number: int, old_id: int, new_id: int, end_frame: int) -> dict:
         try:
-            manual_correction_tracking.merge_tracks_from_frame(
+            self.tracking_data, displaced = manual_correction_tracking.merge_tracks_from_frame(
                 self.tracking_data, int(frame_number), int(old_id), int(new_id), end_frame=int(end_frame),
             )
-            return {"success": True}
+            return {"success": True, "displaced": displaced}
         except ValueError as e:
             return {"error": str(e)}
 
-    def swap_tracks(self, frame_number: int, id_a: int, id_b: int) -> dict:
+    def compute_confirmed_identity_moves(
+        self, frame_number: int, track_id: int, max_frames_ahead: int = 20,
+    ) -> dict:
+        """Diagnostic-only: plans (but does not apply) the position-based
+        propagation used after a Suggest-match attach, in case the same
+        physical cell was subsequently claimed by a sequence of DIFFERENT
+        wrong tracks rather than one consistently-wrong one (see
+        `manual_correction_tracking.find_confirmed_identity_moves`)."""
+        if self.tracking_data is None or self.cells_info is None:
+            return {"error": "No tracking data loaded."}
         try:
+            return manual_correction_tracking.find_confirmed_identity_moves(
+                self.tracking_data, self.cells_info,
+                lambda f: (self._load_frame(f) or (None, None, None))[0],
+                int(frame_number), int(track_id), max_frames_ahead=int(max_frames_ahead),
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+
+    def apply_confirmed_identity_moves(self, track_id: int, moves: list) -> dict:
+        try:
+            self.tracking_data, displaced_list = manual_correction_tracking.apply_confirmed_identity_moves(
+                self.tracking_data, int(track_id), moves,
+            )
+            return {"success": True, "displaced_list": displaced_list}
+        except ValueError as e:
+            return {"error": str(e)}
+
+    def swap_tracks(self, frame_number: int, id_a: int, id_b: int, propagate: bool = False) -> dict:
+        """`propagate=True` exchanges `id_a`/`id_b` at every frame from
+        `frame_number` onward (`manual_correction_tracking
+        .swap_tracks_from_frame`) instead of only that one frame -- mirrors
+        `reassign_track`'s own propagate option."""
+        try:
+            if propagate:
+                result = manual_correction_tracking.swap_tracks_from_frame(
+                    self.tracking_data, int(frame_number), int(id_a), int(id_b),
+                )
+                return {"success": True, **result}
             manual_correction_tracking.swap_tracks_at_frame(
                 self.tracking_data, int(frame_number), int(id_a), int(id_b),
             )
@@ -604,7 +643,9 @@ class EpiQuantAPI:
             return {"candidates": []}
         try:
             candidates = manual_correction_tracking.suggest_match_candidates(
-                self.cells_info, self.tracking_data, int(frame_number), cell_index, top_k=int(top_k),
+                self.cells_info, self.tracking_data, int(frame_number), cell_index,
+                lambda f: (self._load_frame(f) or (None, None, None))[0],
+                top_k=int(top_k),
             )
             return {"candidates": candidates}
         except (KeyError, ValueError) as e:
@@ -612,10 +653,10 @@ class EpiQuantAPI:
 
     def add_tracking_id(self, frame_number: int, new_index: int, cell_id_str: str) -> dict:
         try:
-            manual_correction_tracking.add_tracking_id(
+            self.tracking_data, displaced = manual_correction_tracking.add_tracking_id(
                 self.tracking_data, int(frame_number), int(new_index), cell_id_str,
             )
-            return {"success": True}
+            return {"success": True, "displaced": displaced}
         except KeyError as e:
             return {"error": str(e)}
 
@@ -760,6 +801,9 @@ if __name__ == "__main__":
 
             print("compute_propagation_stop_frame (expect a graceful dict):",
                   api.compute_propagation_stop_frame(frame_range["min_frame"], old_id, other_track))
+
+            print("compute_confirmed_identity_moves (expect a graceful dict):",
+                  api.compute_confirmed_identity_moves(frame_range["min_frame"], old_id))
 
             api.save_tracking()
             print("Saved tracking.")

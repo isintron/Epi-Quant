@@ -255,6 +255,127 @@ graph builds in well under a second even on ~2800-cell/24-frame real
 segmentation, and the walk correctly resolves both a genuine "matched" and a
 forced "unsettled" scenario.
 
+### Round 2: correction-workflow UX + collision-safety redesign (2026-08-09)
+
+Follow-up after using round 1's features in practice surfaced three UX
+frictions and two real defects.
+
+**Collision guard (new default, no opt-in flag)**: `update_tracking_data`,
+`add_tracking_id`, and `merge_tracks_from_frame` now return
+`(tracking_data, displaced)` instead of a bare `DataFrame` — before any of
+them would overwrite a target track's slot that already holds a *different*,
+live claim, a new `_evict_future_if_colliding` helper first relocates that
+claim's entire future (from the collision point onward) onto a
+freshly-minted track ID (`max(existing Index) + 1`), rather than silently
+destroying it. This is the fix for a real cascading-mismatch bug: fixing one
+track's identity could previously corrupt a third, unrelated track when
+their target IDs collided (confirmed via a real 3-cell trace — `Cell_i`,
+`Cell_j`, `Cell_k` — and reproduced as a smoke test). Checked external prior
+art (napari's MMV_H4Tracks "Separate" function, CVAT's ID-correction guide,
+EPySeg's own presence-based refuse-or-swap dispatch) — auto-bump-to-a-fresh-ID
+is the standard pattern; EPySeg's alternative (refuse and demand manual
+resolution) is strictly more restrictive. `merge_tracks_from_frame` also
+gained a same-track guard (`old_id == new_id` now raises `ValueError`) after
+this work surfaced that merging a track into itself would silently null out
+its own data — relevant to the new "Check how far this holds" diagnostic
+below, which deliberately calls it with `old_id == new_id` for a read-only
+neighbor-settlement check.
+
+**`swap_tracks_from_frame`** — swap with propagate, mirroring
+`merge_tracks_from_frame`'s "Propagate to later frames" checkbox but for a
+mutual swap: loops `swap_tracks_at_frame` per frame across a range, skipping
+(and reporting) any frame where only one side has a claim rather than
+aborting the whole range. Since a swap only ever exchanges values between
+the same two rows, it needs none of the eviction logic above.
+
+**`suggest_match_candidates` reversed direction** — now searches *backward*:
+given a selected cell at frame `f` (typically unmatched, but works for a
+wrongly-matched one too), it ranks "orphaned" tracks — ones with a claim at
+`f-1` but none at `f` — by centroid distance, matching how a user actually
+notices a problem (they see the broken cell at the *later* frame). Also
+gained a mask-fallback (`_centroid_and_radius_from_mask`) for cells missing
+from `Cells_info.xlsx` — root-caused to the Extract step's `exclude_edge_cells`
+option, which drops edge-touching cells from `Cells_info.xlsx` while leaving
+them fully intact in the segmentation mask, so they were clickable and
+addable via `add_tracking_id` (which never needed `cells_info`) but crashed
+`suggest_match_candidates` with a `KeyError`. `find_propagation_stop_frame`
+got the same fallback for its neighbor lookups. After a suggestion is
+applied, a new manual "Check how far this holds →" button reuses
+`compute_propagation_stop_frame` purely diagnostically (see the `old_id ==
+new_id` guard above).
+
+**Correct Classification UX** — reversed to target-cluster-first: pick a
+cluster from the (existing) picker buttons, which now toggle an "active"
+highlight and persist across clicks/frame navigation, then click cells to
+reassign them immediately (mirrors the Correct Tracking swap-mode
+convention: pick a mode, then clicks act immediately, no separate apply
+step).
+
+**Correct Tracking panel consolidation** — the Smart-stop trigger moved into
+the same row as the reassign panel's Apply button (shortened label:
+"Smart-stop propagate"), and the track-# input got a dedicated
+`.track-id-input` CSS class instead of the shared `.small-input`. Note:
+`!important` was required on its properties — `.small-input` and
+`.track-id-input` both lose to the generic `input[type="number"]` rule's
+`min-width: 120px` on plain specificity, a pre-existing bug affecting every
+`.small-input` field (FPS/zoom/swap inputs all silently render at 120px
+instead of 70px) that was flagged separately rather than fixed here (fixed
+in a follow-up session, same `!important` treatment).
+
+### Round 3: UI polish + position-based identity propagation (2026-08-09)
+
+Testing round 2 in the real (dev-mode) app surfaced three small UI issues,
+fixed directly: `.track-id-input` widened 45px → 60px (45 proved too
+narrow in practice); both "Propagate to later frames" checkboxes shortened
+to "Propagate to later" (the reassign row was getting crowded after round
+2's Smart-stop consolidation); and a real bug where Suggest-match's "Use
+this" never refreshed the on-image cell-ID labels (traced to its click
+handler being the one place that didn't call an equivalent of
+`showCorrectTrackFrame`'s image re-fetch — fixed by extracting a
+`refreshCorrectTrackImage()` helper shared by both). Also added an
+adjustable label-size control (`ImageFont.load_default(size=N)`, supported
+since Pillow 10.1 — no bundled font file needed; verified in this
+environment's Pillow 12.3.0).
+
+**The more substantial finding**: "Check how far this holds" (round 2's
+Suggest-match follow-up) turned out to be diagnostic-only — it called
+`compute_propagation_stop_frame(frame, trackId, trackId, 20)`, which checks
+*neighbor*-topology settlement, not whether the corrected cell's own track
+number stays correct going forward. It couldn't handle the actual reported
+scenario: a physical cell manually attached to a track at frame f, whose
+identity then churns through **several different wrong tracks** across
+subsequent frames (e.g. attached to track 18 at f, then found under track
+12 at f+1, track 14 at f+2, track 16 at f+3) — `find_propagation_stop_frame`
+trusts the track's own row as ground truth for future frames, which is
+right for the existing single-`old_id` Smart-stop-propagate use case but
+wrong here, since there's no single consistently-wrong `old_id`.
+
+New functions in `manual_correction_tracking.py`:
+- **`find_confirmed_identity_moves`** — walks forward from a human-confirmed
+  anchor cell by centroid position (nearest cell within
+  `drift_gate_multiplier * radius`, reusing the same displacement-gate
+  convention as `find_propagation_stop_frame`'s neighbor walk and
+  `build_cost_matrix`), and at each frame checks which track (if any)
+  currently claims the position-matched cell — recording a move whenever
+  it's unclaimed or claimed by a *different* track. Explicitly not a
+  revival of the removed "local re-track" feature: it never re-runs
+  Hungarian or proposes an initial match on its own, it only extends an
+  already-confirmed anchor one small gated step at a time. Returns a plan,
+  applies nothing.
+- **`apply_confirmed_identity_moves`** — applies that plan in one batch
+  (confirmed with the user: all-at-once, not per-move confirmation),
+  reusing the same `_evict_future_if_colliding` collision guard as every
+  other write path.
+
+Verified against real data (`test_data/AS_dorsal view_E-cad`): simulated a
+3-track churn by nulling a real track's claims across three frames and
+reassigning those same physical cells to three unrelated tracks — the walk
+correctly identified and named all three, and applying the plan correctly
+reunited them onto the original track with the churned tracks' claims
+cleared. Kept entirely separate from the existing neighbor-based
+"Smart-stop propagate" (per the user's confirmed scope decision) — that
+feature and its backing functions are untouched.
+
 ## pywebview UI (`v2/webview/`) — handoff notes
 
 **Status (updated 2026-08-08): substantially matured through several rounds

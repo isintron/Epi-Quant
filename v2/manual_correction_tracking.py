@@ -63,14 +63,22 @@ def update_tracking_data(
     frame_number: int,
     old_id: int,
     new_id: int,
-) -> pd.DataFrame:
+) -> tuple:
     """Reassign the cell that track `old_id` had in `frame_number` onto track
     `new_id` instead: looks up `old_id`'s original (pre-correction) value for
     that frame in `original_tracking_data`, writes it into `new_id`'s row,
     and nulls out any other row that already held that same cell string in
-    that frame column (dedup). Returns `tracking_data` (mutated in place and
-    returned for convenience) — call `save_tracking_data` separately to
-    persist.
+    that frame column (dedup). Returns `(tracking_data, displaced)` — call
+    `save_tracking_data` separately to persist.
+
+    `displaced` is `None` unless `new_id` already held a *different*, live
+    claim at `frame_number` — in that case, that claim's entire future (from
+    `frame_number` onward) is first relocated onto a freshly-minted track ID
+    via `_evict_future_if_colliding`, rather than being silently destroyed,
+    and `displaced` is `{"evicted_track_id", "new_track_id", "from_frame"}`
+    describing what moved. `tracking_data` may be a NEW DataFrame object
+    when a relocation happens (appending a row changes object identity) --
+    always use the returned value.
 
     Raises `ValueError` if `old_id` isn't found in `original_tracking_data`,
     or `new_id` isn't found in `tracking_data`'s `Index` column (v1 showed a
@@ -97,19 +105,24 @@ def update_tracking_data(
         raise ValueError("The new ID does not exist in the index column. Invalid modification.")
     new_row_index = new_row_indices[0]
 
+    displaced = None
+    current_value = tracking_data.at[new_row_index, column_name]
+    if pd.notna(current_value) and current_value != original_cell_id_str:
+        tracking_data, displaced = _evict_future_if_colliding(tracking_data, "Index", new_row_index, frame_number)
+
     tracking_data.at[new_row_index, column_name] = original_cell_id_str
 
     for i, value in tracking_data[column_name].items():
         if value == original_cell_id_str and i != new_row_index:
             tracking_data.at[i, column_name] = None
 
-    return tracking_data
+    return tracking_data, displaced
 
 
 def merge_tracks_from_frame(
     tracking_data: pd.DataFrame, frame_number: int, old_id: int, new_id: int,
     end_frame: Optional[int] = None,
-) -> pd.DataFrame:
+) -> tuple:
     """From `frame_number` onward (inclusive), move every cell currently
     claimed by track `old_id` onto track `new_id` instead, clearing
     `old_id`'s claim for those frames. `frame_number` itself is included,
@@ -135,12 +148,29 @@ def merge_tracks_from_frame(
     Frames before `frame_number` are untouched on both tracks -- if
     `old_id` was a genuinely different track before the mismatch, its
     earlier history is preserved under `old_id`, only its future is
-    reassigned. Returns `tracking_data` (mutated in place and returned for
-    convenience).
+    reassigned. Returns `(tracking_data, displaced)`.
 
-    Raises `ValueError` if `old_id`/`new_id` aren't found in `tracking_data`'s
-    `Index` column.
+    `displaced` is `None` unless `new_id` already held live data at some
+    frame where `old_id` also has live data being moved onto it -- i.e. a
+    genuine collision (the exact scenario from a 3+ track cascading
+    mismatch, where fixing one track's identity would otherwise silently
+    overwrite a third, unrelated track). When that happens, `new_id`'s
+    entire future from the *first* overlapping frame onward is first
+    relocated to a freshly-minted track ID via `_evict_future_if_colliding`
+    (never silently discarded), and `displaced` describes what moved.
+    `tracking_data` may be a NEW DataFrame object when a relocation
+    happens -- always use the returned value.
+
+    Raises `ValueError` if `old_id == new_id` (merging a track into itself
+    would, per the loop below, write each frame's own value back onto
+    itself and then immediately null it out -- a real self-destructive
+    latent bug were this ever called that way; guarded here rather than
+    relying on every caller to avoid it), or if `old_id`/`new_id` aren't
+    found in `tracking_data`'s `Index` column.
     """
+    if int(old_id) == int(new_id):
+        raise ValueError("old_id and new_id must be different tracks to merge.")
+
     id_col = tracking_data.columns[0]
     frame_cols = [c for c in tracking_data.columns if c.startswith("Frame")]
     later_cols = [
@@ -156,13 +186,89 @@ def merge_tracks_from_frame(
         raise ValueError(f"Track {new_id} not found in the tracking data.")
     old_pos, new_pos = old_rows[0], new_rows[0]
 
+    overlap_frames = [
+        int(c[len("Frame"):]) for c in later_cols
+        if pd.notna(tracking_data.at[old_pos, c]) and pd.notna(tracking_data.at[new_pos, c])
+    ]
+    displaced = None
+    if overlap_frames:
+        tracking_data, displaced = _evict_future_if_colliding(tracking_data, id_col, new_pos, min(overlap_frames))
+
     for col in later_cols:
         value = tracking_data.at[old_pos, col]
         if pd.notna(value):
             tracking_data.at[new_pos, col] = value
             tracking_data.at[old_pos, col] = None
 
-    return tracking_data
+    return tracking_data, displaced
+
+
+def _centroid_and_radius_from_mask(fill_labels: np.ndarray, raw_id: int) -> Optional[tuple]:
+    """Fallback geometry for a cell missing from `cells_info` -- most often
+    one dropped by the Extract step's `exclude_edge_cells` option, which
+    removes edge-touching cells from `Cells_info.xlsx` (a deliberate,
+    scientifically-meaningful exclusion for morphometric statistics) while
+    leaving them fully intact in the segmentation mask used here for
+    correction-time lookups. Returns `(center_x, center_y, radius)` computed
+    directly from the mask's own pixel positions (radius = max distance from
+    centroid to any of the cell's own pixels, matching the "Circumscribed
+    Circle Radius" semantics used elsewhere in this module), or `None` if
+    `raw_id` isn't present in `fill_labels` at all.
+    """
+    ys, xs = np.where(fill_labels == raw_id)
+    if len(xs) == 0:
+        return None
+    center_x, center_y = float(xs.mean()), float(ys.mean())
+    radius = float(np.hypot(xs - center_x, ys - center_y).max())
+    return center_x, center_y, radius
+
+
+def _evict_future_if_colliding(
+    tracking_data: pd.DataFrame, id_col: str, target_row_pos, from_frame: int,
+) -> tuple:
+    """If `target_row_pos`'s row already holds non-null values at
+    `Frame{n}` for any `n >= from_frame`, relocate its entire future (from
+    `from_frame` onward) onto a freshly-minted track ID *before* the caller
+    overwrites that slot -- otherwise a reassign/merge into an
+    already-claimed target would silently destroy a third, unrelated
+    track's legitimate data. This is the collision guard used by
+    `update_tracking_data`, `add_tracking_id`, and `merge_tracks_from_frame`.
+
+    Returns `(tracking_data, None)` if nothing needed relocating (the
+    common, non-colliding case -- every caller's existing behavior is
+    unchanged then). Returns `(possibly-new tracking_data,
+    {"evicted_track_id": <old id>, "new_track_id": <fresh id>, "from_frame": from_frame})`
+    if a relocation happened -- appending a row changes the DataFrame's
+    identity, so callers must use the returned `tracking_data`, never
+    assume the original object was mutated in place, once eviction occurs.
+
+    The fresh ID is `max(existing Index) + 1` -- robust to non-contiguous
+    or gapped IDs (deleted/never-reused numbers), unlike a raw
+    row-count-based scheme.
+    """
+    frame_cols = [c for c in tracking_data.columns if c.startswith("Frame")]
+    later_cols = [c for c in frame_cols if int(c[len("Frame"):]) >= from_frame]
+
+    if not any(pd.notna(tracking_data.at[target_row_pos, c]) for c in later_cols):
+        return tracking_data, None
+
+    old_track_id = tracking_data.at[target_row_pos, id_col]
+    new_track_id = int(tracking_data[id_col].max()) + 1
+
+    new_row = {c: None for c in tracking_data.columns}
+    new_row[id_col] = new_track_id
+    for c in later_cols:
+        value = tracking_data.at[target_row_pos, c]
+        if pd.notna(value):
+            new_row[c] = value
+            tracking_data.at[target_row_pos, c] = None
+
+    new_row_label = (tracking_data.index.max() + 1) if len(tracking_data) else 0
+    tracking_data = pd.concat([tracking_data, pd.DataFrame([new_row], index=[new_row_label])])
+
+    return tracking_data, {
+        "evicted_track_id": int(old_track_id), "new_track_id": new_track_id, "from_frame": from_frame,
+    }
 
 
 def _claimed_cells_at_frame(tracking_data: pd.DataFrame, frame_number: int) -> set:
@@ -285,12 +391,21 @@ def find_propagation_stop_frame(
     unsettled = {}  # cell_index -> (x, y, radius)
     for label in neighbor_labels:
         neighbor_index = f"Cell{frame_number}_{label}"
-        if neighbor_index in claimed or neighbor_index not in cells_info_indexed.index:
+        if neighbor_index in claimed:
             continue
-        row = cells_info_indexed.loc[neighbor_index]
-        unsettled[neighbor_index] = (
-            float(row["Center X Coordinate"]), float(row["Center Y Coordinate"]), float(row["Circumscribed Circle Radius"]),
-        )
+        if neighbor_index in cells_info_indexed.index:
+            row = cells_info_indexed.loc[neighbor_index]
+            position = (
+                float(row["Center X Coordinate"]), float(row["Center Y Coordinate"]), float(row["Circumscribed Circle Radius"]),
+            )
+        else:
+            # Missing from cells_info -- most often an edge-excluded cell (see
+            # _centroid_and_radius_from_mask); fall back to the mask itself
+            # rather than silently dropping it from consideration.
+            position = _centroid_and_radius_from_mask(fill_labels, label)
+        if position is None:
+            continue
+        unsettled[neighbor_index] = position
 
     trail: dict = {}
     if not unsettled:
@@ -416,12 +531,243 @@ def swap_tracks_at_frame(
     return tracking_data
 
 
+def swap_tracks_from_frame(
+    tracking_data: pd.DataFrame, frame_number: int, id_a: int, id_b: int,
+    end_frame: Optional[int] = None,
+) -> dict:
+    """From `frame_number` onward (inclusive), exchange whatever `id_a` and
+    `id_b` each hold at EVERY frame in the range -- unlike a single
+    `swap_tracks_at_frame` call (one frame only), this handles a mutual
+    mislabeling that spans several frames, mirroring `merge_tracks_from_frame`'s
+    "propagate to later frames" checkbox but for a swap instead of a
+    one-directional relabel.
+
+    Reuses `swap_tracks_at_frame` per frame: since a swap only ever
+    exchanges values between these same two rows, it can never collide
+    with a third track, so none of `merge_tracks_from_frame`'s eviction
+    logic is needed here.
+
+    A frame where only one of `id_a`/`id_b` has a claim isn't swappable
+    (see `swap_tracks_at_frame`'s own one-sided guard) -- rather than
+    aborting the whole range at the first such frame, it's simply skipped
+    and reported. `end_frame=None` (the default) runs to the table's last
+    `Frame{n}` column.
+
+    Returns `{"swapped_frames": [...], "skipped_frames": [...]}`.
+
+    Raises `ValueError` if `id_a == id_b` or either ID doesn't exist in
+    `tracking_data` at all (checked once upfront, not per frame).
+    """
+    id_col = tracking_data.columns[0]
+    if int(id_a) == int(id_b):
+        raise ValueError("id_a and id_b must be different tracks to swap.")
+    if tracking_data.index[tracking_data[id_col] == int(id_a)].empty:
+        raise ValueError(f"Track {id_a} not found in the tracking data.")
+    if tracking_data.index[tracking_data[id_col] == int(id_b)].empty:
+        raise ValueError(f"Track {id_b} not found in the tracking data.")
+
+    frame_cols = [c for c in tracking_data.columns if c.startswith("Frame")]
+    frame_numbers = sorted(
+        int(c[len("Frame"):]) for c in frame_cols
+        if int(c[len("Frame"):]) >= frame_number and (end_frame is None or int(c[len("Frame"):]) <= end_frame)
+    )
+
+    swapped_frames = []
+    skipped_frames = []
+    for f in frame_numbers:
+        try:
+            swap_tracks_at_frame(tracking_data, f, id_a, id_b)
+            swapped_frames.append(f)
+        except ValueError:
+            skipped_frames.append(f)
+
+    return {"swapped_frames": swapped_frames, "skipped_frames": skipped_frames}
+
+
+def find_confirmed_identity_moves(
+    tracking_data: pd.DataFrame,
+    cells_info: pd.DataFrame,
+    fill_labels_by_frame: Callable[[int], Optional[np.ndarray]],
+    frame_number: int,
+    track_id: int,
+    max_frames_ahead: int = 20,
+    drift_gate_multiplier: float = 1.5,
+) -> dict:
+    """Starting from `track_id`'s own (human-confirmed) cell at
+    `frame_number` -- typically just attached via `suggest_match_candidates`
+    + `add_tracking_id`/`reassign_track` -- walk forward tracking that
+    SAME physical cell by centroid position, and reconcile it against
+    whichever track (if any) currently claims it at each later frame.
+
+    This is deliberately different from `find_propagation_stop_frame`: that
+    function trusts `old_id`'s own row values as ground truth for every
+    future frame, which is correct when there's one single, consistently-
+    wrong `old_id` to merge -- but wrong for a cell whose track number
+    churns through several DIFFERENT wrong tracks across consecutive frames
+    (e.g. a physical cell manually attached to track 18 at frame f, then
+    found under track 12 at f+1, track 14 at f+2, track 16 at f+3 -- three
+    separate wrong tracks, not one). Re-deriving the physical continuation
+    by position at each step (gated by `drift_gate_multiplier * radius`,
+    the same plausible-displacement convention as `build_cost_matrix` and
+    `find_propagation_stop_frame`'s own neighbor walk) is what lets this
+    follow the cell through that kind of churn. This is NOT a revival of
+    the removed "local re-track" feature (see `v2/README.md`'s changelog):
+    it only extends an already human-confirmed anchor forward one small,
+    gated step at a time, it never re-runs Hungarian or guesses an initial
+    match on its own.
+
+    Per frame, in order:
+    - no cell within the gate, or the frame has no cells at all -> stop,
+      `reason="disappeared"`.
+    - the nearest cell is already claimed by `track_id` itself -> stop,
+      `reason="settled"` (Hungarian recovered on its own; nothing left to
+      fix).
+    - the nearest cell is unclaimed -> record a move with
+      `from_track_id=None` (a plain attach), keep walking.
+    - the nearest cell is claimed by a DIFFERENT track -> record a move
+      naming that track, keep walking (the churn case).
+    - `max_frames_ahead` exhausted, or a `Frame{n}` column doesn't exist in
+      `tracking_data` -> stop, `reason="reached_max_frames_ahead"` or
+      `"track_ended"` respectively.
+
+    Returns `{"stop_frame": int, "reason": str, "moves": [{"frame": int,
+    "from_track_id": Optional[int], "cell_index": str}, ...]}` -- a plan
+    only; nothing is written here. Falls back to
+    `_centroid_and_radius_from_mask` for any cell missing from `cells_info`,
+    matching this module's other functions.
+
+    Raises `ValueError` if `track_id` doesn't exist in `tracking_data`, or
+    if it has no cell at `frame_number` to anchor from, or if that anchor
+    cell's position can't be resolved at all.
+    """
+    id_col = tracking_data.columns[0]
+    track_rows = tracking_data.index[tracking_data[id_col] == int(track_id)]
+    if track_rows.empty:
+        raise ValueError(f"Track {track_id} not found in the tracking data.")
+    track_row = track_rows[0]
+
+    anchor_col = f"Frame{frame_number}"
+    if anchor_col not in tracking_data.columns:
+        raise ValueError(f"Frame {frame_number} not found in the tracking data.")
+    anchor_cell = tracking_data.at[track_row, anchor_col]
+    if pd.isna(anchor_cell):
+        raise ValueError(f"Track {track_id} has no cell at frame {frame_number} to anchor from.")
+
+    cells_info_indexed = cells_info.set_index("Cell Index")
+
+    def _position(cell_index: str, frame: int):
+        if cell_index in cells_info_indexed.index:
+            row = cells_info_indexed.loc[cell_index]
+            return (
+                float(row["Center X Coordinate"]), float(row["Center Y Coordinate"]),
+                float(row["Circumscribed Circle Radius"]),
+            )
+        fill_labels = fill_labels_by_frame(frame)
+        if fill_labels is not None:
+            return _centroid_and_radius_from_mask(fill_labels, _raw_cell_id(cell_index))
+        return None
+
+    anchor_position = _position(anchor_cell, frame_number)
+    if anchor_position is None:
+        raise ValueError(
+            f"Could not resolve a position for {anchor_cell} (missing from cells_info and the segmentation mask)."
+        )
+    last_x, last_y, last_radius = anchor_position
+
+    moves: list = []
+    for f in range(frame_number + 1, frame_number + max_frames_ahead + 1):
+        frame_col = f"Frame{f}"
+        if frame_col not in tracking_data.columns:
+            return {"stop_frame": f - 1, "reason": "track_ended", "moves": moves}
+
+        frame_cells = cells_info_indexed[cells_info_indexed.index.str.startswith(f"Cell{f}_")]
+        if frame_cells.empty:
+            return {"stop_frame": f - 1, "reason": "disappeared", "moves": moves}
+
+        distances = np.hypot(
+            frame_cells["Center X Coordinate"].astype(float) - last_x,
+            frame_cells["Center Y Coordinate"].astype(float) - last_y,
+        )
+        nearest_index = distances.idxmin()
+        nearest_distance = float(distances.loc[nearest_index])
+        gate = drift_gate_multiplier * last_radius
+        if nearest_distance > gate:
+            return {"stop_frame": f - 1, "reason": "disappeared", "moves": moves}
+
+        claiming_rows = tracking_data.index[tracking_data[frame_col] == nearest_index]
+        claiming_track_id = int(tracking_data.at[claiming_rows[0], id_col]) if not claiming_rows.empty else None
+
+        if claiming_track_id == int(track_id):
+            return {"stop_frame": f, "reason": "settled", "moves": moves}
+
+        moves.append({"frame": f, "from_track_id": claiming_track_id, "cell_index": nearest_index})
+        last_x = float(frame_cells.at[nearest_index, "Center X Coordinate"])
+        last_y = float(frame_cells.at[nearest_index, "Center Y Coordinate"])
+        last_radius = float(frame_cells.at[nearest_index, "Circumscribed Circle Radius"])
+
+    return {"stop_frame": frame_number + max_frames_ahead, "reason": "reached_max_frames_ahead", "moves": moves}
+
+
+def apply_confirmed_identity_moves(tracking_data: pd.DataFrame, track_id: int, moves: list) -> tuple:
+    """Apply a `moves` plan from `find_confirmed_identity_moves`: for each
+    move, writes its `cell_index` into `track_id`'s row at `frame`, clearing
+    `from_track_id`'s claim there when one is named. Routed through the same
+    `_evict_future_if_colliding` guard as every other write path in this
+    module -- defensive here, since `track_id`'s slot at each move's frame
+    should already be empty by construction of the plan, but this keeps the
+    same never-silently-overwrite guarantee.
+
+    Returns `(tracking_data, displaced_list)` -- `tracking_data` may be a
+    NEW DataFrame object if any eviction happened; always use the returned
+    value. `displaced_list` collects every non-`None` displacement record,
+    in move order (usually empty).
+
+    Raises `ValueError` if `track_id` doesn't exist in `tracking_data`.
+    """
+    id_col = tracking_data.columns[0]
+    track_rows = tracking_data.index[tracking_data[id_col] == int(track_id)]
+    if track_rows.empty:
+        raise ValueError(f"Track {track_id} not found in the tracking data.")
+    track_row = track_rows[0]
+
+    displaced_list = []
+    for move in moves:
+        frame_col = f"Frame{move['frame']}"
+        cell_index = move["cell_index"]
+        from_track_id = move.get("from_track_id")
+
+        current_value = tracking_data.at[track_row, frame_col]
+        if pd.notna(current_value) and current_value != cell_index:
+            tracking_data, displaced = _evict_future_if_colliding(tracking_data, id_col, track_row, move["frame"])
+            if displaced is not None:
+                displaced_list.append(displaced)
+
+        tracking_data.at[track_row, frame_col] = cell_index
+
+        if from_track_id is not None:
+            from_rows = tracking_data.index[tracking_data[id_col] == int(from_track_id)]
+            if not from_rows.empty:
+                from_row = from_rows[0]
+                if tracking_data.at[from_row, frame_col] == cell_index:
+                    tracking_data.at[from_row, frame_col] = None
+
+    return tracking_data, displaced_list
+
+
 def add_tracking_id(
     tracking_data: pd.DataFrame, frame_number: int, new_index: int, cell_id_str: str,
-) -> pd.DataFrame:
+) -> tuple:
     """Assign a previously-unmatched segmentation cell (`cell_id_str`, e.g.
     `'Cell5_12'`) to an existing track `new_index`'s slot for `frame_number`.
-    Returns `tracking_data` (mutated in place and returned for convenience).
+    Returns `(tracking_data, displaced)`.
+
+    `displaced` is `None` unless `new_index` already held a *different*,
+    live claim at `frame_number` -- in that case, that claim's entire
+    future (from `frame_number` onward) is first relocated onto a
+    freshly-minted track ID via `_evict_future_if_colliding`, rather than
+    being silently overwritten, and `displaced` describes what moved.
+    `tracking_data` may be a NEW DataFrame object when a relocation
+    happens -- always use the returned value.
 
     Raises `KeyError` if `new_index` isn't found in `tracking_data`'s `Index`
     column (v1 showed a `QMessageBox.warning` instead).
@@ -433,9 +779,16 @@ def add_tracking_id(
     update_row_index = tracking_data[tracking_data["Index"] == int(new_index)].index
     if update_row_index.empty:
         raise KeyError(f"ID {new_index} was not found in the tracking data's Index column.")
+    row_pos = update_row_index[0]
+    column_name = f"Frame{frame_number}"
 
-    tracking_data.at[update_row_index[0], f"Frame{frame_number}"] = cell_id_str
-    return tracking_data
+    displaced = None
+    current_value = tracking_data.at[row_pos, column_name]
+    if pd.notna(current_value) and current_value != cell_id_str:
+        tracking_data, displaced = _evict_future_if_colliding(tracking_data, "Index", row_pos, frame_number)
+
+    tracking_data.at[row_pos, column_name] = cell_id_str
+    return tracking_data, displaced
 
 
 def suggest_match_candidates(
@@ -443,57 +796,96 @@ def suggest_match_candidates(
     tracking_data: pd.DataFrame,
     frame_number: int,
     selected_cell_index: str,
+    fill_labels_by_frame: Callable[[int], Optional[np.ndarray]],
     top_k: int = 3,
 ) -> list:
-    """For `selected_cell_index` (a `Cell{frame_number}_{raw_id}` string),
-    rank frame `frame_number + 1`'s currently-**unmatched** cells by
-    ascending centroid distance and return up to `top_k` as
-    `[{"cell_index": str, "cell_id": int, "distance": float}, ...]`.
+    """For `selected_cell_index` (a `Cell{frame_number}_{raw_id}` string --
+    typically an unmatched cell the user just clicked, but works just as
+    well for one that's currently attached to the wrong track), rank
+    "orphaned" tracks -- ones that had a claim at `frame_number - 1` but
+    lost it at `frame_number` -- by ascending centroid distance from the
+    selected cell, and return up to `top_k` as
+    `[{"track_id": int, "cell_index": str, "distance": float}, ...]`
+    (`cell_index` is the candidate's own `Frame{frame_number-1}` cell
+    string, for display).
 
-    Pure computation, no mutation -- a human still confirms and applies any
-    suggestion via `add_tracking_id`/`update_tracking_data`/
-    `swap_tracks_at_frame`. Deliberately restricted to the pool of cells
-    frame `frame_number + 1`'s `tracking_data` column doesn't already claim
-    (the existing matched/unmatched notion, see `rendering.render_tracking_overlay`)
-    -- this is a plain nearest-neighbor filter over already-known unmatched
-    candidates, NOT a local Hungarian re-match: a "local re-track" feature
-    doing the latter was already built, tested, and removed (see
-    `v2/README.md`'s changelog) because re-deriving a match from spatial
-    proximity alone just reproduces whatever wrong answer Hungarian already
-    gave; this function never decides anything on its own, it only narrows
-    down candidates for a human to pick from.
+    Searches BACKWARD (candidates at `frame_number - 1`) rather than
+    forward, matching how a user actually notices a problem: they see an
+    unmatched (or wrongly-matched) cell at the LATER frame and want to know
+    which existing track it continues -- not the reverse. `frame_number` is
+    the frame of the cell the user clicked; the caller decides how to apply
+    a chosen candidate (`add_tracking_id` if `selected_cell_index` is
+    currently unmatched, `reassign_track` if it's attached to the wrong
+    track -- this function only ranks candidates, it never decides or
+    writes anything itself).
+
+    Pure computation, no mutation. Deliberately just a nearest-neighbor
+    filter over already-known orphaned tracks, NOT a local Hungarian
+    re-match: a "local re-track" feature doing the latter was already
+    built, tested, and removed (see `v2/README.md`'s changelog) because
+    re-deriving a match from spatial proximity alone just reproduces
+    whatever wrong answer Hungarian already gave.
+
+    Falls back to computing a cell's centroid directly from
+    `fill_labels_by_frame`'s mask (via `_centroid_and_radius_from_mask`)
+    when it's missing from `cells_info` -- e.g. an edge-touching cell the
+    Extract step's `exclude_edge_cells` option deliberately dropped from
+    `Cells_info.xlsx` while leaving it in the segmentation. This is what
+    makes the function usable on a newly-arrived or edge-excluded cell
+    instead of raising `KeyError`.
 
     Raises `ValueError` if `selected_cell_index` doesn't belong to
-    `frame_number`, `KeyError` if it isn't found in `cells_info`. Returns
-    `[]` (not an error) if frame `frame_number + 1` has no unmatched cells.
+    `frame_number`, or if its position can't be resolved at all (missing
+    from both `cells_info` and the mask). Returns `[]` (not an error) if
+    `frame_number <= 1` (nothing precedes it) or no track is orphaned there.
     """
     if not selected_cell_index.startswith(f"Cell{frame_number}_"):
         raise ValueError(
             f"selected_cell_index {selected_cell_index!r} does not belong to frame {frame_number}."
         )
+    if frame_number <= 1:
+        return []
 
-    indexed = cells_info.set_index("Cell Index")
-    if selected_cell_index not in indexed.index:
-        raise KeyError(f"{selected_cell_index} not found in cells_info.")
-    origin_x = indexed.at[selected_cell_index, "Center X Coordinate"]
-    origin_y = indexed.at[selected_cell_index, "Center Y Coordinate"]
+    cells_info_indexed = cells_info.set_index("Cell Index")
 
-    next_frame = frame_number + 1
-    next_frame_cells = indexed[indexed.index.str.startswith(f"Cell{next_frame}_")]
+    def _position(cell_index: str, frame: int):
+        if cell_index in cells_info_indexed.index:
+            row = cells_info_indexed.loc[cell_index]
+            return float(row["Center X Coordinate"]), float(row["Center Y Coordinate"])
+        fill_labels = fill_labels_by_frame(frame)
+        if fill_labels is not None:
+            fallback = _centroid_and_radius_from_mask(fill_labels, _raw_cell_id(cell_index))
+            if fallback is not None:
+                return fallback[0], fallback[1]
+        return None
 
-    next_frame_col = f"Frame{next_frame}"
-    claimed = set(tracking_data[next_frame_col].dropna()) if next_frame_col in tracking_data.columns else set()
+    origin = _position(selected_cell_index, frame_number)
+    if origin is None:
+        raise ValueError(
+            f"Could not resolve a position for {selected_cell_index} "
+            "(missing from cells_info and the segmentation mask)."
+        )
+    origin_x, origin_y = origin
+
+    prev_frame = frame_number - 1
+    prev_col, cur_col = f"Frame{prev_frame}", f"Frame{frame_number}"
+    if prev_col not in tracking_data.columns:
+        return []
+
+    id_col = tracking_data.columns[0]
+    has_prev = tracking_data[prev_col].notna()
+    lost_here = tracking_data[cur_col].isna() if cur_col in tracking_data.columns else True
+    orphaned = tracking_data[has_prev & lost_here]
 
     candidates = []
-    for cell_index, row in next_frame_cells.iterrows():
-        if cell_index in claimed:
+    for _, row in orphaned.iterrows():
+        candidate_cell_index = row[prev_col]
+        position = _position(candidate_cell_index, prev_frame)
+        if position is None:
             continue
-        distance = float(np.hypot(
-            row["Center X Coordinate"] - origin_x, row["Center Y Coordinate"] - origin_y,
-        ))
-        raw_id_match = re.search(r"Cell\d+_(\d+)", cell_index)
-        cell_id = int(raw_id_match.group(1)) if raw_id_match else None
-        candidates.append({"cell_index": cell_index, "cell_id": cell_id, "distance": distance})
+        cx, cy = position
+        distance = float(np.hypot(cx - origin_x, cy - origin_y))
+        candidates.append({"track_id": int(row[id_col]), "cell_index": candidate_cell_index, "distance": distance})
 
     candidates.sort(key=lambda c: c["distance"])
     return candidates[:top_k]
@@ -560,36 +952,83 @@ if __name__ == "__main__":
     except ValueError as e:
         print(f"Correctly rejected one-sided swap: {e}")
 
-    # suggest_match_candidates: three frame-2 cells, one already claimed by
-    # another track -- must be excluded, and the remaining two ranked by
-    # distance from the selected frame-1 cell.
+    # swap_tracks_from_frame: a 3-frame range where the middle frame has
+    # only one side present -- that frame should be skipped and reported,
+    # not abort the whole range.
+    swap_range = pd.DataFrame({
+        "Index": [1, 2],
+        "Frame1": ["Cell1_10", "Cell1_11"],
+        "Frame2": ["Cell2_20", None],
+        "Frame3": ["Cell3_30", "Cell3_31"],
+    })
+    swap_result = swap_tracks_from_frame(swap_range, frame_number=1, id_a=1, id_b=2)
+    print("\nswap_tracks_from_frame result:", swap_result)
+    assert swap_result == {"swapped_frames": [1, 3], "skipped_frames": [2]}, swap_result
+    assert swap_range.at[0, "Frame1"] == "Cell1_11" and swap_range.at[1, "Frame1"] == "Cell1_10"
+    assert swap_range.at[0, "Frame2"] == "Cell2_20", "frame 2 was skipped -- should be untouched"
+    assert swap_range.at[0, "Frame3"] == "Cell3_31" and swap_range.at[1, "Frame3"] == "Cell3_30"
+
+    try:
+        swap_tracks_from_frame(swap_range, frame_number=1, id_a=1, id_b=1)
+        raise AssertionError("expected ValueError for id_a == id_b")
+    except ValueError as e:
+        print(f"Correctly rejected same-id swap_tracks_from_frame: {e}")
+
+    # suggest_match_candidates (reversed direction): a selected cell at
+    # frame 2 (e.g. unmatched, or wrongly matched) should rank frame-1
+    # tracks that lost their claim at frame 2 ("orphaned"), nearest first.
+    # Track 2 already has a Frame2 claim -> not orphaned, excluded.
     suggest_cells_info = pd.DataFrame({
-        "Cell Index": ["Cell1_5", "Cell2_10", "Cell2_11", "Cell2_12"],
-        "Center X Coordinate": [0.0, 1.0, 50.0, 3.0],
-        "Center Y Coordinate": [0.0, 1.0, 50.0, 4.0],
+        "Cell Index": ["Cell1_10", "Cell1_11", "Cell1_12", "Cell2_50", "Cell2_99"],
+        "Center X Coordinate": [1.0, 50.0, 3.0, 51.0, 2.0],
+        "Center Y Coordinate": [1.0, 50.0, 4.0, 51.0, 2.0],
     })
     suggest_tracking = pd.DataFrame({
-        "Index": [1, 2],
-        "Frame1": ["Cell1_5", "Cell1_6"],
-        "Frame2": ["Cell2_10", None],  # Cell2_10 already claimed -> excluded
+        "Index": [1, 2, 3],
+        "Frame1": ["Cell1_10", "Cell1_11", "Cell1_12"],
+        "Frame2": [None, "Cell2_50", None],
     })
-    suggestions = suggest_match_candidates(suggest_cells_info, suggest_tracking, frame_number=1, selected_cell_index="Cell1_5")
-    print("\nSuggested match candidates for Cell1_5 at frame 2:", suggestions)
-    assert [s["cell_index"] for s in suggestions] == ["Cell2_12", "Cell2_11"], suggestions
+    suggestions = suggest_match_candidates(
+        suggest_cells_info, suggest_tracking, frame_number=2, selected_cell_index="Cell2_99",
+        fill_labels_by_frame=lambda f: None,
+    )
+    print("\nSuggested orphaned tracks for Cell2_99 at frame 2:", suggestions)
+    assert [s["track_id"] for s in suggestions] == [1, 3], suggestions
     assert suggestions[0]["distance"] < suggestions[1]["distance"]
 
     empty_suggestions = suggest_match_candidates(
         pd.DataFrame({"Cell Index": ["Cell1_5"], "Center X Coordinate": [0.0], "Center Y Coordinate": [0.0]}),
         pd.DataFrame({"Index": [1], "Frame1": ["Cell1_5"]}),
-        frame_number=1, selected_cell_index="Cell1_5",
+        frame_number=1, selected_cell_index="Cell1_5", fill_labels_by_frame=lambda f: None,
     )
-    assert empty_suggestions == [], empty_suggestions
+    assert empty_suggestions == [], empty_suggestions  # frame 1 has nothing preceding it
 
     try:
-        suggest_match_candidates(suggest_cells_info, suggest_tracking, frame_number=2, selected_cell_index="Cell1_5")
+        suggest_match_candidates(
+            suggest_cells_info, suggest_tracking, frame_number=1, selected_cell_index="Cell2_99",
+            fill_labels_by_frame=lambda f: None,
+        )
         raise AssertionError("expected ValueError for a cell not belonging to frame_number")
     except ValueError as e:
         print(f"Correctly rejected mismatched frame_number: {e}")
+
+    # Mask-fallback path: a selected cell missing from cells_info entirely
+    # (simulating an edge-excluded cell) is still resolvable via its raw
+    # mask footprint.
+    edge_grid = np.zeros((10, 10), dtype=int)
+    edge_grid[0:2, 0:2] = 77  # "Cell2_77", deliberately absent from cells_info
+    edge_cells_info = pd.DataFrame({
+        "Cell Index": ["Cell1_10"],
+        "Center X Coordinate": [0.5],
+        "Center Y Coordinate": [0.5],
+    })
+    edge_tracking = pd.DataFrame({"Index": [1], "Frame1": ["Cell1_10"], "Frame2": [None]})
+    edge_suggestions = suggest_match_candidates(
+        edge_cells_info, edge_tracking, frame_number=2, selected_cell_index="Cell2_77",
+        fill_labels_by_frame=lambda f: edge_grid if f == 2 else None,
+    )
+    print("Mask-fallback suggestions for edge-excluded Cell2_77:", edge_suggestions)
+    assert [s["track_id"] for s in edge_suggestions] == [1], edge_suggestions
 
     # merge_tracks_from_frame(end_frame=...): bounded merge leaves later
     # frames untouched; end_frame=None regression-matches the pre-change
@@ -616,6 +1055,71 @@ if __name__ == "__main__":
     assert unbounded.at[1, "Frame2"] == "Cell2_20" and unbounded.at[1, "Frame3"] == "Cell3_30"
     assert pd.isna(unbounded.at[0, "Frame2"]) and pd.isna(unbounded.at[0, "Frame3"])
     print("merge_tracks_from_frame(end_frame=None) correctly reproduces the unconditional-to-the-end behavior.")
+
+    # Collision guard: the exact 3-cell cascading-mismatch scenario from the
+    # user's report. Cell_i's real track is 11, Cell_j's real track is 15,
+    # and Cell_k is a genuinely new cell that squatted on track 15 from
+    # frame 2 onward. Fixing Cell_j (merge 11 -> 15) must not destroy
+    # Cell_k's data; it should auto-evict Cell_k to a fresh track first.
+    cascade = pd.DataFrame({
+        "Index": [11, 13, 15],
+        "Frame1": ["Cell1_i", None, "Cell1_j"],
+        "Frame2": ["Cell2_j", "Cell2_i", "Cell2_k"],
+        "Frame3": ["Cell3_j", "Cell3_i", "Cell3_k"],
+    })
+    cascade, displaced = merge_tracks_from_frame(cascade, frame_number=2, old_id=11, new_id=15)
+    print("\nAfter merging 11->15 (fixing Cell_j), Cell_k auto-evicted:")
+    print(cascade)
+    assert displaced == {"evicted_track_id": 15, "new_track_id": 16, "from_frame": 2}, displaced
+    row15 = cascade.index[cascade["Index"] == 15][0]
+    row16 = cascade.index[cascade["Index"] == 16][0]
+    row11 = cascade.index[cascade["Index"] == 11][0]
+    assert cascade.at[row15, "Frame1"] == "Cell1_j"
+    assert cascade.at[row15, "Frame2"] == "Cell2_j" and cascade.at[row15, "Frame3"] == "Cell3_j"
+    assert cascade.at[row16, "Frame2"] == "Cell2_k" and cascade.at[row16, "Frame3"] == "Cell3_k"
+    assert pd.isna(cascade.at[row16, "Frame1"])
+    assert pd.isna(cascade.at[row11, "Frame2"]) and pd.isna(cascade.at[row11, "Frame3"])
+
+    cascade, displaced2 = merge_tracks_from_frame(cascade, frame_number=2, old_id=13, new_id=11)
+    print("\nAfter merging 13->11 (fixing Cell_i), no collision this time:")
+    print(cascade)
+    assert displaced2 is None, "track 11 was already vacated by the first merge -- no eviction should occur"
+    row11 = cascade.index[cascade["Index"] == 11][0]
+    assert cascade.at[row11, "Frame1"] == "Cell1_i"
+    assert cascade.at[row11, "Frame2"] == "Cell2_i" and cascade.at[row11, "Frame3"] == "Cell3_i"
+    print("All three physical identities (Cell_i=11, Cell_j=15, Cell_k=16) are now correctly separated.")
+
+    # add_tracking_id / update_tracking_data collision guard (single-frame).
+    add_collision = pd.DataFrame({
+        "Index": [1, 2],
+        "Frame1": ["Cell1_10", "Cell1_11"],
+        "Frame2": [None, "Cell2_99"],
+    })
+    add_collision, add_displaced = add_tracking_id(add_collision, frame_number=2, new_index=2, cell_id_str="Cell2_50")
+    assert add_displaced == {"evicted_track_id": 2, "new_track_id": 3, "from_frame": 2}, add_displaced
+    row2 = add_collision.index[add_collision["Index"] == 2][0]
+    row3 = add_collision.index[add_collision["Index"] == 3][0]
+    assert add_collision.at[row2, "Frame2"] == "Cell2_50"
+    assert add_collision.at[row3, "Frame2"] == "Cell2_99"
+    print("\nadd_tracking_id correctly evicted a colliding claim to a fresh track:")
+    print(add_collision)
+
+    update_collision = pd.DataFrame({
+        "Index": [1, 2],
+        "Frame1": ["Cell1_10", "Cell1_11"],
+        "Frame2": ["Cell2_20", "Cell2_99"],
+    })
+    update_original = update_collision.copy()
+    update_collision, update_displaced = update_tracking_data(
+        update_collision, update_original, frame_number=2, old_id=1, new_id=2,
+    )
+    assert update_displaced == {"evicted_track_id": 2, "new_track_id": 3, "from_frame": 2}, update_displaced
+    row2 = update_collision.index[update_collision["Index"] == 2][0]
+    row3 = update_collision.index[update_collision["Index"] == 3][0]
+    assert update_collision.at[row2, "Frame2"] == "Cell2_20"
+    assert update_collision.at[row3, "Frame2"] == "Cell2_99"
+    print("update_tracking_data correctly evicted a colliding claim to a fresh track:")
+    print(update_collision)
 
     # find_propagation_stop_frame: a synthetic corrected cell (label 1) with
     # one flagged, initially-unmatched neighbor (label 2), across a few
@@ -703,5 +1207,73 @@ if __name__ == "__main__":
     )
     print("find_propagation_stop_frame (max frames ahead reached):", result)
     assert result["stop_frame"] == 3 and result["reason"] == "reached_max_frames_ahead", result
+
+    # find_confirmed_identity_moves / apply_confirmed_identity_moves: a
+    # physical cell manually attached to track 18 at frame 1, then found
+    # under three DIFFERENT wrong tracks (12, 14, 16) across frames 2-4,
+    # settling back onto track 18 itself at frame 5.
+    churn_cells_info = pd.DataFrame([
+        {"Cell Index": "Cell1_A", "Center X Coordinate": 5.0, "Center Y Coordinate": 5.0, "Circumscribed Circle Radius": 3.0},
+        {"Cell Index": "Cell2_A", "Center X Coordinate": 5.0, "Center Y Coordinate": 5.0, "Circumscribed Circle Radius": 3.0},
+        {"Cell Index": "Cell3_A", "Center X Coordinate": 5.0, "Center Y Coordinate": 5.0, "Circumscribed Circle Radius": 3.0},
+        {"Cell Index": "Cell4_A", "Center X Coordinate": 5.0, "Center Y Coordinate": 5.0, "Circumscribed Circle Radius": 3.0},
+        {"Cell Index": "Cell5_A", "Center X Coordinate": 5.0, "Center Y Coordinate": 5.0, "Circumscribed Circle Radius": 3.0},
+    ])
+    churn_tracking = pd.DataFrame({
+        "Index": [18, 12, 14, 16],
+        "Frame1": ["Cell1_A", None, None, None],
+        "Frame2": [None, "Cell2_A", None, None],
+        "Frame3": [None, None, "Cell3_A", None],
+        "Frame4": [None, None, None, "Cell4_A"],
+        "Frame5": ["Cell5_A", None, None, None],
+    })
+    plan = find_confirmed_identity_moves(
+        churn_tracking, churn_cells_info, lambda f: None, frame_number=1, track_id=18,
+    )
+    print("\nfind_confirmed_identity_moves (churn through 3 wrong tracks):", plan)
+    assert plan["reason"] == "settled" and plan["stop_frame"] == 5, plan
+    assert plan["moves"] == [
+        {"frame": 2, "from_track_id": 12, "cell_index": "Cell2_A"},
+        {"frame": 3, "from_track_id": 14, "cell_index": "Cell3_A"},
+        {"frame": 4, "from_track_id": 16, "cell_index": "Cell4_A"},
+    ], plan["moves"]
+
+    churn_tracking, churn_displaced = apply_confirmed_identity_moves(churn_tracking, 18, plan["moves"])
+    print("After applying the moves:")
+    print(churn_tracking)
+    assert churn_displaced == []
+    row18 = churn_tracking.index[churn_tracking["Index"] == 18][0]
+    assert churn_tracking.at[row18, "Frame2"] == "Cell2_A"
+    assert churn_tracking.at[row18, "Frame3"] == "Cell3_A"
+    assert churn_tracking.at[row18, "Frame4"] == "Cell4_A"
+    for track_id, frame_col in [(12, "Frame2"), (14, "Frame3"), (16, "Frame4")]:
+        row = churn_tracking.index[churn_tracking["Index"] == track_id][0]
+        assert pd.isna(churn_tracking.at[row, frame_col]), f"track {track_id}'s claim at {frame_col} should be cleared"
+    print("All three churned tracks correctly reunited onto track 18.")
+
+    # Unclaimed-continuation case: the walk should still record a move
+    # (from_track_id=None) rather than mistaking "unclaimed" for "settled".
+    unclaimed_cells_info = pd.DataFrame([
+        {"Cell Index": "Cell1_B", "Center X Coordinate": 0.0, "Center Y Coordinate": 0.0, "Circumscribed Circle Radius": 2.0},
+        {"Cell Index": "Cell2_B", "Center X Coordinate": 0.0, "Center Y Coordinate": 0.0, "Circumscribed Circle Radius": 2.0},
+    ])
+    unclaimed_tracking = pd.DataFrame({"Index": [9], "Frame1": ["Cell1_B"], "Frame2": [None]})
+    unclaimed_plan = find_confirmed_identity_moves(
+        unclaimed_tracking, unclaimed_cells_info, lambda f: None, frame_number=1, track_id=9, max_frames_ahead=1,
+    )
+    print("\nfind_confirmed_identity_moves (unclaimed continuation):", unclaimed_plan)
+    assert unclaimed_plan["moves"] == [{"frame": 2, "from_track_id": None, "cell_index": "Cell2_B"}], unclaimed_plan
+    assert unclaimed_plan["reason"] == "reached_max_frames_ahead"
+
+    # Disappearance case: no cell at all in the next frame.
+    gone_cells_info = pd.DataFrame([
+        {"Cell Index": "Cell1_C", "Center X Coordinate": 0.0, "Center Y Coordinate": 0.0, "Circumscribed Circle Radius": 2.0},
+    ])
+    gone_tracking = pd.DataFrame({"Index": [7], "Frame1": ["Cell1_C"], "Frame2": [None]})
+    gone_plan = find_confirmed_identity_moves(
+        gone_tracking, gone_cells_info, lambda f: None, frame_number=1, track_id=7,
+    )
+    print("find_confirmed_identity_moves (disappeared):", gone_plan)
+    assert gone_plan == {"stop_frame": 1, "reason": "disappeared", "moves": []}, gone_plan
 
     print("\nAll manual_correction_tracking smoke tests passed.")
