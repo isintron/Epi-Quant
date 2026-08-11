@@ -407,6 +407,91 @@ in the moves list so a reviewer can judge a borderline pick. Both modes are
 covered by smoke tests, including a fixture mirroring the measured
 2.0px-owned vs 3.0px-unclaimed competition.
 
+### Round 4: TA environment score, track-lifecycle view, trajectory click-to-jump (2026-08-10)
+
+Correct Tracking's first two visualizations (matched/unmatched, cell
+identity) only help *inspect* a cell you already suspect. Two new color modes
+port Tissue Analyzer's error-*spotting* workflow (Aigouy & Prud'homme,
+"Segmentation and Quantitative Analysis of Epithelial Tissues", Ch. 20 —
+in the gitignored `bibliography/`; its Fig. 3 is the reference for both).
+
+**Environment score** (`adjacency.environment_scores` + `track_color_mode="environment"`)
+— Dice/Sorensen overlap of a cell's neighbor set between the current frame
+and the previous *or* next one (TA's Fig. 3g/h; the metric is EPySeg's
+`pairwise_score`). Dark = the neighborhood changed a lot, usually worth
+inspecting; bright = preserved. Selectable LUT: viridis (TA's own default),
+Fire, Gem, PuOr, BrBG.
+
+Three deliberate departures from the reference implementation, each for a
+concrete reason:
+
+1. **Neighbor sets are compared in track-ID space.** EPySeg computes
+   neighbors directly on identity-colored tracked images, so this is free
+   there; here they come from per-frame `fill_labels`, whose raw ids are
+   reassigned every frame, so they must be translated through `tracking_data`
+   first. Verified on real data: raw-label neighbor sets genuinely differ
+   between frames while the translated track-ID sets match.
+2. **Fixed [0,1] normalization.** EPySeg calls `apply_lut` with
+   `min=None, max=None`, which autoscales each frame to its own min/max — so
+   the same color means different things on different frames. Pinned here so
+   a movie is readable as a time series.
+3. **A real unscoreable state.** EPySeg scores cells absent from the compared
+   frame as `0`, conflating "brand-new cell" with "environment completely
+   changed" (its own author notes vertex-less cells land there too). Here
+   unscoreable cells — untracked, track absent in the compared frame, or no
+   comparable neighbors — are omitted from the result and left **untinted**.
+   Untracked *neighbors* are likewise dropped from both sets rather than
+   guessed at, a case EPySeg never has.
+
+Validated on `test_data/AS_dorsal view_E-cad`: all 171 cells at frame 5 score
+1.0 against frame 4 (that region's tracking is topologically clean), and
+injecting a swap between two neighboring tracks flags **exactly those two
+cells at 0.5** — TA's own "inspect" threshold — with no false positives.
+TA's Note 16 caveat (a division or delamination lowers the score
+legitimately) is surfaced in the UI hint.
+
+**Track lifecycle** (`manual_correction_tracking.classify_track_lifecycle` +
+`track_color_mode="lifecycle"`) — colors cells whose track *ends* at this
+frame ("lost"), *starts* at it ("new"), or both, i.e. a single-frame track.
+That third state gets its own color because it is TA's Fig. 3 oversegmentation
+example ("a newly appeared cell that does not exist in the previous or next
+time frame") and the most actionable of the three. Other cells are untinted
+unless "Tint other cells" is on. At the first frame nothing can be judged
+"new" and at the last nothing "lost", so edge frames only report the side
+that exists rather than lighting up entirely.
+
+**Caching design worth preserving.** The neighbor graph is cached per frame
+(`api._neighbor_graph_cache`) but — unlike `_border_cell_cache` — needs **no
+invalidation on tracking edits**, because it depends only on the frame's
+`fill_labels` geometry, which never changes. The tracking-dependent half
+(label→track translation and the Dice score) is cheap set math recomputed on
+every render, so both new views are automatically correct straight after a
+correction. Verified: a `swap_tracks` edit changed the scores immediately
+while the cache stayed populated. Measured cost on a 171-cell frame: 35ms to
+build, ~0ms cached. Note the graph must always be built from `fill_labels`
+even when `render_mode="outline"` — the boundary array yields near-empty
+neighbor sets.
+
+**Trajectory click-to-jump** — clicking any cell jumps to its track, reusing
+`get_tracking_cell_at_pixel` unchanged (no backend work: it hit-tests
+`fill_labels` regardless of render mode, and `imagePixelFromClick` is already
+zoom/pan-correct since zoom is an inline pixel width, not a CSS transform).
+`loadTrack` gained a `preserveFrame` option so a click keeps the frame you
+are looking at, falling back to the track's first frame only if the clicked
+track doesn't exist there; the number input and Prev/Next Track buttons keep
+their original jump-to-start behavior. Clicking an unmatched cell reports it
+instead of jumping. Also fixed a latent bug found here: during a track "gap"
+the previous frame's image stayed on screen while `state.trajectoryFrame` had
+already advanced, so a click would have hit-tested a frame that wasn't being
+displayed — the image is now cleared in that state.
+
+Fire is an ImageJ built-in (it is *not* one of Fiji's ~500 `.lut` files),
+defined from its canonical 32 control points, which is exactly how ImageJ
+builds it. Gem is embedded verbatim as base64 from Fiji's `Gem.lut` (an
+800-byte NIH-Image file: 32-byte `ICOL` header + raw RGB), so there is no
+runtime dependency on a Fiji install; control-point subsampling was measured
+and still cost ~3/255 error even at 65 anchors, hence the exact copy.
+
 ## pywebview UI (`v2/webview/`) — handoff notes
 
 **Status (updated 2026-08-08): substantially matured through several rounds

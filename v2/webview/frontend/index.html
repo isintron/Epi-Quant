@@ -227,6 +227,8 @@
     <div class="render-mode-controls">
       <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="uniform" checked> Matched/Unmatched colors</label>
       <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="identity"> Cell identity</label>
+      <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="environment"> Environment score</label>
+      <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="lifecycle"> Track lifecycle</label>
     </div>
     <div class="field-row" id="correct-track-uniform-colors">
       <label>Matched color <input type="color" id="matched-color-input" value="#ffd633"></label>
@@ -243,6 +245,31 @@
           <option value="tab20">tab20</option>
         </select>
       </label>
+    </div>
+    <div class="field-row" id="correct-track-environment" style="display:none">
+      <label>LUT
+        <select id="correct-track-environment-lut-select">
+          <option value="viridis" selected>viridis</option>
+          <option value="Fire">Fire</option>
+          <option value="Gem">Gem</option>
+          <option value="PuOr">PuOr</option>
+          <option value="BrBG">BrBG</option>
+        </select>
+      </label>
+      <label class="radio-label"><input type="radio" name="correct-track-env-direction" value="prev" checked> vs previous</label>
+      <label class="radio-label"><input type="radio" name="correct-track-env-direction" value="next"> vs next</label>
+    </div>
+    <p class="hint" id="correct-track-environment-hint" style="display:none">
+      Dark = this cell's neighbours changed a lot between the two frames — worth inspecting for a
+      segmentation or tracking error. Bright = neighbourhood preserved. A low score isn't always an
+      error: a division or delamination lowers it legitimately. Uncoloured cells can't be scored
+      (unmatched, or the track is absent in the compared frame).
+    </p>
+    <div class="field-row" id="correct-track-lifecycle" style="display:none">
+      <label>Lost at next frame <input type="color" id="lifecycle-lost-color-input" value="#ff3b30"></label>
+      <label>New since previous <input type="color" id="lifecycle-new-color-input" value="#34c759"></label>
+      <label>Both (single frame) <input type="color" id="lifecycle-both-color-input" value="#ffffff"></label>
+      <label class="checkbox-label"><input type="checkbox" id="lifecycle-tint-others-checkbox"> Tint other cells</label>
     </div>
     <div class="frame-nav">
       <button id="correct-track-first-frame" class="secondary-btn">|&larr; First</button>
@@ -315,6 +342,7 @@
 
   <section id="step-trajectory" class="step-section">
     <h2>Trajectory View</h2>
+    <p class="hint">Click any cell in the image to jump straight to its track, keeping the current frame.</p>
     <div class="field-row">
       <label>Track number</label>
       <input type="number" id="track-number-input" list="track-number-list" placeholder="Search track #">

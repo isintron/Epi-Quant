@@ -46,6 +46,7 @@ import webview
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import adjacency
 import cell_tracking
 import common
 import data_input
@@ -80,11 +81,21 @@ class EpiQuantAPI:
 
         self.tracking_data: Optional[pd.DataFrame] = None
         self.original_tracking_data: Optional[pd.DataFrame] = None
+        # frame_number -> `adjacency.build_neighbor_graph` result, for the
+        # environment-score overlay. Unlike `_border_cell_cache` this needs NO
+        # invalidation on tracking edits: the graph is a function of the
+        # frame's `fill_labels` geometry alone, which never changes once a
+        # project is loaded. The tracking-dependent half (translating labels
+        # to track ids and computing the Dice score) is cheap set math and is
+        # recomputed on every render, so the view is always correct right
+        # after a correction. Cleared only when the project changes.
+        self._neighbor_graph_cache: dict[int, Optional[dict]] = {}
 
         self.matched_color = "#ffd633"
         self.unmatched_color = "#3388ff"
         self.highlight_color = "#ff3333"
         self.border_color = "#ff00ff"
+        self.lifecycle_colors = {"lost": "#ff3b30", "new": "#34c759", "both": "#ffffff"}
 
     def set_window(self, window) -> None:
         self.window = window
@@ -166,6 +177,7 @@ class EpiQuantAPI:
     def set_project(self, mask_folder: str, image_folder: str, output_base_dir: str) -> dict:
         self.mask_folder = mask_folder
         self.image_folder = image_folder
+        self._neighbor_graph_cache.clear()  # graphs belong to the old project's masks
         self.output_dirs = common.setup_output_dirs(output_base_dir)
         fmt = data_input.detect_mask_format(mask_folder)
         return {"format": fmt, "output_dirs": self.output_dirs}
@@ -513,10 +525,60 @@ class EpiQuantAPI:
         self.matched_color = matched_color
         self.unmatched_color = unmatched_color
 
+    def set_lifecycle_colors(self, lost_color: str, new_color: str, both_color: str) -> None:
+        """Colors for the track-lifecycle overlay. Kept separate from
+        `set_track_colors` rather than overloading it: `matched_color`/
+        `unmatched_color` mean something different and are shared with the
+        uniform mode."""
+        self.lifecycle_colors = {"lost": lost_color, "new": new_color, "both": both_color}
+
+    def _get_neighbor_graph(self, frame_number: int) -> Optional[dict]:
+        """`adjacency.build_neighbor_graph` for `frame_number`, cached.
+        Always built from `fill_labels` -- never the boundary array, which
+        would silently yield near-empty neighbor sets. Membership-tested (not
+        truthiness-tested) so a legitimately-`None` result caches too, matching
+        `_get_border_cell_indices`."""
+        if frame_number in self._neighbor_graph_cache:
+            return self._neighbor_graph_cache[frame_number]
+        loaded = self._load_frame(frame_number)
+        graph = adjacency.build_neighbor_graph(loaded[0]) if loaded is not None else None
+        self._neighbor_graph_cache[frame_number] = graph
+        return graph
+
+    def _label_to_track(self, frame_number: int) -> dict:
+        """`{raw_label: track_id}` for `frame_number`, from the live
+        `tracking_data` -- recomputed per call (cheap) so it is never stale
+        after a correction."""
+        frame_col = f"Frame{frame_number}"
+        if self.tracking_data is None or frame_col not in self.tracking_data.columns:
+            return {}
+        id_col = self.tracking_data.columns[0]
+        mapping = {}
+        for _, row in self.tracking_data[[id_col, frame_col]].dropna(subset=[frame_col]).iterrows():
+            match = re.search(r"Cell\d+_(\d+)", str(row[frame_col]))
+            if match:
+                mapping.setdefault(int(match.group(1)), int(row[id_col]))
+        return mapping
+
+    def _environment_scores(self, frame_number: int, direction: str) -> dict:
+        """Per-cell environment score for `frame_number` compared against the
+        previous or next frame (Tissue Analyzer's Fig. 3g/h respectively).
+        Empty dict if the compared frame doesn't exist."""
+        other_frame = frame_number - 1 if direction == "prev" else frame_number + 1
+        graph_current = self._get_neighbor_graph(frame_number)
+        graph_other = self._get_neighbor_graph(other_frame)
+        if not graph_current or not graph_other:
+            return {}
+        return adjacency.environment_scores(
+            graph_current, graph_other,
+            self._label_to_track(frame_number), self._label_to_track(other_frame),
+        )
+
     def get_tracking_overlay(
         self, frame_number: int, render_mode: str = "mask", show_labels: bool = True,
         track_color_mode: str = "uniform", identity_palette: str = "golden_angle",
-        label_font_size: int = 10,
+        label_font_size: int = 10, environment_lut: str = "viridis",
+        environment_direction: str = "prev", tint_other_cells: bool = False,
     ) -> Optional[str]:
         if self.tracking_data is None:
             return None
@@ -525,10 +587,23 @@ class EpiQuantAPI:
             return None
         fill_labels, boundary_labels, base_image = loaded
         label_array = boundary_labels if render_mode == "outline" else fill_labels
+
+        environment_scores = (
+            self._environment_scores(frame_number, environment_direction)
+            if track_color_mode == "environment" else None
+        )
+        lifecycle_states = (
+            manual_correction_tracking.classify_track_lifecycle(self.tracking_data, frame_number)
+            if track_color_mode == "lifecycle" else None
+        )
+
         overlay = rendering.render_tracking_overlay(
             label_array, base_image, frame_number, self.tracking_data, self.matched_color, self.unmatched_color,
             label_cells=show_labels, track_color_mode=track_color_mode, identity_palette=identity_palette,
             label_font_size=label_font_size,
+            environment_scores=environment_scores, environment_lut=environment_lut,
+            lifecycle_states=lifecycle_states, lifecycle_colors=self.lifecycle_colors,
+            tint_other_cells=tint_other_cells,
         )
         return rendering.encode_png_base64(overlay)
 

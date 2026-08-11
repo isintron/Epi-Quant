@@ -235,7 +235,9 @@ function wireRenderMode(prefix, onChange) {
 }
 
 // `${prefix}-color-mode` radio group -- "uniform" (matched/unmatched colors,
-// default) or "identity" (each track its own viridis color, rank-normalized).
+// default), "identity" (each track its own colour from a qualitative LUT),
+// "environment" (TA-style neighbourhood-change score through a continuous
+// LUT) or "lifecycle" (tracks starting/ending at this frame).
 function getColorMode(prefix) {
   const checked = document.querySelector(`input[name="${prefix}-color-mode"]:checked`);
   return checked ? checked.value : "uniform";
@@ -549,13 +551,37 @@ function onTrackError(data) {
 // Correct Tracking
 // ---------------------------------------------------------------------
 
+// Each colour mode owns one options panel; show that one and hide the rest.
+// (Was a hardcoded two-way toggle before the environment/lifecycle modes.)
+const TRACK_COLOR_MODE_PANELS = {
+  uniform: ["correct-track-uniform-colors"],
+  identity: ["correct-track-identity-palette"],
+  environment: ["correct-track-environment", "correct-track-environment-hint"],
+  lifecycle: ["correct-track-lifecycle"],
+};
+
+function syncTrackColorModePanels() {
+  const mode = getColorMode("correct-track");
+  Object.entries(TRACK_COLOR_MODE_PANELS).forEach(([panelMode, ids]) => {
+    ids.forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.style.display = panelMode === mode ? (id.endsWith("-hint") ? "block" : "flex") : "none";
+    });
+  });
+}
+
 async function refreshCorrectTrackImage() {
   const showLabels = document.getElementById("correct-track-show-labels").checked;
   const identityPalette = document.getElementById("correct-track-identity-palette-select").value;
   const labelFontSize = parseInt(document.getElementById("correct-track-label-size-input").value, 10) || 10;
+  const environmentLut = document.getElementById("correct-track-environment-lut-select").value;
+  const envDirEl = document.querySelector('input[name="correct-track-env-direction"]:checked');
+  const environmentDirection = envDirEl ? envDirEl.value : "prev";
+  const tintOthers = document.getElementById("lifecycle-tint-others-checkbox").checked;
   const img = await window.EpiQuantAPI.get_tracking_overlay(
     state.correctTrackFrame, getRenderMode("correct-track"), showLabels, getColorMode("correct-track"),
-    identityPalette, labelFontSize
+    identityPalette, labelFontSize, environmentLut, environmentDirection, tintOthers
   );
   if (img) document.getElementById("correct-track-overlay-img").src = img;
 }
@@ -889,7 +915,12 @@ async function enterTrajectoryStep() {
   }
 }
 
-async function loadTrack(tn) {
+// `preserveFrame` keeps the frame currently on screen when the newly selected
+// track also exists there -- used by click-to-jump, where the user just
+// clicked a cell they can see and yanking them to the track's first frame
+// would lose their place. The number input and Prev/Next Track buttons keep
+// the original jump-to-start behaviour.
+async function loadTrack(tn, { preserveFrame = false } = {}) {
   if (!state.trackNumbers.includes(tn)) {
     setStatus("trajectory-status", `Track ${tn} not found.`, "error");
     return;
@@ -901,8 +932,26 @@ async function loadTrack(tn) {
     setStatus("trajectory-status", "No frame data for this track.", "error");
     return;
   }
-  state.trajectoryFrame = range.min_frame;
-  await showTrajectoryFrame(range.min_frame);
+  const current = state.trajectoryFrame;
+  const keep = preserveFrame && current >= range.min_frame && current <= range.max_frame;
+  const frame = keep ? current : range.min_frame;
+  state.trajectoryFrame = frame;
+  await showTrajectoryFrame(frame);
+}
+
+async function handleTrajectoryImageClick(event) {
+  const { x, y } = imagePixelFromClick(event.target, event);
+  const result = await window.EpiQuantAPI.get_tracking_cell_at_pixel(state.trajectoryFrame, x, y);
+  if (!result) {
+    setStatus("trajectory-status", "No cell at that position.", "error");
+    return;
+  }
+  if (result.track_id === null || result.track_id === undefined) {
+    setStatus("trajectory-status", `${result.cell_index} is unmatched — it belongs to no track.`, "error");
+    return;
+  }
+  await loadTrack(result.track_id, { preserveFrame: true });
+  setStatus("trajectory-status", `Jumped to track #${result.track_id} (${result.cell_index}).`, "success");
 }
 
 async function handleTrackNumberInputChange() {
@@ -929,6 +978,10 @@ async function showTrajectoryFrame(frame) {
     document.getElementById("trajectory-overlay-img").src = img;
     setStatus("trajectory-status", "");
   } else {
+    // Clear the image rather than leaving the previous frame's on screen:
+    // it would show frame N-1's pixels while `state.trajectoryFrame` says N,
+    // so a click-to-jump would hit-test the wrong frame entirely.
+    document.getElementById("trajectory-overlay-img").removeAttribute("src");
     setStatus("trajectory-status", "This track has no cell in this frame (gap).", "error");
   }
 }
@@ -1205,12 +1258,26 @@ function init() {
   document.getElementById("correct-track-show-labels").addEventListener("change", () => showCorrectTrackFrame(state.correctTrackFrame));
   document.getElementById("correct-track-label-size-input").addEventListener("change", refreshCorrectTrackImage);
   wireColorMode("correct-track", () => {
-    const isIdentity = getColorMode("correct-track") === "identity";
-    document.getElementById("correct-track-uniform-colors").style.display = isIdentity ? "none" : "flex";
-    document.getElementById("correct-track-identity-palette").style.display = isIdentity ? "flex" : "none";
+    syncTrackColorModePanels();
     showCorrectTrackFrame(state.correctTrackFrame);
   });
-  document.getElementById("correct-track-identity-palette-select").addEventListener("change", () => showCorrectTrackFrame(state.correctTrackFrame));
+  syncTrackColorModePanels();
+  document.getElementById("correct-track-identity-palette-select").addEventListener("change", refreshCorrectTrackImage);
+  document.getElementById("correct-track-environment-lut-select").addEventListener("change", refreshCorrectTrackImage);
+  document.querySelectorAll('input[name="correct-track-env-direction"]').forEach((el) => {
+    el.addEventListener("change", refreshCorrectTrackImage);
+  });
+  document.getElementById("lifecycle-tint-others-checkbox").addEventListener("change", refreshCorrectTrackImage);
+  ["lifecycle-lost-color-input", "lifecycle-new-color-input", "lifecycle-both-color-input"].forEach((id) => {
+    document.getElementById(id).addEventListener("change", async () => {
+      await window.EpiQuantAPI.set_lifecycle_colors(
+        document.getElementById("lifecycle-lost-color-input").value,
+        document.getElementById("lifecycle-new-color-input").value,
+        document.getElementById("lifecycle-both-color-input").value
+      );
+      await refreshCorrectTrackImage();
+    });
+  });
   document.getElementById("correct-track-overlay-img").addEventListener("click", handleCorrectTrackImageClick);
   document.getElementById("apply-track-correction-btn").addEventListener("click", handleApplyTrackCorrection);
   document.getElementById("suggest-match-btn").addEventListener("click", handleSuggestMatch);
@@ -1239,6 +1306,7 @@ function init() {
   wireZoom("trajectory", "trajectory-overlay-img");
   wireFrameWheel("trajectory", "trajectory-overlay-img");
   wireRenderMode("trajectory", () => showTrajectoryFrame(state.trajectoryFrame));
+  document.getElementById("trajectory-overlay-img").addEventListener("click", handleTrajectoryImageClick);
 
   // Global callbacks pushed from Python via window.evaluate_js
   window.onProgress = onProgress;

@@ -282,6 +282,53 @@ def _claimed_cells_at_frame(tracking_data: pd.DataFrame, frame_number: int) -> s
     return set(tracking_data[column_name].dropna())
 
 
+def classify_track_lifecycle(tracking_data: pd.DataFrame, frame_number: int) -> dict:
+    """Which cells at `frame_number` are at the START or END of their track:
+    `{cell_index: "lost" | "new" | "both"}`, listing only cells in one of
+    those states.
+
+    - `"lost"`  -- claimed at this frame but not at `frame_number + 1`, i.e.
+      the track stops here.
+    - `"new"`   -- claimed at this frame but not at `frame_number - 1`, i.e.
+      the track starts here.
+    - `"both"`  -- a single-frame track. Tissue Analyzer's Fig. 3 uses exactly
+      this case as its oversegmentation example ("a newly appeared cell that
+      does not exist in the previous or next time frame"), which is why the
+      renderer gives it its own color rather than folding it into the other
+      two.
+
+    Together these are the "interrupted track" errors TA describes; a cell
+    marked here is worth checking, though a genuine division, delamination or
+    a cell entering/leaving the field produces the same signal legitimately.
+
+    **Edge frames**: with no previous frame nothing can be judged `"new"`, and
+    with no next frame nothing can be judged `"lost"` -- otherwise every cell
+    in the first and last frames would light up, which says nothing. Absence
+    of a `Frame{n}` column is what marks an edge, so this needs no separate
+    knowledge of the movie's length.
+    """
+    current_col = f"Frame{frame_number}"
+    if current_col not in tracking_data.columns:
+        return {}
+    prev_col, next_col = f"Frame{frame_number - 1}", f"Frame{frame_number + 1}"
+    has_prev = prev_col in tracking_data.columns
+    has_next = next_col in tracking_data.columns
+    if not has_prev and not has_next:
+        return {}
+
+    states = {}
+    for _, row in tracking_data.dropna(subset=[current_col]).iterrows():
+        is_new = has_prev and pd.isna(row[prev_col])
+        is_lost = has_next and pd.isna(row[next_col])
+        if is_new and is_lost:
+            states[row[current_col]] = "both"
+        elif is_lost:
+            states[row[current_col]] = "lost"
+        elif is_new:
+            states[row[current_col]] = "new"
+    return states
+
+
 def _raw_cell_id(cell_index: str) -> int:
     match = re.search(r"Cell\d+_(\d+)", cell_index)
     if not match:
@@ -1364,5 +1411,35 @@ if __name__ == "__main__":
     assert [m["cell_index"] for m in drift_unrestricted["moves"]] == ["Cell2_neighbor"], drift_unrestricted
     assert drift_unrestricted["moves"][0]["from_track_id"] == 5
     print("Restricted pairing correctly avoids stealing the neighbour; unrestricted still can.")
+
+    # classify_track_lifecycle: track 1 spans all 3 frames (no state), track 2
+    # ends at frame 2 ("lost"), track 3 starts at frame 2 ("new"), track 4
+    # exists only at frame 2 ("both" -- a single-frame track).
+    # Track 5 exists only at frame 1 and track 6 only at frame 3, so the edge
+    # frames have something real to judge on their one available side.
+    lifecycle_tracking = pd.DataFrame({
+        "Index": [1, 2, 3, 4, 5, 6],
+        "Frame1": ["Cell1_1", "Cell1_2", None, None, "Cell1_5", None],
+        "Frame2": ["Cell2_1", "Cell2_2", "Cell2_3", "Cell2_4", None, None],
+        "Frame3": ["Cell3_1", None, "Cell3_3", None, None, "Cell3_6"],
+    })
+    mid = classify_track_lifecycle(lifecycle_tracking, 2)
+    print("\nclassify_track_lifecycle at a middle frame:", mid)
+    assert mid == {"Cell2_2": "lost", "Cell2_3": "new", "Cell2_4": "both"}, mid
+
+    # Edge frames judge only the side that exists: at the first frame a track
+    # can end ("lost") but nothing can be "new"; at the last frame a track can
+    # start ("new") but nothing can be "lost". Track 5 ends at frame 1 and
+    # track 6 starts at frame 3 -- neither is reported "both", which is the
+    # point: without a previous/next frame that verdict isn't knowable.
+    first = classify_track_lifecycle(lifecycle_tracking, 1)
+    assert first == {"Cell1_5": "lost"}, first
+    last = classify_track_lifecycle(lifecycle_tracking, 3)
+    assert last == {"Cell3_6": "new"}, last
+    print("Edge frames correctly judge only the side that exists:", first, last)
+
+    single_frame_only = classify_track_lifecycle(pd.DataFrame({"Index": [1], "Frame1": ["Cell1_1"]}), 1)
+    assert single_frame_only == {}, single_frame_only
+    print("A single-frame movie yields no lifecycle states at all.")
 
     print("\nAll manual_correction_tracking smoke tests passed.")

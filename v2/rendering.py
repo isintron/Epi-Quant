@@ -51,6 +51,86 @@ from data_input import _find_matching_image
 # exactly consistent with any diagnostic plots elsewhere in the project.
 PALETTE_PRESET_NAMES = ["tab10", "Set2", "Dark2", "Paired", "tab20"]
 
+# CONTINUOUS colormaps, for scalar-per-cell overlays (the environment score)
+# -- distinct from the qualitative presets above, which map discrete
+# cluster/track ids. viridis is Tissue Analyzer's own default for this score
+# (EPySeg's `matplotlib_to_TA()`); PuOr/BrBG are diverging alternatives.
+CONTINUOUS_LUT_NAMES = ["viridis", "Fire", "Gem", "PuOr", "BrBG"]
+
+# ImageJ's built-in "Fire" LUT, which exists only as hardcoded arrays inside
+# ImageJ's LutLoader (it is NOT one of Fiji's ~500 `.lut` files). These are
+# its canonical 32 control points; ImageJ itself interpolates them to 256, so
+# reproducing that here is exact rather than an approximation.
+_FIRE_CONTROL_POINTS = (
+    (0, 0, 1, 25, 49, 73, 98, 122, 146, 162, 173, 184, 195, 207, 217, 229,
+     240, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255),
+    (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 14, 35, 57,
+     79, 101, 117, 133, 147, 161, 175, 190, 205, 219, 234, 248, 255, 255, 255, 255),
+    (0, 61, 96, 130, 165, 192, 220, 227, 210, 181, 151, 122, 93, 64, 35, 5,
+     0, 0, 0, 0, 0, 0, 0, 0, 0, 35, 98, 160, 223, 255, 255, 255),
+)
+
+# Fiji's "Gem" LUT (`Fiji.app/luts/Gem.lut`, an 800-byte NIH-Image file: a
+# 32-byte `ICOL` header followed by raw R[256]G[256]B[256]). Embedded verbatim
+# as base64 rather than referenced at runtime so the app doesn't depend on a
+# Fiji install, and exactly rather than as control points -- subsampling was
+# measured to still cost ~3/255 of error even at 65 anchors.
+_GEM_LUT_B64 = (
+    "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB"
+    "AQEBAQEBAQEBAQECBAYICgwOEBIUFhgaHB4gIiQmKCosLjAyNDY4Ojw+QEFDRUdJS01PUVNV"
+    "V1lbXV9hY2VnaWttb3FzdXd5e31/gYOFh4mLjY+Rk5WXmZudn6Gjpaepq62vsbO1t7m7vb/A"
+    "wsTGyMrMztDS1NbY2tze4OLk5ujq7O7w8vT2+Pr8/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+"
+    "/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/gICAgMDBAQFBQYGBwcI"
+    "CAkJCgoLCwwMDQ0ODg8PEBARERISExMUFBUVFhYXFxgYGRkaGhsbHBwdHR4eHx8gICEhICAf"
+    "Hx4eHR0cHBsbGhoZGRgYFxcWFhUVFBQTExISEREQEA8PDg4NDQwMCwsKCgkJCAgHBwYGBQUE"
+    "BAMDAgIBAwQGBwkKDA0PEBITFRYYGRscHh8hIiQlJygqKy0uMDEzNDY3OTo8PT9AQUJERUdI"
+    "SktNTlBRU1RWV1laXF1fX2JkZ2lsbnFzdnh7fYCChYeKjI+RlJaZm56go6Woqq2vsrS3uby+"
+    "wMLFx8rMz9HU1tnb3uDj5ejq7e/y9Pf5/PwCAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhsc"
+    "HR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQEFCQ0RFRkdISUpLTE1OT1BR"
+    "UlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f399e3l3dXNx"
+    "b21raWdlY2FfXVtZV1VTUU9NS0lHRUNBQD48Ojg2NDIwLiwqKCYkIiAeHBoYFhQSEA4MCggG"
+    "BAEECAwQFBgcICQoLDA0ODxAQ0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5ufo6err7O3u7/CxsrO"
+    "0tba3uLm6u7y9vr6"
+)
+
+
+def _lut_256(name: str) -> np.ndarray:
+    """A `(256, 3)` uint8 RGB ramp for `name` (one of
+    `CONTINUOUS_LUT_NAMES`). `Fire`/`Gem` are ImageJ/Fiji LUTs with no
+    matplotlib equivalent (see the constants above); everything else is
+    sampled from matplotlib's own continuous colormap."""
+    if name == "Fire":
+        r, g, b = _FIRE_CONTROL_POINTS
+        anchors = np.linspace(0, 255, len(r))
+        grid = np.arange(256)
+        return np.stack(
+            [np.interp(grid, anchors, channel) for channel in (r, g, b)], axis=1
+        ).round().astype(np.uint8)
+    if name == "Gem":
+        raw = np.frombuffer(base64.b64decode(_GEM_LUT_B64), dtype=np.uint8)
+        return np.stack([raw[0:256], raw[256:512], raw[512:768]], axis=1)
+    cmap = colormaps[name]
+    return (np.array([cmap(i / 255.0)[:3] for i in range(256)]) * 255).round().astype(np.uint8)
+
+
+def continuous_lut_colors(values: dict, lut_name: str = "viridis") -> dict:
+    """Map `{key: score}` to `{key: (r, g, b)}` through `lut_name`, with a
+    **fixed 0->1 range**.
+
+    The fixed range is deliberate. EPySeg's equivalent (`apply_lut` called
+    with `min=None, max=None`) rescales each frame to its own min/max, so the
+    same color means a different score on different frames and the movie
+    can't be read as a time series. Pinning the range keeps frames
+    comparable; scores outside `[0, 1]` are clamped rather than rescaling
+    everything around them.
+    """
+    lut = _lut_256(lut_name)
+    colors = {}
+    for key, value in values.items():
+        index = int(round(min(1.0, max(0.0, float(value))) * 255))
+        colors[key] = tuple(int(c) for c in lut[index])
+    return colors
+
 
 def get_palette_presets() -> dict[str, list[str]]:
     """`{"tab10": ["#1f77b4", ...], "Set2": [...], ...}` for
@@ -191,6 +271,11 @@ def render_tracking_overlay(
     track_color_mode: str = "uniform",
     identity_palette: str = "golden_angle",
     label_font_size: int = 10,
+    environment_scores: Optional[dict] = None,
+    environment_lut: str = "viridis",
+    lifecycle_states: Optional[dict] = None,
+    lifecycle_colors: Optional[dict] = None,
+    tint_other_cells: bool = False,
 ) -> Image.Image:
     """Tint each cell by whether it's matched (present in `tracking_data`'s
     `Frame{frame_number}` column) or unmatched, generalizing v1's
@@ -210,6 +295,26 @@ def render_tracking_overlay(
     so individual cells/tracks are visually distinguishable at a glance
     rather than all matched cells sharing one color; unmatched cells still
     get `unmatched_color`.
+
+    Two further modes exist to help *find* errors rather than inspect a cell
+    already suspected, both modeled on Tissue Analyzer's error-spotting
+    workflow (Aigouy & Prud'homme, Fig. 3):
+
+    - `"environment"` colors each cell by `environment_scores`
+      (`{raw_label: 0..1}` from `adjacency.environment_scores`) through the
+      `environment_lut` continuous LUT. Per TA, **dark = the cell's
+      neighborhood changed a lot** (inspect it); bright = preserved. Cells
+      absent from the dict are unscoreable and are left untinted rather than
+      being colored as if they scored 0 -- see `adjacency.environment_scores`
+      for why that distinction matters.
+    - `"lifecycle"` colors each cell by `lifecycle_states`
+      (`{cell_index: "lost"|"new"|"both"}` from
+      `manual_correction_tracking.classify_track_lifecycle`) via
+      `lifecycle_colors` (`{"lost": "#...", "new": "#...", "both": "#..."}`).
+      `"both"` is a single-frame track -- TA's own oversegmentation example,
+      hence its own color. Cells in no lifecycle state are left untinted
+      unless `tint_other_cells`, in which case they take `matched_color`/
+      `unmatched_color` as in `"uniform"`.
     """
     img = base_image.copy()
     frame_col = f"Frame{frame_number}"
@@ -233,6 +338,17 @@ def render_tracking_overlay(
         all_track_ids = sorted(tracking_data[id_col].dropna().unique())
         identity_color_by_track = assign_identity_colors(all_track_ids, identity_palette)
 
+    environment_rgb: dict = {}
+    if track_color_mode == "environment":
+        environment_rgb = continuous_lut_colors(environment_scores or {}, environment_lut)
+
+    lifecycle_rgb: dict = {}
+    if track_color_mode == "lifecycle":
+        lifecycle_rgb = {
+            state: _hex_to_rgb(hex_color)
+            for state, hex_color in (lifecycle_colors or {}).items()
+        }
+
     labels: list[tuple[int, int, str]] = []
     for cell_id in np.unique(outlines):
         if cell_id == 0:
@@ -241,7 +357,18 @@ def render_tracking_overlay(
         track_id = matched_lookup.get(cell_index)
         is_matched = track_id is not None
 
-        if is_matched and track_color_mode == "identity":
+        if track_color_mode == "environment":
+            # Unscoreable cells stay untinted (base image shows through) --
+            # deliberately NOT colored as if they scored 0.
+            if cell_id in environment_rgb:
+                img[outlines == cell_id] = environment_rgb[cell_id]
+        elif track_color_mode == "lifecycle":
+            state = (lifecycle_states or {}).get(cell_index)
+            if state is not None and state in lifecycle_rgb:
+                img[outlines == cell_id] = lifecycle_rgb[state]
+            elif tint_other_cells:
+                img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)
+        elif is_matched and track_color_mode == "identity":
             img[outlines == cell_id] = identity_color_by_track[track_id]
         else:
             img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)

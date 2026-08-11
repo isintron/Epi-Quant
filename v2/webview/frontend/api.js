@@ -137,7 +137,8 @@
       })();
       return true;
     },
-    async get_tracking_overlay(_frame, _renderMode, _showLabels, _colorMode, _identityPalette, _labelFontSize) {
+    async get_tracking_overlay(_frame, _renderMode, _showLabels, _colorMode, _identityPalette, _labelFontSize,
+                               _environmentLut, _environmentDirection, _tintOthers) {
       return MOCK_PNG;
     },
     async get_tracking_cell_at_pixel(frame, _x, _y) {
@@ -184,6 +185,9 @@
       return null;
     },
     async set_track_colors(_matchedColor, _unmatchedColor) {
+      return null;
+    },
+    async set_lifecycle_colors(_lostColor, _newColor, _bothColor) {
       return null;
     },
     async get_track_numbers() {

@@ -4,6 +4,7 @@
 .idea/
 .github
 *.code-workspace
+bibliography/
 
 # Claude
 .claude/
