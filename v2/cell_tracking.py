@@ -328,6 +328,160 @@ def track_cells(
     return _merge_tracking_pairs(frame_output_dir, folder_prefix, start_index=merge_start_index)
 
 
+def retrack_frame_range(
+    cells_info: pd.DataFrame,
+    tracking_data: pd.DataFrame,
+    start_frame: int,
+    end_frame: int,
+    feature_columns: Optional[list[str]] = None,
+    weights: Optional[list[float]] = None,
+) -> dict:
+    """Re-solve tracking for frames `start_frame..end_frame` only, leaving
+    every other frame's identities untouched. For use after hand-correcting
+    segmentation: the masks changed, so the stored links for those frames are
+    stale, but re-tracking the whole movie would renumber tracks and discard
+    manual tracking corrections elsewhere.
+
+    Returns `{"reconciled": [...], "new_tracks": [...], "frames": [...],
+    "relinked": int}`; `tracking_data` is mutated in place (and may be a NEW
+    object if rows were appended -- use the returned dict's caller-side
+    value, i.e. re-read from the caller's own reference).
+
+    **This is not the "local re-track" that was built and removed earlier.**
+    That one re-ran Hungarian matching in a spatial neighborhood around a
+    *tracking* correction -- re-running the algorithm that produced the wrong
+    link, which unsurprisingly reproduced it. Here the *segmentation input
+    itself changed*, so the old links describe cells that no longer exist and
+    recomputing them is the only correct response.
+
+    How identity survives the two seams:
+
+    - **Leading seam.** Frame `start_frame - 1` is untouched, so each of its
+      cell strings still resolves to a track row. The re-solved
+      `(start-1, start)` match therefore says which existing track each
+      re-tracked cell continues, and that cell is written into that same
+      row. Identity is preserved across the seam for free. (This is the one
+      idea worth taking from EPySeg, whose `match_by_max_overlap` propagates
+      the previous frame's identities off disk -- minus its unconditional
+      re-mint of the first frame, which is exactly what makes partial
+      re-tracking impossible there.)
+    - **Trailing seam.** Frame `end_frame + 1` still holds its OLD identities,
+      which may disagree with the re-tracked chain. The re-solved
+      `(end, end+1)` match says which `end+1` cell genuinely continues each
+      re-tracked track; where that cell is currently claimed by a different
+      track, that track's remaining future is spliced onto the re-tracked one
+      via `merge_tracks_from_frame` and the swap is recorded in
+      `"reconciled"`. EPySeg has no equivalent -- it simply leaves the seam
+      broken.
+
+    Cells inside the range with no anchor (a cell that appears mid-range)
+    start a new track numbered `max(Index) + 1`, the same collision-free
+    scheme the correction path already uses.
+    """
+    import manual_correction_tracking  # local: avoids a circular import at module load
+
+    if start_frame > end_frame:
+        raise ValueError(f"start_frame {start_frame} is after end_frame {end_frame}.")
+
+    id_col = tracking_data.columns[0]
+    frame_numbers = sorted(set(
+        int(match.group(1)) for idx in cells_info.index
+        for match in [re.search(r"Cell(\d+)_", str(idx))] if match
+    ))
+    if not frame_numbers:
+        raise ValueError("cells_info contains no recognizable Cell{frame}_ indices.")
+    first_frame, last_frame = min(frame_numbers), max(frame_numbers)
+
+    # Include the seam pairs: they are what let identity carry across the
+    # boundaries instead of the range floating free.
+    pair_start = max(start_frame - 1, first_frame)
+    pair_end = min(end_frame, last_frame - 1)
+    sentinel = cells_info["Circumscribed Circle Radius"].max()
+
+    links: dict[int, dict[str, str]] = {}
+    for frame in range(pair_start, pair_end + 1):
+        cells_a = cells_info[cells_info.index.str.contains(f"Cell{frame}_")]
+        cells_b = cells_info[cells_info.index.str.contains(f"Cell{frame + 1}_")]
+        if cells_a.empty or cells_b.empty:
+            continue
+        cost = build_cost_matrix(cells_a, cells_b, feature_columns, weights)
+        matched = match_frames(cost, sentinel)
+        matched = matched[matched["Difference"] != sentinel]
+        links[frame] = dict(zip(matched["frame1_cell"], matched["frame2_cell"]))
+
+    def _row_holding(frame: int, cell_index: str):
+        col = f"Frame{frame}"
+        if col not in tracking_data.columns:
+            return None
+        rows = tracking_data.index[tracking_data[col] == cell_index]
+        return rows[0] if len(rows) else None
+
+    # Walk each re-solved link forward, writing continuations into the row
+    # that already owns the chain's first cell.
+    result = {"reconciled": [], "new_tracks": [], "frames": list(range(start_frame, end_frame + 1)), "relinked": 0}
+    claimed_this_run: set = set()
+
+    for frame in sorted(links):
+        for cell_a, cell_b in links[frame].items():
+            row = _row_holding(frame, cell_a)
+            target_col = f"Frame{frame + 1}"
+            if target_col not in tracking_data.columns:
+                continue
+
+            if row is None:
+                # No existing track owns this chain's start -- a cell that
+                # appeared inside the range. Give it a fresh, non-colliding id.
+                new_id = int(tracking_data[id_col].max()) + 1
+                blank = {c: None for c in tracking_data.columns}
+                blank[id_col] = new_id
+                blank[f"Frame{frame}"] = cell_a
+                tracking_data.loc[tracking_data.index.max() + 1] = blank
+                row = tracking_data.index[tracking_data[id_col] == new_id][0]
+                result["new_tracks"].append({"track_id": new_id, "from_frame": frame, "cell_index": cell_a})
+
+            existing = tracking_data.at[row, target_col]
+            if pd.notna(existing) and existing == cell_b:
+                continue  # already links this way; nothing to change
+
+            # Whoever else currently claims cell_b must give it up first.
+            other = _row_holding(frame + 1, cell_b)
+            if other is not None and other != row:
+                other_id = int(tracking_data.at[other, id_col])
+                this_id = int(tracking_data.at[row, id_col])
+                if frame + 1 > end_frame:
+                    # Trailing seam: cell_b belongs to the untouched future, so
+                    # splice that whole future onto the re-tracked track rather
+                    # than orphaning it at the boundary.
+                    tracking_data, _displaced = manual_correction_tracking.merge_tracks_from_frame(
+                        tracking_data, frame + 1, other_id, this_id,
+                    )
+                    result["reconciled"].append(
+                        {"frame": frame + 1, "from_track_id": other_id, "into_track_id": this_id, "cell_index": cell_b},
+                    )
+                    row = tracking_data.index[tracking_data[id_col] == this_id][0]
+                    continue
+                tracking_data.at[other, target_col] = None
+
+            tracking_data.at[row, target_col] = cell_b
+            claimed_this_run.add(cell_b)
+            result["relinked"] += 1
+
+    # Any cell inside the range that no link reached is genuinely unmatched
+    # now; clear stale claims on cells that no longer exist in cells_info.
+    for frame in range(start_frame, end_frame + 1):
+        col = f"Frame{frame}"
+        if col not in tracking_data.columns:
+            continue
+        present = set(cells_info.index[cells_info.index.str.startswith(f"Cell{frame}_")])
+        for pos in tracking_data.index:
+            value = tracking_data.at[pos, col]
+            if pd.notna(value) and value not in present:
+                tracking_data.at[pos, col] = None
+
+    result["tracking_data"] = tracking_data
+    return result
+
+
 def split_by_leading_edge(cells_info: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split `cells_info` (must have a `leading_edge` column and a plain
     `'Cell Index'` column, not yet indexed) into (mes, epi) populations.
@@ -396,11 +550,67 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Standalone debug entry for v2.cell_tracking")
-    parser.add_argument("--cells-info", required=True, help="Cells_info.xlsx path")
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--cells-info", help="Cells_info.xlsx path (omit to run the self-test)")
+    parser.add_argument("--output-dir")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
+
+    if not args.cells_info:
+        # Self-test: a 5-frame, 3-cell movie. Cells sit far apart so the
+        # Hungarian match is unambiguous and the assertions test the seam
+        # bookkeeping rather than the matcher.
+        def _cell(name, x, y):
+            row = {c: 0.0 for c in DEFAULT_TRACKING_FEATURES}
+            row["Center X Coordinate"], row["Center Y Coordinate"] = x, y
+            row["Maximum Horizontal Length"] = row["Maximum Vertical Length"] = 30.0
+            row["Circumscribed Circle Radius"] = 10.0
+            return pd.Series(row, name=name)
+
+        rows = []
+        for f in range(1, 6):
+            rows.append(_cell(f"Cell{f}_1", 10.0, 10.0))
+            rows.append(_cell(f"Cell{f}_2", 200.0, 10.0))
+            if f in (3, 4):  # a cell that only exists mid-range
+                rows.append(_cell(f"Cell{f}_9", 10.0, 200.0))
+        info = pd.DataFrame(rows)
+
+        tracking = pd.DataFrame({
+            "Index": [1, 2],
+            **{f"Frame{f}": [f"Cell{f}_1", f"Cell{f}_2"] for f in range(1, 6)},
+        })
+        # Break the trailing seam: track 2's frame-5 claim is moved to a third
+        # track, so re-tracking [2,4] must reconcile it rather than orphan it.
+        tracking.loc[2] = {"Index": 99, **{f"Frame{f}": None for f in range(1, 6)}}
+        tracking.at[2, "Frame5"] = "Cell5_2"
+        tracking.at[1, "Frame5"] = None
+
+        before_ids = set(tracking["Index"])
+        out = retrack_frame_range(info, tracking, start_frame=2, end_frame=4)
+        tracking = out["tracking_data"]
+        print("retrack_frame_range ->", {k: v for k, v in out.items() if k != "tracking_data"})
+        print(tracking, "\n")
+
+        row1 = tracking.index[tracking["Index"] == 1][0]
+        assert all(tracking.at[row1, f"Frame{f}"] == f"Cell{f}_1" for f in range(1, 6)), "track 1 must be intact"
+        assert 1 in before_ids and 2 in before_ids, "pre-existing ids must not be renumbered"
+
+        assert out["reconciled"], "the deliberately-broken trailing seam should have been reconciled"
+        rec = out["reconciled"][0]
+        assert rec["from_track_id"] == 99 and rec["cell_index"] == "Cell5_2", rec
+        row2 = tracking.index[tracking["Index"] == 2][0]
+        assert tracking.at[row2, "Frame5"] == "Cell5_2", "seam splice must land on the re-tracked track"
+
+        assert out["new_tracks"], "the mid-range cell should have started a new track"
+        new_id = out["new_tracks"][0]["track_id"]
+        assert new_id not in before_ids, "a new track must not collide with an existing id"
+        rown = tracking.index[tracking["Index"] == new_id][0]
+        assert tracking.at[rown, "Frame3"] == "Cell3_9" and tracking.at[rown, "Frame4"] == "Cell4_9", tracking.loc[rown]
+        assert pd.isna(tracking.at[rown, "Frame1"]), "the new track must not claim frames before it appeared"
+
+        print("All cell_tracking self-tests passed.")
+        raise SystemExit(0)
+
     os.makedirs(args.output_dir, exist_ok=True)
 
     cells_info_df = pd.read_excel(args.cells_info)

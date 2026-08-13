@@ -100,7 +100,47 @@
         <button id="extract-zoom-in" class="secondary-btn">+</button>
         <button id="extract-zoom-reset" class="secondary-btn">Reset</button>
       </div>
+      <div class="field-row">
+        <label class="checkbox-label"><input type="checkbox" id="extract-show-outline"> Outline</label>
+        <input type="color" id="extract-outline-color-input" value="#00ff00">
+        <label class="checkbox-label"><input type="checkbox" id="extract-show-labels"> Cell ID</label>
+        <label>Size <input type="number" id="extract-label-size-input" class="small-input" value="10" min="6" max="30"></label>
+      </div>
+      <div class="field-row">
+        <label class="checkbox-label"><input type="checkbox" id="extract-qc-toggle"> QC</label>
+        <label>Metric
+          <select id="extract-qc-metric-select">
+            <option value="boundary_contrast" selected>Boundary contrast</option>
+            <option value="morphology">Morphology outlier</option>
+            <option value="neighbor_count">Neighbour count</option>
+            <option value="measurement_failures">Measurement failures</option>
+          </select>
+        </label>
+        <label>LUT
+          <select id="extract-qc-lut-select">
+            <option value="viridis" selected>viridis</option>
+            <option value="Fire">Fire</option>
+            <option value="Gem">Gem</option>
+            <option value="PuOr">PuOr</option>
+            <option value="BrBG">BrBG</option>
+          </select>
+        </label>
+        <button id="extract-qc-summary-btn" class="secondary-btn">Worst frames</button>
+      </div>
+      <div class="render-mode-controls" id="extract-qc-render-mode" style="display:none">
+        <span class="control-group-label">QC tint</span>
+        <label class="radio-label"><input type="radio" name="extract-render-mode" value="mask" checked> Filled</label>
+        <label class="radio-label"><input type="radio" name="extract-render-mode" value="outline"> Boundary only</label>
+      </div>
+      <p class="hint" id="extract-qc-hint" style="display:none">
+        Dark = suspicious, bright = fine.
+        Boundary contrast asks whether the outline sits on the bright membrane signal;
+        morphology and neighbour count flag cells unlike the rest of their own frame;
+        measurement failures are cells whose feature extraction fell back to a sentinel value.
+        Uncoloured cells couldn't be judged by this metric. Click a cell for all four scores.
+      </p>
       <div class="image-click-wrap"><img id="extract-preview-img" class="frame-preview"></div>
+      <div id="extract-qc-status" class="status-line"></div>
     </div>
 
     <div class="next-step-choices" id="extract-next-choices" style="display:none">
@@ -215,6 +255,21 @@
     </div>
     <div class="progress-bar" id="track-progress-bar" style="display:none"><div class="progress-fill"></div></div>
     <div id="track-status" class="status-line"></div>
+
+    <h3>Re-track a frame range</h3>
+    <p class="hint">
+      After hand-correcting segmentation, re-track only the affected frames. Identities outside the
+      range are left alone, and the seam at End+1 is reconciled automatically rather than orphaned.
+    </p>
+    <div class="field-row">
+      <label>Start <input type="number" id="retrack-start-input" class="track-id-input" min="1"></label>
+      <label>End <input type="number" id="retrack-end-input" class="track-id-input" min="1"></label>
+      <button id="detect-stale-btn" class="secondary-btn">Detect changed frames</button>
+      <button id="start-retrack-btn" class="secondary-btn">Re-track range</button>
+    </div>
+    <div id="retrack-status" class="status-line"></div>
+    <ul id="retrack-report-list" class="status-line" style="display:none"></ul>
+
     <div class="next-step-choices" id="track-next-choices" style="display:none">
       <button id="go-to-correct-tracking" class="secondary-btn">Manually correct tracking →</button>
       <button id="go-to-trajectory" class="primary-btn">View Trajectories →</button>

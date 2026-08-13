@@ -236,6 +236,13 @@ button:disabled {
   font-size: 14px;
 }
 
+/* Names what a radio group applies to, where the step has more than one
+   control that could be read as "outline". */
+.control-group-label {
+  color: #666;
+  margin-right: -8px;
+}
+
 .image-click-wrap {
   border: 1px solid var(--border);
   border-radius: 8px;

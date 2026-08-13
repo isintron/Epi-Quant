@@ -16,6 +16,53 @@ cd v2
 python data_input.py --mask-folder /path/to/masks --output /path/to/out
 ```
 
+## How `data_input.py` resolves a folder into frames
+
+Two questions decide everything downstream: *which files are frames*, and
+*which image belongs to each frame*. Both are answered here, once, so nothing
+later can disagree.
+
+```mermaid
+flowchart TD
+    A["mask_folder"] --> B{"detect_mask_format"}
+    B -->|"mixed / empty"| ERR["ValueError"]
+    B -->|"tiff"| C["convert_tiff_masks_to_npy"]
+    B -->|"npy"| F["list_segmentation_files"]
+
+    C --> C1["load_tiff_mask<br/>auto | labeled | skeleton | binary_mask"]
+    C1 --> C2["write dict per frame:<br/>masks - uint16, what Cellpose needs<br/>outlines - filled, what extraction measures<br/>img - the paired source image"]
+    C2 --> D["masks/npy_converted/"] --> F
+
+    F --> G{"resolve_frame_numbers:<br/>does EVERY name contain digits?"}
+    G -->|"yes"| H["frame = LAST digit run<br/>(last, so a gene name like GAP43<br/>can't masquerade as the counter)"]
+    G -->|"no"| I["frame = position in<br/>(number, lowercased name) order<br/>all-or-nothing, so a positional 1<br/>can't collide with a digit-derived 1"]
+
+    H --> J["extract_cell_info"]
+    I --> J
+    J --> K["Cells_info.xlsx<br/>row index = Cell(frame)_(cellID)"]
+    H --> L
+    I --> L
+
+    L{"_find_matching_image"} --> M{"caller passed<br/>reference_name?"}
+    M -->|"yes"| N["_match_image_by_stem:<br/>strip _mask / _seg / _handCorrection<br/>longest form first"]
+    N -->|"hit"| P["that image"]
+    N -->|"miss"| O["match by frame number"]
+    M -->|"no"| O
+```
+
+Two rules are worth keeping in mind when adding a dataset:
+
+- **Frame numbering is all-or-nothing.** Digits win only if *every* filename
+  in the folder has them. Add one digit-less file to a numbered folder and the
+  whole folder renumbers positionally — deliberate (it prevents silent
+  collisions) but surprising if unexpected.
+- **Name beats position for image pairing.** Sorted order can disagree between
+  the mask and image folders, so the stem match runs first and position is
+  only the fallback. `Demo_Seg_QC` is the case that proves it: its masks sort
+  `Demo_OE_mask`, `Demo_WT_handCorrection_mask`, `Demo_WT_mask` while its
+  images sort `Demo_OE`, `Demo_WT`, `Demo_WT_handCorrection`, so pure position
+  hands frames 2 and 3 each other's image.
+
 ## Input format flexibility (reviewer-requested extension)
 
 A peer reviewer asked for the pipeline to accept segmentation input beyond
@@ -174,19 +221,19 @@ dropdown) is completely untouched.
 
 ## Module map
 
-| File                                    | Covers (v1 source)                                                                                                            |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `common.py`                           | Path setup, shared`save_modified_rows` helper                                                                               |
-| `data_input.py`                       | Module 1 — Cellpose`.npy` loading + 18-feature extraction (`gui_main.bio_extract_cell_info`)                             |
-| `pca_kmeans.py`                       | Module 2 — PCA + K-means classification (`gui_main.bio_compute_cell_pca` / `bio_clustering_k_mean`)                      |
-| `manual_correction_classification.py` | Module 4a — classification correction +`leading_edge` computation (`gui_comparison.py`)                                  |
-| `cell_tracking.py`                    | Module 3 — Hungarian-algorithm tracking (`gui_main.run_cell_tracking` + tracking orchestration)                            |
-| `manual_correction_tracking.py`       | Module 4b — tracking correction (`gui_cell_track.py`), plus swap-safe correction / suggest-match / smart-stop propagate (new, see below) |
-| `trajectory_visualization.py`         | Module 5 — trajectory replay + displacement field (`gui_plot_track.py`, `gui_cell_direction.py`) + lifetime-map scaffold |
-| `rendering.py`                        | Overlay compositing for the webview UI (see below) — cluster/tracking/trajectory tinting, click-to-cell pixel lookup, PNG encoding |
-| `adjacency.py`                        | Same-frame cell-adjacency (neighbor) graph via mask-dilation overlap — new, shared by the tracking-correction termination check and `gap_analysis/packing_analysis.py` (see below) |
-| `webview/`                            | The pywebview desktop UI itself (see "pywebview UI" section below)                                                            |
-| `gap_analysis/`                       | Stub modules for manuscript analyses with no v1 implementation (see below)                                                    |
+| File                                    | Covers (v1 source)                                                                                                                                                                   |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `common.py`                           | Path setup, shared`save_modified_rows` helper                                                                                                                                      |
+| `data_input.py`                       | Module 1 — Cellpose`.npy` loading + 18-feature extraction (`gui_main.bio_extract_cell_info`)                                                                                    |
+| `pca_kmeans.py`                       | Module 2 — PCA + K-means classification (`gui_main.bio_compute_cell_pca` / `bio_clustering_k_mean`)                                                                             |
+| `manual_correction_classification.py` | Module 4a — classification correction +`leading_edge` computation (`gui_comparison.py`)                                                                                         |
+| `cell_tracking.py`                    | Module 3 — Hungarian-algorithm tracking (`gui_main.run_cell_tracking` + tracking orchestration)                                                                                   |
+| `manual_correction_tracking.py`       | Module 4b — tracking correction (`gui_cell_track.py`), plus swap-safe correction / suggest-match / smart-stop propagate (new, see below)                                          |
+| `trajectory_visualization.py`         | Module 5 — trajectory replay + displacement field (`gui_plot_track.py`, `gui_cell_direction.py`) + lifetime-map scaffold                                                        |
+| `rendering.py`                        | Overlay compositing for the webview UI (see below) — cluster/tracking/trajectory tinting, click-to-cell pixel lookup, PNG encoding                                                  |
+| `adjacency.py`                        | Same-frame cell-adjacency (neighbor) graph via mask-dilation overlap — new, shared by the tracking-correction termination check and`gap_analysis/packing_analysis.py` (see below) |
+| `webview/`                            | The pywebview desktop UI itself (see "pywebview UI" section below)                                                                                                                   |
+| `gap_analysis/`                       | Stub modules for manuscript analyses with no v1 implementation (see below)                                                                                                           |
 
 Build/dependency order: `common` → `data_input` → `pca_kmeans` →
 `manual_correction_classification` (parity-check gate here, see below) →
@@ -218,8 +265,7 @@ rather than folded into `update_tracking_data`, mirroring EPySeg's
 "Swap two tracks" panel in the webview UI, separate from the existing
 reassign dialog.
 
-**`suggest_match_candidates(cells_info, tracking_data, frame_number,
-selected_cell_index, top_k=3)`** — ranks frame `frame_number + 1`'s currently
+**`suggest_match_candidates(cells_info, tracking_data, frame_number, selected_cell_index, top_k=3)`** — ranks frame `frame_number + 1`'s currently
 unmatched cells by centroid distance from the selected cell, as a suggestion
 only (a human still clicks "Use this" to apply via `add_tracking_id`). Note:
 **not** a revival of the "local re-track" feature removed earlier (see the
@@ -301,8 +347,7 @@ addable via `add_tracking_id` (which never needed `cells_info`) but crashed
 `suggest_match_candidates` with a `KeyError`. `find_propagation_stop_frame`
 got the same fallback for its neighbor lookups. After a suggestion is
 applied, a new manual "Check how far this holds →" button reuses
-`compute_propagation_stop_frame` purely diagnostically (see the `old_id ==
-new_id` guard above).
+`compute_propagation_stop_frame` purely diagnostically (see the `old_id == new_id` guard above).
 
 **Correct Classification UX** — reversed to target-cluster-first: pick a
 cluster from the (existing) picker buttons, which now toggle an "active"
@@ -351,6 +396,7 @@ right for the existing single-`old_id` Smart-stop-propagate use case but
 wrong here, since there's no single consistently-wrong `old_id`.
 
 New functions in `manual_correction_tracking.py`:
+
 - **`find_confirmed_identity_moves`** — walks forward from a human-confirmed
   anchor cell by centroid position (nearest cell within
   `drift_gate_multiplier * radius`, reusing the same displacement-gate
@@ -492,16 +538,242 @@ builds it. Gem is embedded verbatim as base64 from Fiji's `Gem.lut` (an
 runtime dependency on a Fiji install; control-point subsampling was measured
 and still cost ~3/255 error even at 65 anchors, hence the exact copy.
 
+### Round 5: segmentation QC view + local re-track (2026-08-10)
+
+**Segmentation QC (`v2/segmentation_qc.py`, new).** Extract had no quality
+signal at all: the `-1`/`0` sentinels `extract_cell_info` writes for failed
+ellipse fits, zero perimeters and zero contours went only to `logger.debug`,
+then straight into PCA/K-means as if they were measurements. Four
+individually-selectable metrics now render as heatmaps in the Extract step,
+reusing round 4's `continuous_lut_colors` and LUT set unchanged:
+
+- `boundary_contrast` — does the outline sit on the bright membrane signal?
+  `(ring − interior) / (ring + interior)` per cell. **The one that uses the
+  image**, and the one worth trusting most on junction-marker data.
+- `morphology` — robust (median/MAD) z-score over area, circularity and
+  inscribed/circumscribed ratio, from columns already stored.
+- `neighbor_count` — |neighbours − 6|, reusing `adjacency.build_neighbor_graph`
+  and its cache. Border cells are excluded (their count is truncated by the
+  field of view, not by segmentation quality).
+- `measurement_failures` — surfaces those wasted sentinels. Note the
+  zero-contour branch writes **`0`**, not `-1`, for vertex count and both
+  radii, so an `== -1` scan alone misses it.
+
+Metrics are kept separate rather than PCA-combined into one score. The
+best-known no-reference work (Chen & Murphy, MBoC 2022) does combine 14
+metrics, but assumes multichannel images with several cell types differing in
+expression — not single-channel Ecad-GFP — so its weighting would not
+transfer, and a combined number would hide *why* a cell was flagged.
+
+**Cellpose's own `cellprob` is deliberately unused** even though it's present
+(`flows[4][2]`): the `flows` layout differs between Cellpose versions *within
+this project* (`AS_dorsal` stores `flows[0]` as ndarray, `pupae` as a list),
+and it records Cellpose's original guess, so it's stale for exactly the
+hand-corrected cells that matter — `ismanual` shows 8–43 corrected cells per
+frame in `AS_dorsal view_E-cad`. Everything is computed from the raw image
+plus the final mask instead.
+
+**Two calibration facts, both measured rather than assumed.** `boundary_contrast`
+validates against a weak ground truth: on `AS_dorsal view_E-cad` frame 10,
+hand-corrected cells average **0.247 vs 0.461** for automatic ones — it
+independently picks out the same hard regions a human chose to fix. And the
+metrics do *not* share a scale: contrast medians ~0.44 on real data, so a
+shared 0–1 LUT and a shared 0.5 threshold flagged ~85% of cells.
+`QC_METRIC_DISPLAY` gives each metric its own LUT window and triage
+threshold, bringing flag rates to 0.7–12%. The window is fixed, not a
+per-frame autoscale, so round 4's cross-frame comparability still holds.
+The raw intensity array is read via `data_input._find_matching_image`, never
+`rendering.load_base_image`, which max-normalises per frame to uint8 and
+would both break cross-frame comparison and discard 8 bits of the 16-bit
+`pupae_E-cad` data. Both bit depths are verified.
+
+**Local re-track (`cell_tracking.retrack_frame_range`).** Re-solves tracking
+for `[start, end]` only, after segmentation hand-correction makes those links
+stale. Identity survives both seams: `start-1` is untouched, so the re-solved
+`(start-1, start)` match says which existing track each cell continues and it
+is written into that same row; at `end+1` the re-solved `(end, end+1)` match
+says which cell genuinely continues the chain, and where a different track
+claims it, that track's future is spliced on via the existing
+`merge_tracks_from_frame` and reported. Mid-range arrivals get
+`max(Index) + 1`, the same collision-free scheme the correction path uses.
+
+**This is not the "local re-track" removed in an earlier round.** That one
+re-ran Hungarian in a *spatial* neighbourhood around a *tracking* correction
+— re-running the algorithm that produced the bad link. Here the *segmentation
+input changed*, so recomputing is the only correct response.
+
+**How EPySeg/TA solves this: it doesn't** (verified in source). Tracking is
+whole-list only; index 0 is unconditionally re-minted with fresh random
+colours by `track_first_frame` with no existence guard; there is no seam
+handling, no staleness detection, and no ID-collision protection
+(`assigned_ids` starts as `[0, 0xFFFFFF]`, is never seeded from existing
+files, and isn't even passed into the per-frame matcher). Its de-facto answer
+is re-tracking the whole movie, which **destroys every manual track
+correction** — the author flagged this and never fixed it. The one
+transferable idea is that `match_by_max_overlap` propagates the previous
+frame's identities off disk; that is what the leading-seam anchor above does,
+minus the re-mint that makes partial re-tracking impossible there.
+
+`api.get_stale_frames()` compares mask `.npy` mtimes against the tracking
+output and reports each frame's `ismanual` count, pre-filling the range and
+warning that tracking is out of date — the check EPySeg lacks entirely.
+(`ismanual` can't date a correction, so mtime decides staleness and
+`ismanual` is context.)
+
+Verified on real data: re-tracking `[8,12]` on `AS_dorsal view_E-cad` left
+all 18 frame columns outside `[7,13]` byte-identical, preserved every
+pre-existing track id, and kept the count at 185; re-tracking unmodified data
+is correctly a no-op. Then, breaking 30 `Frame10` claims deliberately (20
+nulled, 10 swapped) and re-tracking `[9,11]` **repaired all 30 exactly**,
+with zero residual difference from the original table.
+
+### Round 5 follow-up 2: TIFF 1-px erosion + Filled/Outlines toggle (2026-08-13)
+
+Both found by the user QC-ing `embryos_GBE_GAP43` (segmented in TA, read
+through the TIFF→npy converter). **Both only affect TIFF input — the native
+`.npy` path is untouched, so the manuscript's Cellpose-based AS/LE numbers do
+not move** (verified: `AS_dorsal` and `pupae` extraction byte-identical
+against the pre-change module; `cp_dataset` differs on one cell, which is the
+pre-existing `cv2.fitEllipse` nondeterminism that also differs old-vs-old).
+
+**1. Cells lost a 1-px rim.** `_label_binary_mask` resolved the source TIFF
+into a cell class and a boundary class, labeled only the cell class, and
+**discarded the boundary** — so every drawn 1-px line became permanent
+background between two cells. Measured: background was 8.03% of the image,
+*exactly* the 10,449 skeleton pixels, and **not one of the 269 cells was
+4-adjacent to another** (native Cellpose has 16,107 adjacent pixel pairs).
+
+New `_close_label_gaps` hands those pixels back to the nearest cell, via
+`scipy.ndimage.distance_transform_edt(..., return_indices=True)` —
+scikit-image's `expand_labels` would be the obvious tool but scikit-image is
+**not installed and is referenced nowhere in this repo**. Restricted to the
+resolved boundary class, never a blanket background fill, so a genuinely
+unsegmented region can't be absorbed. Applied to `skeleton`/`auto` only;
+`binary_mask`'s background may be real empty space.
+
+Result on embryos: background 8.03% → 0.00%, adjacent pairs 0 → 14,128, cell
+count unchanged (269 → 269, nothing lost or merged). **`boundary_contrast`
+rose from 0.145 to 0.175 (+20%)** — the ring now samples the membrane instead
+of sitting one pixel inside it, which is exactly what the QC metric needed.
+
+**2. The Filled/Outlines toggle was a no-op on TIFF data.** The frontend
+wiring was correct; the converter wrote the *same filled array* under both
+`'masks'` and `'outlines'`, so `_load_frame`'s `boundary_labels` **was**
+`fill_labels` (`np.array_equal → True`, both 91.9% nonzero) and "outlines"
+painted a flooded cell. This affected all five render steps, not just the two
+reported. The converter now writes a genuine ring via `thin_label_outlines`
+(91.9% → 13.7% nonzero). Verified the encoded PNGs now differ between
+`mask` and `outline` in both Extract and Correct Tracking, on both input paths.
+
+`rendering.cell_boundary_mask` now delegates to `data_input.thin_label_outlines`
+so the ring geometry has one implementation.
+
+**Numbers this moves, TIFF datasets only:**
+
+| | from gap fix | extra, from thin outlines |
+|---|---|---|
+| Cell Area | +9.1% | — |
+| Cell Perimeter | +4.0% | — |
+| Circularity | +1.2% | — |
+| Fitted Ellipse Minor / Major Axis | — | +16.4% / +18.0% |
+| Ellipse Major/Minor Ratio | — | +1.5% |
+
+The ellipse shift is the point, not a side effect: `cv2.fitEllipse` is fed the
+raw stored array, so a filled point cloud biased the fit small while a ring
+fits the actual outline — which is what the Cellpose path always did. The two
+input formats are now consistent. The axis *ratio* barely moves, so
+aspect-ratio conclusions hold, but ellipse axes are 4 of the 13 PCA features,
+so **any TIFF-derived classification should be re-run.**
+
+**3. `binary_mask` picked the wrong class** (pre-existing, fixed here). It
+selected whichever class covered *fewer* pixels, which is backwards whenever
+cells outnumber the gaps — on skeleton-like input it labeled 4,668 line
+fragments as "cells" instead of finding the 269 real ones. It now takes the
+foreground (higher) value, matching this `mask_type`'s documented meaning and
+the UI's own wording, "binary_mask (foreground = cell body)". Cell/boundary
+disambiguation is the skeleton path's job (`_resolve_skeleton_classes`, what
+`auto` uses); `binary_mask` is the explicit "trust me" escape hatch.
+
+`python3 data_input.py` now runs a self-test covering all three (9-cell
+skeleton grid closes with no background and touching cells; the ring is
+smaller than the filled mask and preserves the label set; `binary_mask` labels
+3 foreground blobs and keeps its background).
+
+### Round 5 follow-up: digit-less filenames, Cellpose round-trip, adaptive QC window (2026-08-12)
+
+Found by the user debugging the new QC view against `test_data/Demo_Seg_QC`
+(two *unrelated samples*, `Demo_WT`/`Demo_OE`, as TIFF boundary masks — not a
+time series). Three separate defects, all now fixed and verified.
+
+**1. Digit-less filenames made every preview blank.** `_extract_frame_number`
+returns `inf` for a name with no digits, and `extract_cell_info` had its own
+private `str(idx + 1)` fallback — so extraction emitted `Cell1_*`/`Cell2_*`
+rows while `_npy_path_for_frame` and `_find_matching_image` both looked for a
+frame numbered `inf`, found nothing, and returned `None`. New
+`data_input.resolve_frame_numbers` is now the single place that decision is
+made, used by `list_segmentation_files`, `extract_cell_info`,
+`_find_matching_image`, `convert_tiff_masks_to_npy` and api.py's three
+lookups. Numbering is all-or-nothing (embedded digits if *every* name has
+them, otherwise positional for *all*) so a positional 1 can't collide with a
+digit-derived 1. Ordering is `(number, lowercased name)` — sorting digit-less
+names by `inf` alone left them in `os.listdir` order, which is arbitrary, so
+frames 1 and 2 could have swapped identity between runs on the same folder.
+Verified byte-identical extraction output on `AS_dorsal view_E-cad` against
+the pre-change code (2822 rows, every column equal).
+
+**2. Converted `.npy` files couldn't be opened in Cellpose.**
+`convert_tiff_masks_to_npy` wrote `{'outlines': ...}` only; Cellpose's
+`io._load_seg` indexes `dat["masks"]` unconditionally (`KeyError: 'masks'`)
+and then reports "no image file found and no image in npy" without `'img'`.
+Both keys are now written — `'masks'` as uint16, matching what Cellpose
+saves. `'outlines'` deliberately keeps holding the same *filled* array rather
+than a thin boundary: `extract_cell_info` measures from `'outlines'` on this
+path, so narrowing it would silently change every extracted geometry column,
+and Cellpose is unaffected because `io._masks_to_gui` discards stored
+outlines for 2D masks and recomputes them. Verified by replaying
+`_load_seg`'s key path inside the user's own cellpose venv.
+To hand-correct one, copy it beside its image as `<image-stem>_seg.npy`.
+
+**3. The QC LUT window was hardcoded to Ecad-GFP's contrast range.**
+`boundary_contrast` is a physical intensity ratio; the `vmax=0.6` in
+`QC_METRIC_DISPLAY` was measured on dorsal-closure Ecad data. `Demo_Seg_QC`
+tops out at 0.07, so every cell rendered in the bottom eighth of the colormap
+and **100% tripped the flag threshold** — saying nothing about segmentation
+quality. `segmentation_qc.fit_display_window` now refits the window from the
+project's own scores (98th percentile, not max, so one bright junction can't
+compress everything), cached per project in `api._qc_display_cache` and
+applied to every frame, so frames stay mutually comparable — the property the
+fixed-range LUT exists to protect. Only `boundary_contrast` is refit; the
+other three span 0-1 by construction. Flag rates: `Demo_Seg_QC` 100% → 9.2%,
+`AS_dorsal` unchanged at 5.8% (fitted window 0.555 vs the old hardcoded 0.6).
+
+**Extract preview controls.** `api.get_extract_preview` now composites the
+whole Extract preview in one call — raw frame, optional QC tint
+(`metric=None` for none), optional segmentation outline (colour-pickable),
+optional per-cell ID labels (size-adjustable). One method rather than the
+frontend layering several, because each layer needs the same `_load_frame`
+result and they must be drawn in a fixed order. `rendering.cell_boundary_mask`
+derives the outline from the *filled* mask rather than a stored `'outlines'`
+array, since that array is only a thin boundary on the native Cellpose path
+and would flood every cell on the TIFF path. `rendering._label_centroids`
+computes all centroids in one `bincount` pass instead of the per-cell
+`np.where` scan `render_tracking_overlay` uses.
+
 ## pywebview UI (`v2/webview/`) — handoff notes
 
-**Status (updated 2026-08-08): substantially matured through several rounds
-of real user testing + fixes (see "Extended session changelog" below) — a
-real crash, a real click-to-cell bug, and a real tracking-correctness bug
-have all been found and fixed by actually using the app, not just code
-review. Still not click-tested through an actual native `pywebview` window
-in the current handoff — everything below was verified via direct backend
-Python calls against real `test_data/` + the dev-mode mock in a real
-browser.** If you're picking this up in a new conversation, read
+**Status (updated 2026-08-11, after Round 5): substantially matured through
+five rounds of real user testing + feature work (see "Extended session
+changelog" below for the original round, then the numbered "Round 2"–"Round
+5" sections further down for everything since) — a real crash, a real
+click-to-cell bug, and a real tracking-correctness bug have all been found
+and fixed by actually using the app, not just code review, and Round 5 added
+a segmentation-QC view and a bounded local re-track. Still not click-tested
+through an actual native `pywebview` window in ANY round so far — everything
+below, across all five rounds, was verified via direct backend Python calls
+against real `test_data/` + the dev-mode mock in a real browser. That gap is
+now five rounds old; it should be the first thing a session with access to a
+real display does, before adding a sixth round of features on top of a UI
+nobody has physically clicked.** If you're picking this up in a new conversation, read
 `~/.claude/skills/epi-quant-webview-ui/SKILL.md` first — it has the file
 layout, the `EpiQuantAPI` naming convention, the progress-wiring template,
 and an "add a new pipeline step" checklist (still accurate, unchanged by
@@ -525,9 +797,7 @@ boundary-outline render toggle. Correct Tracking additionally has a
 matched/unmatched vs. per-cell-identity (Golden Angle or a reused qualitative
 LUT) color mode and a cell-label visibility toggle.
 
-**Verified**: the entire backend, via `api.py`'s own `if __name__ ==
-"__main__"` smoke-test harness (`python v2/webview/api.py --mask-folder ...
---image-folder ... --output-dir ... [--classify --n-clusters 2]`), re-run
+**Verified**: the entire backend, via `api.py`'s own `if __name__ == "__main__"` smoke-test harness (`python v2/webview/api.py --mask-folder ... --image-folder ... --output-dir ... [--classify --n-clusters 2]`), re-run
 repeatedly against all real datasets across this round's fixes, most
 recently `test_data/pupae_E-cad`, `test_data/AS_dorsal view_E-cad`, and
 `test_data/AS_LE_lateral view_E-cad` (86 frames, 226 tracks post-fix) —
@@ -542,6 +812,7 @@ rendered ones in a real window.
 **Not yet verified — do this next**: run the actual app
 (`pip install -r v2/webview/requirements.txt && python v2/webview/app.py`)
 and click through it for real, especially:
+
 1. Click-to-cell on full-size real images through an actual browser click
    (the underlying hit-testing bug — see changelog — is fixed and verified
    at the Python level with real pixel coordinates, but never through a
@@ -561,6 +832,16 @@ and click through it for real, especially:
    "Tracking correctness" entry in the changelog below; this is not optional
    busywork, the previously-reported ~10%/~60% comparison was measured
    against the buggy merge algorithm.
+6. *(Added in Round 5.)* The segmentation-QC overlay's LUT tinting on real,
+   full-size rendered cells — only verified as base64 PNG bytes coming back
+   from `api.get_qc_overlay` and against the dev-mode mock's 1×1 stand-in
+   image, never actually looked at.
+7. *(Added in Round 5.)* The local re-track panel's Start/End inputs and
+   "Detect changed frames" button, end to end, against a real project the
+   user has actually hand-corrected in Cellpose/Fiji and reloaded — the
+   real-data verification re-tracked already-clean masks and a
+   Python-script-simulated "broken links" case, not an actual
+   hand-corrected `.npy` round-tripped through the real Extract step.
 
 ### Extended session changelog (2026-08-08) — found via real usage, not code review
 
@@ -571,6 +852,7 @@ what broke, not by reading code — treat this list as the "what's actually
 been battle-tested" record for the webview UI.
 
 **Rendering/display bugs:**
+
 - App **crashed on Classify**: `pca_kmeans.py` calls `plt.figure()` (to save
   PCA plots) from a background thread (pywebview's `js_api` calls don't run
   on the main thread); macOS requires `NSWindow` creation on the main
@@ -635,6 +917,7 @@ been battle-tested" record for the webview UI.
   KDTree scan) — cached per-frame, invalidated on any classification change.
 
 **Tracking correctness (the big one — changes reported numbers, see below):**
+
 - **Reassigning one track's ID sometimes silently changed a *different*
   track's displayed ID**, and **cells that first appear mid-movie (not
   present in frame 1) were never tracked at all** — both traced to the same
@@ -664,8 +947,7 @@ been battle-tested" record for the webview UI.
   re-ran Hungarian matching on a spatial+temporal neighborhood around a
   correction, which doesn't address the actual failure mode (a wrong track
   ID that then keeps extending itself frame after frame). Replaced with
-  `manual_correction_tracking.merge_tracks_from_frame(tracking_data,
-  frame_number, old_id, new_id)`: from `frame_number` onward, moves every
+  `manual_correction_tracking.merge_tracks_from_frame(tracking_data, frame_number, old_id, new_id)`: from `frame_number` onward, moves every
   cell `old_id` currently claims onto `new_id`, clearing `old_id`'s claim —
   i.e. splices the mis-tracked tail of one track onto the correct one,
   wired in as a "Propagate to later frames" checkbox next to the existing
@@ -675,6 +957,7 @@ been battle-tested" record for the webview UI.
   11 is empty from frame 6 on, frame 5 is untouched.
 
 **New features (additive, don't affect existing numbers):**
+
 - "Load Existing Results" on the Setup step — if a prior run's
   `Cells_info.xlsx`/`cells_clustering_results.xlsx`/tracking `.xlsx` already
   exist in the chosen output folder, offers to load them instead of
@@ -793,7 +1076,6 @@ rates) for any cell/frame that was already being processed correctly in v1
   `-1` convention already used for the zero-perimeter case), so a
   virtually-unreachable edge case degrades gracefully instead of crashing.
   Flagged here since it wasn't one of the 4 explicitly agreed fixes.
-
 - **`data_input._extract_frame_number` / `extract_cell_info`'s `fig_id`**
   (found while building the webview UI and testing against
   `test_data/embryos_GBE_GAP43`, whose mask filenames look like

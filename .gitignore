@@ -5,6 +5,7 @@
 .github
 *.code-workspace
 bibliography/
+figures/
 
 # Claude
 .claude/

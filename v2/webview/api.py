@@ -54,6 +54,7 @@ import manual_correction_classification
 import manual_correction_tracking
 import pca_kmeans
 import rendering
+import segmentation_qc
 import trajectory_visualization
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,13 @@ class EpiQuantAPI:
         # recomputed on every render, so the view is always correct right
         # after a correction. Cleared only when the project changes.
         self._neighbor_graph_cache: dict[int, Optional[dict]] = {}
+        # frame_number -> unmodified intensity array for segmentation QC;
+        # same file-derived, never-invalidated reasoning as above.
+        self._raw_image_cache: dict[int, Optional[np.ndarray]] = {}
+        # metric -> LUT window fitted once from the project's own first
+        # scored frame (see segmentation_qc.fit_display_window). Cached so
+        # every frame shares one window and stays mutually comparable.
+        self._qc_display_cache: dict[str, dict] = {}
 
         self.matched_color = "#ffd633"
         self.unmatched_color = "#3388ff"
@@ -119,8 +127,9 @@ class EpiQuantAPI:
     def _npy_path_for_frame(self, frame_number: int) -> Optional[str]:
         if not self.npy_folder:
             return None
-        for filename in data_input.list_segmentation_files(self.npy_folder):
-            if data_input._extract_frame_number(filename) == frame_number:
+        files = data_input.list_segmentation_files(self.npy_folder)
+        for filename, number in data_input.resolve_frame_numbers(files).items():
+            if number == frame_number:
                 return os.path.join(self.npy_folder, filename)
         return None
 
@@ -133,11 +142,13 @@ class EpiQuantAPI:
         ID, not just its border). Native Cellpose `.npy` output's own
         `'outlines'` key is deceptively named: it's the ~2-5%-of-pixels
         boundary line, not a filled mask -- `'masks'` is the filled one
-        (same cell IDs, verified against test_data). `convert_tiff_masks_to_npy`'s
-        synthetic dicts have no `'masks'` key because their `'outlines'` is
-        already a filled labeled mask (`load_tiff_mask`'s output) -- so
-        falling back to `'outlines'` when `'masks'` is absent is correct for
-        that path too.
+        (same cell IDs, verified against test_data).
+        `convert_tiff_masks_to_npy` writes both keys with the same meaning, so
+        either input path yields a filled `fill_labels` and a thin
+        `boundary_labels`. (The `'masks'`-absent fallback below is kept only
+        for `.npy` files written by older versions of that converter, which
+        stored a single filled array under `'outlines'`; on those the two
+        render modes look identical.)
 
         `boundary_labels` is always the raw `'outlines'` key as-is: the thin
         boundary-line array. Two distinct uses need it kept separate from
@@ -178,6 +189,8 @@ class EpiQuantAPI:
         self.mask_folder = mask_folder
         self.image_folder = image_folder
         self._neighbor_graph_cache.clear()  # graphs belong to the old project's masks
+        self._raw_image_cache.clear()
+        self._qc_display_cache.clear()
         self.output_dirs = common.setup_output_dirs(output_base_dir)
         fmt = data_input.detect_mask_format(mask_folder)
         return {"format": fmt, "output_dirs": self.output_dirs}
@@ -295,9 +308,8 @@ class EpiQuantAPI:
             frames = self.cells_info["Cell Index"].str.extract(r"Cell(\d+)_")[0].astype(int)
             return sorted(frames.unique().tolist())
         if self.npy_folder:
-            return sorted({
-                data_input._extract_frame_number(f) for f in data_input.list_segmentation_files(self.npy_folder)
-            })
+            files = data_input.list_segmentation_files(self.npy_folder)
+            return sorted(set(data_input.resolve_frame_numbers(files).values()))
         return []
 
     def get_raw_frame_image(self, frame_number: int) -> Optional[str]:
@@ -307,6 +319,148 @@ class EpiQuantAPI:
         _fill_labels, _boundary_labels, base_image = loaded
         from PIL import Image
         return rendering.encode_png_base64(Image.fromarray(base_image))
+
+    # ---- Segmentation QC (Extract step) ----------------------------------
+
+    def _raw_frame_array(self, frame_number: int) -> Optional[np.ndarray]:
+        """The frame's **unmodified** intensity array, cached per frame.
+
+        Deliberately not `_load_frame`'s `base_image`: `rendering.load_base_image`
+        max-normalizes each frame to uint8, which makes intensities
+        incomparable between frames and throws away 8 bits of a 16-bit
+        acquisition (`test_data/pupae_E-cad` is genuinely uint16). Like the
+        neighbor-graph cache this depends only on files on disk, so it never
+        needs invalidating on a correction -- only when the project changes.
+        """
+        if frame_number in self._raw_image_cache:
+            return self._raw_image_cache[frame_number]
+        raw = None
+        npy_path = self._npy_path_for_frame(frame_number)
+        if npy_path is not None:
+            dat = np.load(npy_path, allow_pickle=True).item()
+            raw = dat.get("img")
+        if raw is None and self.image_folder:
+            raw = data_input._find_matching_image(self.image_folder, frame_number)
+        self._raw_image_cache[frame_number] = raw
+        return raw
+
+    def _qc_scores(self, frame_number: int, metric: str) -> dict:
+        """`{raw_label: score}` for one metric on one frame. Empty dict if the
+        metric's inputs aren't available yet."""
+        loaded = self._load_frame(frame_number)
+        if loaded is None:
+            return {}
+        fill_labels = loaded[0]
+
+        if metric == "boundary_contrast":
+            raw = self._raw_frame_array(frame_number)
+            return segmentation_qc.boundary_contrast(raw, fill_labels) if raw is not None else {}
+        if metric == "neighbor_count":
+            return segmentation_qc.neighbor_count_deviation(
+                fill_labels, neighbor_graph=self._get_neighbor_graph(frame_number),
+            )
+        if self.cells_info is None:
+            return {}
+        if metric == "morphology":
+            return segmentation_qc.morphology_outlier(self.cells_info, frame_number)
+        if metric == "measurement_failures":
+            return segmentation_qc.measurement_failures(self.cells_info, frame_number)
+        return {}
+
+    def _qc_display(self, metric: str) -> dict:
+        """`metric`'s LUT window for this project, fitted once and cached."""
+        if metric not in self._qc_display_cache:
+            frames = self.get_frame_numbers()
+            sample = self._qc_scores(frames[0], metric) if frames else {}
+            self._qc_display_cache[metric] = segmentation_qc.fit_display_window(metric, sample)
+        return self._qc_display_cache[metric]
+
+    def get_qc_metric_names(self) -> list:
+        return segmentation_qc.QC_METRIC_NAMES
+
+    def get_qc_metric_display(self) -> dict:
+        return segmentation_qc.QC_METRIC_DISPLAY
+
+    def get_qc_overlay(
+        self, frame_number: int, metric: str = "boundary_contrast",
+        lut: str = "viridis", render_mode: str = "mask",
+    ) -> Optional[str]:
+        loaded = self._load_frame(frame_number)
+        if loaded is None:
+            return None
+        fill_labels, boundary_labels, base_image = loaded
+        label_array = boundary_labels if render_mode == "outline" else fill_labels
+        display = self._qc_display(metric)
+        overlay = rendering.render_score_overlay(
+            label_array, base_image, self._qc_scores(frame_number, metric), lut,
+            vmin=display["vmin"], vmax=display["vmax"],
+        )
+        return rendering.encode_png_base64(overlay)
+
+    def get_extract_preview(
+        self, frame_number: int, metric: Optional[str] = None,
+        lut: str = "viridis", render_mode: str = "mask",
+        show_outline: bool = False, outline_color: str = "#00ff00",
+        show_labels: bool = False, label_font_size: int = 10,
+    ) -> Optional[str]:
+        """The Extract step's preview image, composited in one call: raw
+        frame, optional QC tint (`metric=None` for none), optional
+        segmentation outline, optional per-cell ID labels.
+
+        One method rather than the frontend layering several, because each
+        layer needs the same `_load_frame` result and the overlays must be
+        drawn in a fixed order (tint, then outline, then labels on top).
+        """
+        loaded = self._load_frame(frame_number)
+        if loaded is None:
+            return None
+        fill_labels, boundary_labels, base_image = loaded
+
+        if metric:
+            label_array = boundary_labels if render_mode == "outline" else fill_labels
+            display = self._qc_display(metric)
+            image = rendering.render_score_overlay(
+                label_array, base_image, self._qc_scores(frame_number, metric), lut,
+                vmin=display["vmin"], vmax=display["vmax"],
+            )
+            array = np.array(image)
+        else:
+            array = base_image.copy()
+
+        if show_outline:
+            array = rendering.draw_cell_outlines(array, fill_labels, outline_color)
+
+        from PIL import Image
+        pil_img = Image.fromarray(array)
+        if show_labels:
+            pil_img = rendering.draw_cell_labels(pil_img, fill_labels, label_font_size)
+        return rendering.encode_png_base64(pil_img)
+
+    def get_qc_summary(self, metric: str = "boundary_contrast") -> list:
+        """Per-frame `{frame, scored, flagged, min, median}` so the worst
+        frames are findable without stepping through the whole movie. The
+        flag threshold is the metric's own (see `QC_METRIC_DISPLAY`), since
+        the metrics don't share a scale."""
+        flag_below = self._qc_display(metric)["flag_below"]
+        return [
+            {"frame": f, **segmentation_qc.summarize(self._qc_scores(f, metric), flag_below)}
+            for f in self.get_frame_numbers()
+        ]
+
+    def get_qc_cell_at_pixel(self, frame_number: int, x: int, y: int) -> Optional[dict]:
+        """Every metric's score for the clicked cell, so a flagged cell can be
+        interrogated rather than just seen."""
+        loaded = self._load_frame(frame_number)
+        if loaded is None:
+            return None
+        cell_id = rendering.cell_id_at_pixel(loaded[0], int(x), int(y))
+        if cell_id is None:
+            return None
+        scores = {}
+        for metric in segmentation_qc.QC_METRIC_NAMES:
+            value = self._qc_scores(frame_number, metric).get(int(cell_id))
+            scores[metric] = None if value is None else round(float(value), 3)
+        return {"cell_index": f"Cell{frame_number}_{cell_id}", "cell_id": int(cell_id), "scores": scores}
 
     # ---- Classify (skippable) --------------------------------------------
 
@@ -520,6 +674,73 @@ class EpiQuantAPI:
         except Exception as e:
             logger.exception("Tracking failed")
             self._notify("onTrackError", {"message": str(e)})
+
+    def get_stale_frames(self) -> dict:
+        """Which frames' segmentation changed after the last tracking run.
+
+        Compares each mask `.npy`'s mtime against the tracking output's, and
+        reports each frame's `ismanual` count (Cellpose records which cells a
+        human drew or edited; this project's real data carries 8-43 per
+        frame). Purely advisory -- it pre-fills the re-track range and warns
+        that tracking is out of date. EPySeg has no equivalent check at all,
+        which is how a hand-corrected mask silently keeps stale tracks there.
+
+        `ismanual` alone can't date a correction (a frame edited long ago
+        still reports it), so mtime is what decides staleness and `ismanual`
+        is context.
+        """
+        tracking_path = os.path.join(
+            self.output_dirs["cell_track_output"], "all_cell_tracking", "all_cell_merged_tracking_results.xlsx",
+        ) if self.output_dirs else None
+        tracked_at = os.path.getmtime(tracking_path) if tracking_path and os.path.isfile(tracking_path) else None
+
+        frames = []
+        seg_files = data_input.list_segmentation_files(self.npy_folder or "")
+        for filename, frame in data_input.resolve_frame_numbers(seg_files).items():
+            path = os.path.join(self.npy_folder, filename)
+            mtime = os.path.getmtime(path)
+            manual = 0
+            try:
+                flags = np.load(path, allow_pickle=True).item().get("ismanual")
+                manual = int(np.asarray(flags).sum()) if flags is not None else 0
+            except Exception:
+                logger.debug("Could not read ismanual from %s", path)
+            frames.append({
+                "frame": frame,
+                "stale": tracked_at is not None and mtime > tracked_at,
+                "manual_cells": manual,
+            })
+        frames.sort(key=lambda f: f["frame"])
+        stale = [f["frame"] for f in frames if f["stale"]]
+        return {
+            "tracked": tracked_at is not None,
+            "frames": frames,
+            "stale_frames": stale,
+            "suggested_range": [min(stale), max(stale)] if stale else None,
+        }
+
+    def start_local_retrack(self, start_frame: int, end_frame: int) -> bool:
+        thread = threading.Thread(
+            target=self._run_local_retrack, args=(int(start_frame), int(end_frame)), daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _run_local_retrack(self, start_frame: int, end_frame: int) -> None:
+        try:
+            if self.cells_info is None or self.tracking_data is None:
+                raise ValueError("Extract and track the movie before re-tracking a range.")
+            cb = self._progress_cb("retrack")
+            cb(f"Re-tracking frames {start_frame}-{end_frame}...", 10)
+            result = cell_tracking.retrack_frame_range(
+                self.cells_info.set_index("Cell Index"), self.tracking_data, start_frame, end_frame,
+            )
+            self.tracking_data = result.pop("tracking_data")
+            cb("Re-track complete.", 100)
+            self._notify("onRetrackDone", {**result, "track_count": int(len(self.tracking_data))})
+        except Exception as e:
+            logger.exception("Local re-track failed")
+            self._notify("onRetrackError", {"message": str(e)})
 
     def set_track_colors(self, matched_color: str, unmatched_color: str) -> None:
         self.matched_color = matched_color

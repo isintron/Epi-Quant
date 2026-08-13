@@ -186,7 +186,8 @@ async function handleStartExtraction() {
 
 function onProgress(data) {
   const barIdByStage = { extract: "extract-progress-bar", track: "track-progress-bar" };
-  const statusIdByStage = { extract: "extract-status", track: "track-status", leading_edge: "leading-edge-status" };
+  const statusIdByStage = { extract: "extract-status", track: "track-status", leading_edge: "leading-edge-status",
+                            retrack: "retrack-status" };
 
   const barId = barIdByStage[data.stage];
   if (barId) {
@@ -252,8 +253,59 @@ function wireColorMode(prefix, onChange) {
 async function showExtractFrame(frame) {
   state.extractFrame = frame;
   document.getElementById("extract-frame-label").textContent = frameLabel(frame);
-  const img = await window.EpiQuantAPI.get_raw_frame_image(frame);
+  await refreshExtractImage();
+  document.getElementById("extract-qc-status").textContent = "";
+}
+
+async function refreshExtractImage() {
+  const qcOn = document.getElementById("extract-qc-toggle").checked;
+  const img = await window.EpiQuantAPI.get_extract_preview(
+    state.extractFrame,
+    qcOn ? document.getElementById("extract-qc-metric-select").value : null,
+    document.getElementById("extract-qc-lut-select").value,
+    getRenderMode("extract"),
+    document.getElementById("extract-show-outline").checked,
+    document.getElementById("extract-outline-color-input").value,
+    document.getElementById("extract-show-labels").checked,
+    parseInt(document.getElementById("extract-label-size-input").value, 10) || 10,
+  );
   if (img) document.getElementById("extract-preview-img").src = img;
+}
+
+function syncExtractQcPanels() {
+  const on = document.getElementById("extract-qc-toggle").checked;
+  document.getElementById("extract-qc-render-mode").style.display = on ? "flex" : "none";
+  document.getElementById("extract-qc-hint").style.display = on ? "block" : "none";
+}
+
+async function handleExtractImageClick(event) {
+  if (!document.getElementById("extract-qc-toggle").checked) return;
+  const { x, y } = imagePixelFromClick(event.target, event);
+  const result = await window.EpiQuantAPI.get_qc_cell_at_pixel(state.extractFrame, x, y);
+  if (!result) {
+    setStatus("extract-qc-status", "No cell at that position.", "error");
+    return;
+  }
+  const parts = Object.entries(result.scores)
+    .map(([m, v]) => `${m}: ${v === null ? "n/a" : v}`)
+    .join("   ");
+  setStatus("extract-qc-status", `${result.cell_index} — ${parts}`);
+}
+
+async function handleExtractQcSummary() {
+  const metric = document.getElementById("extract-qc-metric-select").value;
+  setStatus("extract-qc-status", "Scoring every frame…");
+  const summary = await window.EpiQuantAPI.get_qc_summary(metric);
+  const ranked = summary.filter((r) => r.scored > 0)
+    .sort((a, b) => (b.flagged / b.scored) - (a.flagged / a.scored)).slice(0, 5);
+  if (ranked.length === 0) {
+    setStatus("extract-qc-status", "No frames could be scored with this metric.", "error");
+    return;
+  }
+  const text = ranked
+    .map((r) => `frame ${r.frame}: ${r.flagged}/${r.scored} flagged (median ${r.median})`)
+    .join("   |   ");
+  setStatus("extract-qc-status", `Worst frames by ${metric} — ${text}`);
 }
 
 // ---------------------------------------------------------------------
@@ -519,6 +571,72 @@ async function handleStartTracking() {
   document.getElementById("track-progress-bar").style.display = "block";
   setStatus("track-status", "Starting tracking…");
   await window.EpiQuantAPI.start_tracking(state.selectedTrackingMode || "single");
+}
+
+async function handleDetectStaleFrames() {
+  const info = await window.EpiQuantAPI.get_stale_frames();
+  const manual = (info.frames || []).filter((f) => f.manual_cells > 0).length;
+  if (!info.tracked) {
+    setStatus("retrack-status", "Track the movie once before re-tracking a range.", "error");
+    return;
+  }
+  if (!info.suggested_range) {
+    setStatus("retrack-status",
+      `No mask has changed since the last tracking run (${manual} frame(s) contain hand-drawn cells).`, "success");
+    return;
+  }
+  const [start, end] = info.suggested_range;
+  document.getElementById("retrack-start-input").value = start;
+  document.getElementById("retrack-end-input").value = end;
+  setStatus("retrack-status",
+    `Segmentation changed after tracking on frame(s) ${info.stale_frames.join(", ")} — range pre-filled.`, "error");
+}
+
+async function handleStartRetrack() {
+  const start = parseInt(document.getElementById("retrack-start-input").value, 10);
+  const end = parseInt(document.getElementById("retrack-end-input").value, 10);
+  if (Number.isNaN(start) || Number.isNaN(end)) {
+    setStatus("retrack-status", "Enter a valid Start and End frame.", "error");
+    return;
+  }
+  if (start > end) {
+    setStatus("retrack-status", "Start must not be after End.", "error");
+    return;
+  }
+  document.getElementById("start-retrack-btn").disabled = true;
+  document.getElementById("retrack-report-list").style.display = "none";
+  setStatus("retrack-status", `Re-tracking frames ${start}-${end}…`);
+  await window.EpiQuantAPI.start_local_retrack(start, end);
+}
+
+async function onRetrackDone(data) {
+  document.getElementById("start-retrack-btn").disabled = false;
+  const list = document.getElementById("retrack-report-list");
+  list.innerHTML = "";
+
+  (data.reconciled || []).forEach((r) => {
+    const li = document.createElement("li");
+    li.textContent = `Seam at frame ${r.frame}: track #${r.from_track_id} spliced into track #${r.into_track_id} (${r.cell_index}).`;
+    list.appendChild(li);
+  });
+  (data.new_tracks || []).forEach((t) => {
+    const li = document.createElement("li");
+    li.textContent = `New track #${t.track_id} starts at frame ${t.from_frame} (${t.cell_index}).`;
+    list.appendChild(li);
+  });
+  list.style.display = list.children.length ? "block" : "none";
+
+  setStatus("retrack-status",
+    `Re-tracked ${(data.frames || []).length} frame(s): ${data.relinked} link(s) updated, ` +
+    `${(data.reconciled || []).length} seam reconciliation(s), ${(data.new_tracks || []).length} new track(s). ` +
+    `${data.track_count} tracks total.`, "success");
+
+  state.trackNumbers = await window.EpiQuantAPI.get_track_numbers();
+}
+
+function onRetrackError(data) {
+  document.getElementById("start-retrack-btn").disabled = false;
+  setStatus("retrack-status", `Re-track failed: ${data.message}`, "error");
 }
 
 async function onTrackDone(data) {
@@ -1105,8 +1223,8 @@ function wireZoom(prefix, imgId) {
     slider.value = percent;
   };
 
-  document.getElementById(`${prefix}-zoom-in`).addEventListener("click", () => setZoom(state.zoomLevels[prefix] + 25));
-  document.getElementById(`${prefix}-zoom-out`).addEventListener("click", () => setZoom(state.zoomLevels[prefix] - 25));
+  document.getElementById(`${prefix}-zoom-in`).addEventListener("click", () => setZoom(state.zoomLevels[prefix] + 10));
+  document.getElementById(`${prefix}-zoom-out`).addEventListener("click", () => setZoom(state.zoomLevels[prefix] - 10));
   document.getElementById(`${prefix}-zoom-reset`).addEventListener("click", () => setZoom(100));
   slider.addEventListener("input", () => setZoom(parseInt(slider.value, 10)));
   slider.addEventListener("wheel", (e) => e.stopPropagation()); // let the slider keep its own native wheel-drag; only the image below should scroll frames
@@ -1185,7 +1303,17 @@ function init() {
 
   // Extract
   document.getElementById("start-extraction-btn").addEventListener("click", handleStartExtraction);
-  document.getElementById("extract-preview-img").addEventListener("click", () => {}); // raw preview, no click action
+  document.getElementById("extract-preview-img").addEventListener("click", handleExtractImageClick);
+  document.getElementById("extract-qc-toggle").addEventListener("change", async () => {
+    syncExtractQcPanels();
+    await refreshExtractImage();
+  });
+  document.getElementById("extract-qc-metric-select").addEventListener("change", refreshExtractImage);
+  ["extract-show-outline", "extract-outline-color-input", "extract-show-labels", "extract-label-size-input"]
+    .forEach((id) => document.getElementById(id).addEventListener("change", refreshExtractImage));
+  document.getElementById("extract-qc-lut-select").addEventListener("change", refreshExtractImage);
+  document.getElementById("extract-qc-summary-btn").addEventListener("click", handleExtractQcSummary);
+  wireRenderMode("extract", refreshExtractImage);
   wireFrameNav("extract", () => state.extractFrame, (f) => (state.extractFrame = f), showExtractFrame);
   wireZoom("extract", "extract-preview-img");
   wireFrameWheel("extract", "extract-preview-img");
@@ -1247,6 +1375,8 @@ function init() {
 
   // Track
   document.getElementById("start-tracking-btn").addEventListener("click", handleStartTracking);
+  document.getElementById("detect-stale-btn").addEventListener("click", handleDetectStaleFrames);
+  document.getElementById("start-retrack-btn").addEventListener("click", handleStartRetrack);
   document.getElementById("go-to-correct-tracking").addEventListener("click", () => goToStep("correct-tracking"));
   document.getElementById("go-to-trajectory").addEventListener("click", enterTrajectoryStep);
 
@@ -1313,6 +1443,8 @@ function init() {
   window.onExtractDone = onExtractDone;
   window.onExtractError = onExtractError;
   window.onTrackDone = onTrackDone;
+  window.onRetrackDone = onRetrackDone;
+  window.onRetrackError = onRetrackError;
   window.onTrackError = onTrackError;
 }
 

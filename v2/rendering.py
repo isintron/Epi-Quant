@@ -43,7 +43,7 @@ from matplotlib import colormaps
 from matplotlib.colors import rgb2hex
 from PIL import Image, ImageDraw, ImageFont
 
-from data_input import _find_matching_image
+from data_input import _find_matching_image, thin_label_outlines
 
 # Built-in preset qualitative palettes offered by the UI's cluster-color
 # picker, alongside free per-cluster HEX customization. Derived straight
@@ -385,6 +385,91 @@ def render_tracking_overlay(
         for cx, cy, text in labels:
             draw.text((cx, cy), text, fill="white", font=font)
 
+    return pil_img
+
+
+def render_score_overlay(
+    outlines: np.ndarray,
+    base_image: np.ndarray,
+    scores: dict,
+    lut_name: str = "viridis",
+    vmin: float = 0.0,
+    vmax: float = 1.0,
+) -> Image.Image:
+    """Tint each cell by its `scores[raw_label]` value through `lut_name`.
+    Cells with no score are left untinted so the base image shows through --
+    "not judgeable" reads differently from "scored 0", the same convention
+    `render_tracking_overlay`'s environment mode uses.
+
+    `vmin`/`vmax` window which part of the score range the LUT spans, for
+    metrics whose realistic values don't fill 0-1 (see
+    `segmentation_qc.QC_METRIC_DISPLAY`). This is a FIXED window, not a
+    per-frame autoscale -- frames stay comparable, which is the property
+    `continuous_lut_colors` exists to protect.
+
+    Deliberately generic (a plain `{label: score}` dict in, no DataFrame,
+    no tracking data) so it serves the Extract step's segmentation-QC view,
+    which runs before any tracking exists.
+    """
+    span = (vmax - vmin) or 1.0
+    windowed = {label: (value - vmin) / span for label, value in scores.items()}
+
+    img = base_image.copy()
+    for label, rgb in continuous_lut_colors(windowed, lut_name).items():
+        img[outlines == label] = rgb
+    return Image.fromarray(img)
+
+
+def _label_centroids(fill_labels: np.ndarray) -> dict[int, tuple[int, int]]:
+    """`{label: (cx, cy)}` for every non-background label, in one pass.
+
+    Uses `bincount` sums rather than a `np.where` per cell (the pattern
+    `render_tracking_overlay` uses) because this runs over every cell in the
+    frame at once -- on an ~800-cell frame the per-cell scan costs a full
+    image traversal each time.
+    """
+    flat = fill_labels.ravel()
+    width = fill_labels.shape[1]
+    positions = np.arange(flat.size)
+    counts = np.bincount(flat)
+    sum_y = np.bincount(flat, weights=positions // width)
+    sum_x = np.bincount(flat, weights=positions % width)
+
+    centroids = {}
+    for label in np.nonzero(counts)[0]:
+        if label == 0:
+            continue
+        centroids[int(label)] = (int(sum_x[label] / counts[label]), int(sum_y[label] / counts[label]))
+    return centroids
+
+
+def cell_boundary_mask(fill_labels: np.ndarray) -> np.ndarray:
+    """Boolean mask of pixels that sit on a cell's edge -- inside a cell and
+    4-adjacent to a different label (another cell or background).
+
+    Derived from the FILLED mask rather than from a stored `'outlines'` array
+    so the "Outline" overlay draws a boundary even for a mask whose stored
+    outlines are missing or unreliable. `data_input.thin_label_outlines` is
+    the single implementation of the ring geometry; this just reduces it to a
+    boolean.
+    """
+    return thin_label_outlines(fill_labels) > 0
+
+
+def draw_cell_outlines(img: np.ndarray, fill_labels: np.ndarray, color: str = "#00ff00") -> np.ndarray:
+    """Paint each cell's boundary onto `img` (modified in place and returned)."""
+    img[cell_boundary_mask(fill_labels)] = _hex_to_rgb(color)
+    return img
+
+
+def draw_cell_labels(
+    pil_img: Image.Image, fill_labels: np.ndarray, font_size: int = 10, color: str = "#ffffff",
+) -> Image.Image:
+    """Draw each cell's raw ID at its centroid, at `font_size`."""
+    draw = ImageDraw.Draw(pil_img)
+    font = ImageFont.load_default(size=font_size)
+    for label, (cx, cy) in _label_centroids(fill_labels).items():
+        draw.text((cx, cy), str(label), fill=color, font=font)
     return pil_img
 
 

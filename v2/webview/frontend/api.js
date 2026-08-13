@@ -77,6 +77,29 @@
     async get_raw_frame_image(_frame) {
       return MOCK_PNG;
     },
+    async get_qc_metric_names() {
+      return ["boundary_contrast", "morphology", "neighbor_count", "measurement_failures"];
+    },
+    async get_qc_metric_display() {
+      return { boundary_contrast: { vmin: 0.0, vmax: 0.6, flag_below: 0.25 } };
+    },
+    async get_qc_overlay(_frame, _metric, _lut, _renderMode) {
+      return MOCK_PNG;
+    },
+    async get_extract_preview(_frame, _metric, _lut, _renderMode, _showOutline, _outlineColor,
+                              _showLabels, _labelFontSize) {
+      return MOCK_PNG;
+    },
+    async get_qc_summary(_metric) {
+      return [
+        { frame: 1, scored: 176, flagged: 12, min: 0.16, median: 0.44 },
+        { frame: 2, scored: 177, flagged: 31, min: 0.08, median: 0.39 },
+      ];
+    },
+    async get_qc_cell_at_pixel(frame, _x, _y) {
+      return { cell_index: `Cell${frame}_5`, cell_id: 5,
+               scores: { boundary_contrast: 0.536, morphology: 0.95, neighbor_count: 0.75, measurement_failures: 1.0 } };
+    },
     async get_palette_presets() {
       return {
         tab10: ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"],
@@ -129,6 +152,22 @@
     },
     async get_tracking_mode_options() {
       return { has_leading_edge: mockState.hasLeadingEdge, split_available: mockState.hasLeadingEdge };
+    },
+    async get_stale_frames() {
+      return { tracked: true,
+               frames: [{ frame: 1, stale: false, manual_cells: 8 }, { frame: 2, stale: true, manual_cells: 4 }],
+               stale_frames: [2], suggested_range: [2, 2] };
+    },
+    async start_local_retrack(start, end) {
+      (async () => {
+        await delay(300);
+        window.onRetrackDone && window.onRetrackDone({
+          frames: [start, end], relinked: 12, track_count: 185,
+          reconciled: [{ frame: end + 1, from_track_id: 99, into_track_id: 2, cell_index: `Cell${end + 1}_7` }],
+          new_tracks: [{ track_id: 186, from_frame: start, cell_index: `Cell${start}_31` }],
+        });
+      })();
+      return true;
     },
     async start_tracking(_mode) {
       (async () => {
