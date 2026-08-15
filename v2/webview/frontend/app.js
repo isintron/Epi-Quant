@@ -36,6 +36,9 @@ const state = {
 
   existingResults: { extraction: false, classification: false, tracking: false },
 
+  // The most recent image rendered in ANY step, so the clipboard button still
+  // has something to copy on steps that have no preview of their own.
+  lastViewDataUri: null,
   playIntervals: {}, // prefix -> setInterval id, for frame autoplay
   zoomLevels: {}, // prefix -> current zoom percent
 };
@@ -45,6 +48,83 @@ const enabledSteps = new Set(["setup"]);
 // ---------------------------------------------------------------------
 // Step navigation
 // ---------------------------------------------------------------------
+
+// data-step -> the <img> that step displays. Steps 1 (setup) and 5 (track)
+// are parameter-only and have no preview, which is why the clipboard button
+// falls back to the last view rendered anywhere.
+const STEP_PREVIEW_IMG = {
+  extract: "extract-preview-img",
+  classify: "classify-overlay-img",
+  "correct-classification": "correct-class-overlay-img",
+  "correct-tracking": "correct-track-overlay-img",
+  trajectory: "trajectory-overlay-img",
+};
+
+/** The single writer of displayed image content. Pass `null` to clear. */
+function setPreviewImage(elementId, dataUri) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  if (dataUri) {
+    el.src = dataUri;
+    state.lastViewDataUri = dataUri;
+    document.getElementById("copy-view-btn").disabled = false;
+  } else {
+    el.removeAttribute("src");
+  }
+}
+
+function currentStep() {
+  // goToStep records the active step only in the DOM -- there is no
+  // state.currentStep to read.
+  const active = document.querySelector(".step-btn.active");
+  return active ? active.dataset.step : null;
+}
+
+/** The image to copy: this step's own if it has one, else the last rendered. */
+function currentViewDataUri() {
+  const imgId = STEP_PREVIEW_IMG[currentStep()];
+  if (imgId) {
+    const el = document.getElementById(imgId);
+    if (el && el.getAttribute("src")) return el.getAttribute("src");
+  }
+  return state.lastViewDataUri;
+}
+
+async function handleCopyView() {
+  const dataUri = currentViewDataUri();
+  if (!dataUri) {
+    setStatus("copy-view-status", "Nothing has been rendered yet.", "error");
+    return;
+  }
+  const blob = await (await fetch(dataUri)).blob();
+
+  // The page is served from http://127.0.0.1:<port>/ (pywebview auto-starts
+  // its own server), which is a secure context, so the async clipboard API is
+  // available. It has still never been exercised in the real native window,
+  // hence the Python fallback below rather than a bare failure.
+  try {
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+    flashCopyResult("Copied the current view to the clipboard.");
+    return;
+  } catch (err) {
+    console.warn("navigator.clipboard failed, falling back to the Python bridge:", err);
+  }
+
+  const result = await window.EpiQuantAPI.copy_image_to_clipboard(dataUri);
+  if (result && result.success) {
+    flashCopyResult("Copied to the clipboard.");
+  } else {
+    flashCopyResult(`Copy failed: ${(result && result.message) || "clipboard unavailable"}`, true);
+  }
+}
+
+function flashCopyResult(message, isError) {
+  const btn = document.getElementById("copy-view-btn");
+  const original = btn.textContent;
+  btn.textContent = isError ? "⧉ Failed" : "⧉ Copied";
+  btn.title = message;
+  setTimeout(() => { btn.textContent = original; }, 1600);
+}
 
 function enableStep(step) {
   enabledSteps.add(step);
@@ -208,6 +288,15 @@ async function onExtractDone(data) {
   document.getElementById("extract-preview").style.display = "block";
   document.getElementById("extract-next-choices").style.display = "flex";
   enableStep("classify");
+  // Seed the minimum-junction box with the value derived from this project's
+  // own junction lengths, so the number shown is the one actually in use.
+  const minPx = await window.EpiQuantAPI.get_junction_min_px();
+  if (minPx) {
+    const input = document.getElementById("extract-junction-min-input");
+    input.value = minPx.value;
+    input.title = `Derived from this project's junction lengths (${minPx.auto} px). Edit to override.`;
+  }
+  syncExtractQcPanels();
   await showExtractFrame(state.extractFrame);
 }
 
@@ -269,13 +358,25 @@ async function refreshExtractImage() {
     document.getElementById("extract-show-labels").checked,
     parseInt(document.getElementById("extract-label-size-input").value, 10) || 10,
   );
-  if (img) document.getElementById("extract-preview-img").src = img;
+  setPreviewImage("extract-preview-img", img);
 }
 
 function syncExtractQcPanels() {
   const on = document.getElementById("extract-qc-toggle").checked;
   document.getElementById("extract-qc-render-mode").style.display = on ? "flex" : "none";
-  document.getElementById("extract-qc-hint").style.display = on ? "block" : "none";
+  const junctionSelected = document.getElementById("extract-qc-metric-select").value === "junction_contrast";
+  document.getElementById("extract-junction-min-wrap").style.display = on && junctionSelected ? "" : "none";
+  if (!on) setQcHelpVisible(false);
+}
+
+// The metric help lives in a popover rather than inline prose: it now covers
+// five metrics and was pushing the preview off screen.
+function setQcHelpVisible(visible) {
+  document.getElementById("qc-help-popover").style.display = visible ? "block" : "none";
+}
+
+function qcHelpVisible() {
+  return document.getElementById("qc-help-popover").style.display !== "none";
 }
 
 async function handleExtractImageClick(event) {
@@ -289,7 +390,14 @@ async function handleExtractImageClick(event) {
   const parts = Object.entries(result.scores)
     .map(([m, v]) => `${m}: ${v === null ? "n/a" : v}`)
     .join("   ");
-  setStatus("extract-qc-status", `${result.cell_index} — ${parts}`);
+
+  // Worst edges first, and name the neighbour, so a flagged cell says WHICH
+  // of its junctions is the problem rather than only that one is.
+  const edges = (result.junctions || []).slice(0, 3)
+    .map((j) => `${j.contrast <= 0 ? "⚠ " : ""}vs cell ${j.with_cell}: ${j.contrast}`)
+    .join("   ");
+  const edgeText = edges ? `\n   junctions (worst first) — ${edges}` : "";
+  setStatus("extract-qc-status", `${result.cell_index} — ${parts}${edgeText}`);
 }
 
 async function handleExtractQcSummary() {
@@ -458,7 +566,7 @@ async function showClassifyFrame(frame) {
   state.classifyFrame = frame;
   document.getElementById("classify-frame-label").textContent = frameLabel(frame);
   const img = await window.EpiQuantAPI.get_classification_overlay(frame, getRenderMode("classify"));
-  if (img) document.getElementById("classify-overlay-img").src = img;
+  setPreviewImage("classify-overlay-img", img);
 }
 
 async function handleClassifyImageClick(event) {
@@ -492,7 +600,7 @@ async function showCorrectClassFrame(frame) {
   state.correctClassFrame = frame;
   document.getElementById("correct-class-frame-label").textContent = frameLabel(frame);
   const img = await window.EpiQuantAPI.get_classification_overlay(frame, getRenderMode("correct-class"));
-  if (img) document.getElementById("correct-class-overlay-img").src = img;
+  setPreviewImage("correct-class-overlay-img", img);
   document.getElementById("correct-class-selected-cell").textContent = "";
   state.selectedCellForCorrection = null;
 }
@@ -701,7 +809,7 @@ async function refreshCorrectTrackImage() {
     state.correctTrackFrame, getRenderMode("correct-track"), showLabels, getColorMode("correct-track"),
     identityPalette, labelFontSize, environmentLut, environmentDirection, tintOthers
   );
-  if (img) document.getElementById("correct-track-overlay-img").src = img;
+  setPreviewImage("correct-track-overlay-img", img);
 }
 
 async function showCorrectTrackFrame(frame) {
@@ -1093,13 +1201,13 @@ async function showTrajectoryFrame(frame) {
   document.getElementById("trajectory-frame-label").textContent = `Frame ${frame}`;
   const img = await window.EpiQuantAPI.get_trajectory_overlay(state.currentTrackNumber, frame, getRenderMode("trajectory"));
   if (img) {
-    document.getElementById("trajectory-overlay-img").src = img;
+    setPreviewImage("trajectory-overlay-img", img);
     setStatus("trajectory-status", "");
   } else {
     // Clear the image rather than leaving the previous frame's on screen:
     // it would show frame N-1's pixels while `state.trajectoryFrame` says N,
     // so a click-to-jump would hit-test the wrong frame entirely.
-    document.getElementById("trajectory-overlay-img").removeAttribute("src");
+    setPreviewImage("trajectory-overlay-img", null);
     setStatus("trajectory-status", "This track has no cell in this frame (gap).", "error");
   }
 }
@@ -1308,7 +1416,24 @@ function init() {
     syncExtractQcPanels();
     await refreshExtractImage();
   });
-  document.getElementById("extract-qc-metric-select").addEventListener("change", refreshExtractImage);
+  document.getElementById("extract-qc-metric-select").addEventListener("change", async () => {
+    syncExtractQcPanels();
+    await refreshExtractImage();
+  });
+  document.getElementById("extract-junction-min-input").addEventListener("change", async (e) => {
+    const applied = await window.EpiQuantAPI.set_junction_min_px(parseInt(e.target.value, 10) || null);
+    if (applied) e.target.value = applied.value;
+    await refreshExtractImage();
+  });
+  document.getElementById("qc-help-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    setQcHelpVisible(!qcHelpVisible());
+  });
+  document.getElementById("qc-help-close").addEventListener("click", () => setQcHelpVisible(false));
+  document.getElementById("qc-help-popover").addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => { if (qcHelpVisible()) setQcHelpVisible(false); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") setQcHelpVisible(false); });
+  document.getElementById("copy-view-btn").addEventListener("click", handleCopyView);
   ["extract-show-outline", "extract-outline-color-input", "extract-show-labels", "extract-label-size-input"]
     .forEach((id) => document.getElementById(id).addEventListener("change", refreshExtractImage));
   document.getElementById("extract-qc-lut-select").addEventListener("change", refreshExtractImage);

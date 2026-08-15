@@ -22,6 +22,9 @@
     <button class="step-btn" data-step="track" disabled>5. Track</button>
     <button class="step-btn" data-step="correct-tracking" disabled>6. Correct Tracking</button>
     <button class="step-btn" data-step="trajectory" disabled>7. Trajectory</button>
+    <!-- Deliberately NOT .step-btn: init() binds goToStep(btn.dataset.step) to
+         every .step-btn, which would throw on a button with no data-step. -->
+    <button id="copy-view-btn" class="nav-action-btn" title="Copy the current view to the clipboard" disabled>⧉ Clipboard</button>
   </nav>
 </header>
 
@@ -110,7 +113,8 @@
         <label class="checkbox-label"><input type="checkbox" id="extract-qc-toggle"> QC</label>
         <label>Metric
           <select id="extract-qc-metric-select">
-            <option value="boundary_contrast" selected>Boundary contrast</option>
+            <option value="junction_contrast" selected>Junction contrast (per edge)</option>
+            <option value="boundary_contrast">Boundary contrast (per cell)</option>
             <option value="morphology">Morphology outlier</option>
             <option value="neighbor_count">Neighbour count</option>
             <option value="measurement_failures">Measurement failures</option>
@@ -125,20 +129,51 @@
             <option value="BrBG">BrBG</option>
           </select>
         </label>
+        <label id="extract-junction-min-wrap">Min junction
+          <input type="number" id="extract-junction-min-input" class="small-input" min="4" max="500">px
+        </label>
         <button id="extract-qc-summary-btn" class="secondary-btn">Worst frames</button>
       </div>
       <div class="render-mode-controls" id="extract-qc-render-mode" style="display:none">
         <span class="control-group-label">QC tint</span>
         <label class="radio-label"><input type="radio" name="extract-render-mode" value="mask" checked> Filled</label>
         <label class="radio-label"><input type="radio" name="extract-render-mode" value="outline"> Boundary only</label>
+        <button id="qc-help-btn" class="help-btn" aria-label="What do these metrics mean?">?</button>
       </div>
-      <p class="hint" id="extract-qc-hint" style="display:none">
-        Dark = suspicious, bright = fine.
-        Boundary contrast asks whether the outline sits on the bright membrane signal;
-        morphology and neighbour count flag cells unlike the rest of their own frame;
-        measurement failures are cells whose feature extraction fell back to a sentinel value.
-        Uncoloured cells couldn't be judged by this metric. Click a cell for all four scores.
-      </p>
+
+      <div id="qc-help-popover" class="popover" style="display:none">
+        <div class="popover-head">
+          <strong>Segmentation QC metrics</strong>
+          <button id="qc-help-close" class="help-btn" aria-label="Close">&times;</button>
+        </div>
+        <p><strong>Dark = suspicious, bright = fine.</strong> Uncoloured cells or edges couldn't be
+           judged by the selected metric. Click a cell to see all its scores.</p>
+        <dl>
+          <dt>Junction contrast <span class="tag">per edge</span></dt>
+          <dd>Scores every cell&ndash;cell edge on its own: how much brighter the edge is than the
+              cytoplasm either side of it. This is the one that catches a boundary drawn where no
+              membrane exists. <strong>At or below 0 means the edge is darker than the cytoplasm it
+              separates</strong> &mdash; which no real membrane can be. <em>Min junction</em> sets the
+              shortest edge worth scoring; it is derived from your image's own junction lengths
+              (25th percentile), so it adapts to resolution. Shorter edges are skipped because a few
+              pixels beside a bright vertex give an unstable reading.</dd>
+          <dt>Boundary contrast <span class="tag">per cell</span></dt>
+          <dd>The same intensity idea averaged over a cell's whole perimeter. Good for "is this
+              cell's outline generally on the membrane", but one bad edge among six good ones is
+              diluted away &mdash; use junction contrast to find a single wrong edge.</dd>
+          <dt>Morphology outlier <span class="tag">per cell</span></dt>
+          <dd>How unlike the rest of its own frame a cell's area, circularity and compactness are.
+              Flags merged cells (large, ragged) and fragments (tiny, sliver-shaped).</dd>
+          <dt>Neighbour count <span class="tag">per cell</span></dt>
+          <dd>Distance from the 6 neighbours a well-packed epithelium tends toward. Too many
+              suggests a merge, too few a split. Border cells are skipped &mdash; their count is cut
+              off by the field of view, not by segmentation quality.</dd>
+          <dt>Measurement failures <span class="tag">per cell</span></dt>
+          <dd>Cells whose feature extraction fell back to a sentinel value (failed ellipse fit, zero
+              perimeter, no contour found). These otherwise reach only the debug log, yet still feed
+              PCA and clustering.</dd>
+        </dl>
+      </div>
       <div class="image-click-wrap"><img id="extract-preview-img" class="frame-preview"></div>
       <div id="extract-qc-status" class="status-line"></div>
     </div>

@@ -627,6 +627,137 @@ is correctly a no-op. Then, breaking 30 `Frame10` claims deliberately (20
 nulled, 10 swapped) and re-tracking `[9,11]` **repaired all 30 exactly**,
 with zero residual difference from the original table.
 
+### Round 5 follow-up 4: QC help popover, clipboard export, tunable junction length (2026-08-14)
+
+**Minimum junction length is now derived, not hardcoded.** `MIN_INTERFACE_PX
+= 20` assumed a fixed pixel scale; junction length actually tracks image
+resolution. `segmentation_qc.suggest_min_interface_px` takes the 25th
+percentile of the frame's own junction band-lengths, and
+`junction_contrast`/`worst_junction_per_cell`/`junction_label_array` accept
+`min_interface_px=None` to mean "derive it". Derived values across this
+project: **14 px** (`pupae_E-cad`), **17** (`embryos_GBE_GAP43`), **21**
+(`Demo_Seg_QC`), **41** (`AS_dorsal view_E-cad`) — a 3x spread no constant
+covers. `api.get_junction_min_px()` pools it over the same sampled frames as
+the LUT window (`_qc_fit_frames`) so the threshold can't drift frame to frame
+(measured per-frame spread is only 17-18 px on embryos, 20-22 on Demo);
+`set_junction_min_px()` overrides it and clears the dependent LUT cache.
+
+**The percentile is 25, not the 5th originally proposed** — chosen on
+measurement, and the override makes the difference reproducible. At the
+derived 21 px, `Demo_Seg_QC` frame 2 (which contains a real false junction)
+flags exactly 1 junction and frame 3 (the hand-corrected control) flags 0.
+Forcing the threshold to 9 px (the 5th percentile) takes frame 2 to 3 flags
+and **frame 3 to 2 flags on a frame with nothing wrong** — the two short
+vertex stubs return, one of which visibly traces a real but dim membrane. A
+lower percentile buys only false positives here; clean datasets flag nothing
+either way.
+
+**QC help moved into a `?` popover.** `#extract-qc-hint` had grown to ten
+lines of inline prose pushing the preview down the page. It is replaced by a
+`?` button beside the "Boundary only" radio opening a popover with one entry
+per metric, plus what `Min junction` does and why short edges are skipped.
+Dismisses on outside click and `Escape`. This is the **first layered element
+in the app** — the stylesheet previously contained no `z-index` and no
+absolute/fixed positioning at all, and there was no modal, dialog, popover or
+tooltip pattern to follow. Native `<dialog>` was avoided because the bundled
+WKWebView's support for it is unverified; the popover uses the same
+`style.display` toggle idiom as everything else.
+
+**Send-to-clipboard button** in the step nav, beside "7. Trajectory". It
+carries `nav-action-btn`, deliberately **not** `step-btn` — `init()` binds
+`goToStep(btn.dataset.step)` to every `.step-btn`, which would throw on a
+button with no `data-step`.
+
+Steps 1 (Setup) and 5 (Track) have no preview image, so all six `<img>.src`
+writes now route through one `setPreviewImage()` helper that records
+`state.lastViewDataUri`; the button copies the active step's own image when it
+has one and that last view otherwise. Copies at **native resolution** — verified
+that a 300x200 render displayed at 793x529 under zoom still copies as 300x200,
+so zoom stays a viewing aid and pasted figures are reproducible.
+
+The page is served from `http://127.0.0.1:<random-port>/` — pywebview
+auto-starts its Bottle server because `create_window` receives a bare
+filesystem path (`webview/util.py:75-84`, `webview/__init__.py:274`), even
+though `http_server=True` is never passed. That is a potentially-trustworthy
+origin, so `navigator.clipboard` is available and is the primary path (the
+`<img>.src` data URI needs no Python round-trip). `api.copy_image_to_clipboard`
+is a fallback via `AppKit.NSPasteboard`, added because **the native window has
+still never been click-tested**; pyobjc is already a transitive pywebview
+dependency so this costs no new requirement, and there is no PyInstaller spec
+for `v2/webview/` to update (the `gui_main.spec` in the docs targets the legacy
+PyQt5 `src/` app). Verified at the Python level by round-tripping a 40x25 PNG
+off the pasteboard at the exact pixel value; **it cannot be exercised from the
+dev browser**, which has no `window.pywebview`.
+
+### Round 5 follow-up 3: junction contrast — per-edge, not per-cell (2026-08-13)
+
+The user pointed out that `Demo_Seg_QC`'s WT frame contains a real
+segmentation error — a junction drawn straight across a cell, splitting it
+into two spurious 4-vertex cells — that the QC view did not flag at all.
+
+**Why it was missed.** `boundary_contrast` averages over a cell's *entire
+perimeter*. A cell has ~6 edges, so one fabricated edge among five good ones
+is diluted away: the two affected cells scored at the **25th and 57th
+percentile** of their frame, i.e. entirely unremarkable. Measured per
+interface instead, that same edge is the **dimmest of all 203 junctions** in
+the frame (median intensity 1073 vs a frame median of 1472).
+
+**`junction_contrast`** scores each cell-cell interface on its own:
+`(median on the border − median of the two interiors) / sum`. Three details
+that were each necessary, not incidental:
+
+- **Median, not mean, along the border.** The vertices at each end of a
+  junction are genuinely bright; a mean lets them mask a dark span between
+  them. Switching to the median moved the real error from 3rd-worst to
+  2nd-worst on its own.
+- **A minimum interface size** (`MIN_INTERFACE_PX = 20` band px, ~10 px of
+  junction). The two junctions that had been out-ranking the genuine error
+  were 15- and 18-px stubs beside vertices — too few independent samples for
+  a stable median. Excluding them made the real error **worst of 159**, with
+  the next junction 0.065 away. Visual inspection confirmed one of those
+  stubs traces a real (dim) membrane, i.e. it was a false positive.
+- **Gap bridging** (`_bridge_gaps`, `MAX_GAP_PX = 3`). "Adjacent" is not a
+  given even in Cellpose output: on `pupae_E-cad` **no two of the 826 cells
+  touch anywhere** (0 4-adjacent pixel pairs), so a touching-only search
+  returned zero junctions. Bounded so cells can't reach across the genuinely
+  unsegmented background that is 67-71% of those frames.
+
+**Contrast ≤ 0 is an absolute, physically meaningful threshold**: a real
+membrane is brighter than the cytoplasm it separates, so an edge that is not
+means there is no membrane there. Result on the three `Demo_Seg_QC` frames:
+
+| frame | junctions | ≤ 0 |
+|---|---|---|
+| WT (has the error) | 159 | **1 — exactly the false junction** |
+| WT hand-corrected | 159 | 0 |
+| OE | 104 | 0 |
+
+Across whole projects the flag rate is 0.12% (`AS_dorsal`, 8/6869) to 0.47%
+(`Demo_Seg_QC`, 2/422), and 0.00% on `embryos_GBE_GAP43` (0/14567).
+
+**Rendered as edges, not cells.** `junction_label_array` paints each scored
+interface with its own id, so the existing `rendering.render_score_overlay`
+consumes it unchanged and the bad *edge* is coloured in place rather than
+tinting the two cells that share it. The false junction shows up as a black
+line against otherwise yellow/orange junctions. Click-to-inspect lists the
+clicked cell's own junctions worst-first with the neighbour named, so the
+answer is "this edge, with that cell", not just "something here is wrong".
+
+**On a user-adjustable colour range** (asked, and answered with measurement):
+not needed, because the auto-fit already spans what a manual control would
+be for. Median `junction_contrast` is 0.14 on `Demo_Seg_QC`, 0.45 on
+`pupae_E-cad` and 0.52 on `AS_dorsal view_E-cad` — a 3.7x spread that no
+single fixed window covers, which is why `fit_display_window` now refits
+`vmax` for this metric too. `vmin` stays pinned at 0 and is deliberately
+*not* fitted: fitting it would turn "≤ 0 means no membrane" from an absolute
+statement into a relative one, and make the worst junction of a perfectly
+clean frame look as alarming as a genuine error.
+
+The window is now pooled over up to 3 frames spread across the project
+(`api._QC_FIT_FRAMES`) rather than taken from frame 1 alone — `Demo_Seg_QC`
+holds *unrelated samples* whose contrast levels differ ~2x, so fitting on
+whichever happened to be first clipped the others to the top of the colormap.
+
 ### Round 5 follow-up 2: TIFF 1-px erosion + Filled/Outlines toggle (2026-08-13)
 
 Both found by the user QC-ing `embryos_GBE_GAP43` (segmented in TA, read

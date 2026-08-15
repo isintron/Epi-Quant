@@ -327,6 +327,89 @@ button:disabled {
   font-size: 13px;
 }
 
+/* Clipboard action in the step nav. Sized like a .step-btn so it sits on the
+   same row, but visually distinct so it doesn't read as an 8th step. */
+.nav-action-btn {
+  margin-left: 12px;
+  padding: 6px 12px;
+  font-size: 13px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: white;
+  color: var(--muted);
+}
+
+.nav-action-btn:hover:not(:disabled) {
+  background: #f0f1f3;
+  color: var(--text);
+}
+
+/* Round "?" affordance, used for the QC metric help. */
+.help-btn {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: white;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.help-btn:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+/* First layered element in the app -- nothing else in this stylesheet uses
+   z-index or absolute positioning, so these values need not coordinate with
+   anything. Positioned relative to the page rather than anchored to the
+   button, which keeps it from being clipped by the preview's overflow. */
+.popover {
+  position: relative;
+  z-index: 10;
+  margin: 8px 0 12px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.10);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.popover p { margin: 0 0 10px 0; }
+.popover dl { margin: 0; }
+
+.popover dt {
+  font-weight: 600;
+  margin-top: 10px;
+}
+
+.popover dd {
+  margin: 2px 0 0 0;
+  color: var(--muted);
+}
+
+.popover .tag {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-left: 4px;
+}
+
 details {
   margin-bottom: 12px;
 }

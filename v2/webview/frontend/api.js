@@ -78,7 +78,16 @@
       return MOCK_PNG;
     },
     async get_qc_metric_names() {
-      return ["boundary_contrast", "morphology", "neighbor_count", "measurement_failures"];
+      return ["junction_contrast", "boundary_contrast", "morphology", "neighbor_count", "measurement_failures"];
+    },
+    async get_junction_min_px() {
+      return { value: 21, auto: 21, is_override: false };
+    },
+    async set_junction_min_px(value) {
+      return { value: value || 21, auto: 21, is_override: !!value };
+    },
+    async copy_image_to_clipboard(_dataUri) {
+      return { success: true, message: "" };
     },
     async get_qc_metric_display() {
       return { boundary_contrast: { vmin: 0.0, vmax: 0.6, flag_below: 0.25 } };
@@ -98,7 +107,8 @@
     },
     async get_qc_cell_at_pixel(frame, _x, _y) {
       return { cell_index: `Cell${frame}_5`, cell_id: 5,
-               scores: { boundary_contrast: 0.536, morphology: 0.95, neighbor_count: 0.75, measurement_failures: 1.0 } };
+               scores: { boundary_contrast: 0.536, morphology: 0.95, neighbor_count: 0.75, measurement_failures: 1.0 },
+               junctions: [{ with_cell: 40, contrast: -0.0145 }, { with_cell: 12, contrast: 0.131 }] };
     },
     async get_palette_presets() {
       return {

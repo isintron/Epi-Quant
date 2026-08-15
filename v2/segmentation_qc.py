@@ -37,7 +37,34 @@ from scipy import ndimage
 import adjacency
 
 # Metric keys the UI offers, in display order.
-QC_METRIC_NAMES = ["boundary_contrast", "morphology", "neighbor_count", "measurement_failures"]
+QC_METRIC_NAMES = [
+    "junction_contrast", "boundary_contrast", "morphology", "neighbor_count", "measurement_failures",
+]
+
+# Fallback minimum interface size, used only when a frame has too few
+# junctions to take a percentile from. Normally the threshold is DERIVED per
+# project by `suggest_min_interface_px` -- junction length scales with image
+# resolution, and the 25th percentile spans 14-40 px across this project's
+# datasets, so no single constant serves them all.
+#
+# Whatever the value, it is not cosmetic: on `Demo_Seg_QC`'s WT frame the two
+# junctions that out-ranked the real segmentation error were 15 and 18 band px
+# stubs beside vertices. Excluding them moved the genuine error from 3rd-worst
+# to worst-of-159, with the next junction 0.065 away.
+MIN_INTERFACE_PX = 20
+
+# Percentile of a frame's own junction lengths used as the default minimum.
+# 25 rather than a lower value on measured grounds: at the 5th percentile the
+# *corrected* Demo_Seg_QC frame still reports 2 flagged junctions (the vertex
+# stubs above, one of which visibly traces a real but dim membrane), while at
+# the 25th the error frame flags exactly its one real error and the corrected
+# frame flags none. Clean datasets flag nothing either way, so a lower
+# percentile buys only false positives.
+DEFAULT_MIN_INTERFACE_PERCENTILE = 25
+
+# How far a cell may be grown into background to meet a neighbour before their
+# shared border is measured. See `_bridge_gaps`.
+MAX_GAP_PX = 3
 
 # Per-metric display window and triage threshold. These metrics are all
 # "1 = good", but they do NOT share a scale: `boundary_contrast` is a physical
@@ -52,6 +79,11 @@ QC_METRIC_NAMES = ["boundary_contrast", "morphology", "neighbor_count", "measure
 # preserves still holds. `flag_below` is a triage cutoff for the frame summary;
 # nothing is ever discarded on its basis.
 QC_METRIC_DISPLAY = {
+    # vmin is pinned at 0 on physical grounds, not fitted: a real membrane
+    # must be BRIGHTER than the cytoplasm it separates, so contrast <= 0 means
+    # "there is no membrane here" regardless of dataset or exposure. Anything
+    # at or below 0 therefore renders at the very bottom of the LUT.
+    "junction_contrast": {"vmin": 0.0, "vmax": 0.25, "flag_below": 0.02},
     "boundary_contrast": {"vmin": 0.0, "vmax": 0.6, "flag_below": 0.25},
     "morphology": {"vmin": 0.0, "vmax": 1.0, "flag_below": 0.5},
     "neighbor_count": {"vmin": 0.0, "vmax": 1.0, "flag_below": 0.5},
@@ -68,24 +100,31 @@ def fit_display_window(metric: str, scores: Dict[int, float]) -> dict:
     """Adapt `metric`'s LUT window to the scores actually seen in a project,
     falling back to `QC_METRIC_DISPLAY` when there's nothing to fit.
 
-    Only `boundary_contrast` is refit. The other three are constructed to
-    span 0-1 by definition, but boundary contrast is a physical intensity
-    ratio whose achievable range depends on the marker, exposure and
-    background of the acquisition. The defaults in `QC_METRIC_DISPLAY` were
-    measured on Ecad-GFP dorsal-closure data (~0.05-0.60); a lower-contrast
-    dataset (`test_data/Demo_Seg_QC` tops out near 0.07) would render every
-    single cell in the bottom eighth of the colormap and trip the flag
-    threshold on all of them, which says nothing about segmentation quality
-    and everything about the hardcoded window.
+    Only the two *contrast* metrics are refit. The other three are constructed
+    to span 0-1 by definition, but a contrast is a physical intensity ratio
+    whose achievable range depends on the marker, exposure and background of
+    the acquisition, and it varies far more than a single hardcoded window can
+    cover: median `junction_contrast` is 0.14 on `Demo_Seg_QC` but 0.52 on
+    `AS_dorsal view_E-cad` and 0.45 on `pupae_E-cad`. A window sized for one
+    saturates the others -- every junction pinned to the top of the colormap,
+    or (as with the original 0.05-0.60 `boundary_contrast` default against
+    `Demo_Seg_QC`'s 0.07 ceiling) every cell pinned to the bottom and flagged.
+
+    **`vmin` stays at 0 and is never fitted.** For a contrast that is a
+    physically meaningful zero, not a convenience: a real membrane is brighter
+    than the cytoplasm it separates, so <= 0 means "there is no membrane
+    here". Fitting `vmin` would turn that absolute statement into a relative
+    one and let the worst junction in a clean frame look as alarming as a
+    genuine false junction.
 
     The window is still FIXED per project, not per frame -- the caller fits
     it once and reuses it -- so frames stay comparable to one another, which
     is the property the fixed-range LUT exists to protect. `flag_below`
-    keeps the same proportion of the window as the measured default
-    (0.25/0.6), so the triage rate stays comparable across datasets too.
+    keeps the same proportion of the window as the measured default, so the
+    triage rate stays comparable across datasets too.
     """
     base = dict(QC_METRIC_DISPLAY.get(metric, {"vmin": 0.0, "vmax": 1.0, "flag_below": 0.5}))
-    if metric != "boundary_contrast" or not scores:
+    if metric not in ("boundary_contrast", "junction_contrast") or not scores:
         return base
 
     values = np.array(list(scores.values()), dtype=float)
@@ -96,7 +135,8 @@ def fit_display_window(metric: str, scores: Dict[int, float]) -> dict:
         return base
 
     vmax = float(np.clip(vmax, 0.05, 1.0))
-    return {"vmin": 0.0, "vmax": vmax, "flag_below": vmax * 0.25 / 0.6}
+    flag_ratio = base["flag_below"] / base["vmax"] if base.get("vmax") else 0.0
+    return {"vmin": 0.0, "vmax": vmax, "flag_below": vmax * flag_ratio}
 
 
 def _cells_info_for_frame(cells_info: pd.DataFrame, frame_number: int) -> pd.DataFrame:
@@ -166,6 +206,210 @@ def boundary_contrast(
         scores[label] = float(np.clip((ring_mean - interior_mean) / total, 0.0, 1.0))
 
     return scores
+
+
+def _bridge_gaps(fill_labels: np.ndarray, max_gap_px: int) -> np.ndarray:
+    """Grow each cell into the background by up to `max_gap_px`, so cells that
+    a thin gap keeps apart end up sharing a border.
+
+    Needed because "adjacent" is not a given even in Cellpose output: on
+    `test_data/pupae_E-cad` **no two of the 826 cells touch anywhere** (0
+    4-adjacent pixel pairs), so a strictly touching-only interface search
+    finds nothing at all. The gap between two such cells is exactly where the
+    membrane sits, so bridging it puts the interface band on the signal we
+    want to measure.
+
+    Bounded on purpose: a distance limit keeps cells from reaching across the
+    genuinely unsegmented background that surrounds the tissue (67-71% of the
+    frame in this project's Cellpose datasets).
+    """
+    background = fill_labels == 0
+    if not background.any() or max_gap_px <= 0:
+        return fill_labels
+    distance, (nearest_y, nearest_x) = ndimage.distance_transform_edt(background, return_indices=True)
+    within_reach = background & (distance <= max_gap_px)
+    bridged = fill_labels.copy()
+    bridged[within_reach] = fill_labels[nearest_y[within_reach], nearest_x[within_reach]]
+    return bridged
+
+
+def _interface_pixels(fill_labels: np.ndarray) -> Dict[tuple, np.ndarray]:
+    """`{(low_label, high_label): flat pixel indices}` for every pair of
+    touching cells -- the 2-px band straddling their shared border.
+
+    One vectorised pass over the two shift directions rather than a
+    boolean-mask sweep per pair: a frame with ~400 interfaces would otherwise
+    walk the whole image 400 times.
+    """
+    flat_index = np.arange(fill_labels.size).reshape(fill_labels.shape)
+    stride = int(fill_labels.max()) + 1
+
+    keys, indices = [], []
+    for first, second in (
+        ((slice(None, -1), slice(None)), (slice(1, None), slice(None))),
+        ((slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+    ):
+        left, right = fill_labels[first], fill_labels[second]
+        touching = (left != right) & (left > 0) & (right > 0)
+        if not touching.any():
+            continue
+        a = left[touching].astype(np.int64)
+        b = right[touching].astype(np.int64)
+        key = np.minimum(a, b) * stride + np.maximum(a, b)
+        # Both sides of the border belong to the band.
+        keys.append(np.concatenate([key, key]))
+        indices.append(np.concatenate([flat_index[first][touching], flat_index[second][touching]]))
+
+    if not keys:
+        return {}
+
+    key = np.concatenate(keys)
+    index = np.concatenate(indices)
+    order = np.argsort(key, kind="stable")
+    key, index = key[order], index[order]
+    boundaries = np.flatnonzero(np.diff(key)) + 1
+
+    interfaces = {}
+    for chunk_key, chunk_index in zip(np.split(key, boundaries), np.split(index, boundaries)):
+        pair = (int(chunk_key[0] // stride), int(chunk_key[0] % stride))
+        interfaces[pair] = np.unique(chunk_index)
+    return interfaces
+
+
+def suggest_min_interface_px(
+    fill_labels: np.ndarray,
+    percentile: float = DEFAULT_MIN_INTERFACE_PERCENTILE,
+    max_gap_px: int = MAX_GAP_PX,
+) -> int:
+    """A minimum interface size derived from this frame's own junctions: the
+    `percentile`-th of their band-pixel lengths.
+
+    Junction length in pixels scales with image resolution, so a fixed
+    threshold is either too strict on a small frame or too permissive on a
+    large one -- measured across this project the 25th percentile is 14 px on
+    `pupae_E-cad`, 18 on `embryos_GBE_GAP43`, 20 on `Demo_Seg_QC` and
+    `AS_LE_lateral`, and 40 on `AS_dorsal view_E-cad`. Deriving it makes the
+    metric resolution-independent without asking the user for a pixel size.
+
+    Falls back to `MIN_INTERFACE_PX` when there are too few junctions for a
+    percentile to mean anything.
+    """
+    sizes = np.array([pixels.size for pixels in _interface_pixels(_bridge_gaps(fill_labels, max_gap_px)).values()])
+    if sizes.size < 8:
+        return MIN_INTERFACE_PX
+    return max(1, int(np.percentile(sizes, percentile)))
+
+
+def _resolve_min_interface_px(
+    fill_labels: np.ndarray, min_interface_px: Optional[int], max_gap_px: int,
+) -> int:
+    return suggest_min_interface_px(fill_labels, max_gap_px=max_gap_px) if min_interface_px is None \
+        else int(min_interface_px)
+
+
+def _interior_levels(raw_image: np.ndarray, fill_labels: np.ndarray, erode_px: int = 2) -> Dict[int, float]:
+    """`{label: median interior intensity}` -- the cytoplasm level each cell's
+    junctions are judged against."""
+    levels = {}
+    for index, bbox in enumerate(ndimage.find_objects(fill_labels)):
+        if bbox is None:
+            continue
+        label = index + 1
+        mask = fill_labels[bbox] == label
+        window = raw_image[bbox]
+        interior = ndimage.binary_erosion(mask, iterations=erode_px)
+        levels[label] = float(np.median(window[interior if interior.sum() >= 5 else mask]))
+    return levels
+
+
+def junction_contrast(
+    raw_image: np.ndarray, fill_labels: np.ndarray, min_interface_px: Optional[int] = None,
+    max_gap_px: int = MAX_GAP_PX,
+) -> Dict[tuple, float]:
+    """`{(cell_a, cell_b): contrast}` for each shared border: how much
+    brighter the border is than the cytoplasm on either side of it, as
+    `(border - interior) / (border + interior)`.
+
+    This is the metric that catches a *false* junction -- a boundary drawn
+    across a cell where no membrane exists. `boundary_contrast` averages over
+    a cell's whole perimeter, so one bad edge among six good ones is diluted
+    away: on `Demo_Seg_QC`'s WT frame the two cells split by a spurious line
+    scored at the 25th and 57th percentile, i.e. entirely unremarkable.
+    Measured per interface instead, that same line is the worst of 159 and the
+    only one in the frame with contrast <= 0.
+
+    **Contrast <= 0 is the meaningful threshold**, and it is absolute rather
+    than relative: a real membrane is brighter than the cytoplasm it
+    separates, so a border that is not means there is no membrane there.
+
+    Medians, not means, along the border -- the vertices at each end are
+    genuinely bright and a mean lets them mask a dark span between them.
+    Interfaces smaller than `min_interface_px` are skipped; passing `None`
+    derives that threshold from the frame (see `suggest_min_interface_px`).
+    """
+    image = raw_image.astype(np.float32)
+    if image.ndim == 3:
+        image = image.mean(axis=2)
+    flat_image = image.ravel()
+
+    min_interface_px = _resolve_min_interface_px(fill_labels, min_interface_px, max_gap_px)
+    interiors = _interior_levels(image, fill_labels)
+
+    scores = {}
+    for (a, b), pixels in _interface_pixels(_bridge_gaps(fill_labels, max_gap_px)).items():
+        if pixels.size < min_interface_px or a not in interiors or b not in interiors:
+            continue
+        border = float(np.median(flat_image[pixels]))
+        interior = (interiors[a] + interiors[b]) / 2.0
+        total = border + interior
+        if total <= 0:
+            continue
+        scores[(a, b)] = float((border - interior) / total)
+    return scores
+
+
+def junction_label_array(
+    fill_labels: np.ndarray, min_interface_px: Optional[int] = None, max_gap_px: int = MAX_GAP_PX,
+) -> tuple:
+    """`(labels, {junction_id: (cell_a, cell_b)})` where `labels` paints each
+    scored interface with its own id and everything else 0.
+
+    Lets a junction map render through the existing
+    `rendering.render_score_overlay` unchanged -- it only ever asks "which
+    pixels carry this key" -- so a bad *edge* can be shown in place instead of
+    only tinting the two cells that share it.
+    """
+    min_interface_px = _resolve_min_interface_px(fill_labels, min_interface_px, max_gap_px)
+    painted = np.zeros(fill_labels.shape, dtype=np.int32)
+    mapping = {}
+    for junction_id, (pair, pixels) in enumerate(
+        sorted(_interface_pixels(_bridge_gaps(fill_labels, max_gap_px)).items()), start=1,
+    ):
+        if pixels.size < min_interface_px:
+            continue
+        painted.ravel()[pixels] = junction_id
+        mapping[junction_id] = pair
+    return painted, mapping
+
+
+def worst_junction_per_cell(
+    raw_image: np.ndarray, fill_labels: np.ndarray, min_interface_px: Optional[int] = None,
+    max_gap_px: int = MAX_GAP_PX,
+) -> Dict[int, float]:
+    """`{label: worst contrast among that cell's junctions}` -- the per-cell
+    view of `junction_contrast`.
+
+    Worst rather than mean, deliberately: a cell with one false edge and five
+    good ones is exactly the case `boundary_contrast` misses, and only the
+    minimum surfaces it. Cells with no interface large enough to judge are
+    omitted rather than scored 0.
+    """
+    worst: Dict[int, float] = {}
+    for (a, b), value in junction_contrast(raw_image, fill_labels, min_interface_px, max_gap_px).items():
+        for label in (a, b):
+            if label not in worst or value < worst[label]:
+                worst[label] = value
+    return worst
 
 
 def _robust_z(values: np.ndarray) -> np.ndarray:
@@ -330,6 +574,55 @@ if __name__ == "__main__":
     assert contrast[1] > 0.8, contrast[1]
     assert contrast[2] == 0.0, contrast[2]
     print("  -> membrane-aligned cell scores high, flat cell scores 0.")
+
+    # --- junction_contrast: four tiled cells whose shared borders all sit on
+    # bright membrane, except one "junction" drawn across dark cytoplasm.
+    tiles = np.zeros((60, 60), dtype=int)
+    tiles[0:30, 0:30] = 1
+    tiles[0:30, 30:60] = 2
+    tiles[30:60, 0:30] = 3
+    tiles[30:60, 30:60] = 4
+    membrane = np.zeros((60, 60), dtype=np.float32) + 100.0   # cytoplasm
+    membrane[28:32, :] = 900.0                                 # real horizontal membrane
+    membrane[:, 28:32] = 900.0                                 # real vertical membrane
+    # Cell 1 is split by a line drawn where there is NO membrane signal.
+    tiles[0:15, 0:30] = 1
+    tiles[15:30, 0:30] = 5
+
+    junctions = junction_contrast(membrane, tiles, min_interface_px=20)
+    false_edge = junctions[(1, 5)]
+    real_edges = [v for k, v in junctions.items() if k != (1, 5)]
+    print("\njunction_contrast: false edge=%.3f   real edges min=%.3f"
+          % (false_edge, min(real_edges)))
+    assert false_edge <= 0, "an edge drawn across cytoplasm must not score positive"
+    assert min(real_edges) > 0.5, real_edges
+    assert false_edge < min(real_edges)
+    print("  -> the fabricated junction is the only non-positive edge.")
+
+    worst = worst_junction_per_cell(membrane, tiles, min_interface_px=20)
+    assert worst[1] <= 0 and worst[5] <= 0, worst
+    assert all(worst[c] > 0.5 for c in (2, 3, 4)), worst
+    print("  -> both cells sharing it are flagged; the untouched cells are not.")
+
+    derived = suggest_min_interface_px(tiles)
+    print("  -> derived min interface = %d px (p%d of this frame's junctions)"
+          % (derived, DEFAULT_MIN_INTERFACE_PERCENTILE))
+    assert derived > 0
+    assert junction_contrast(membrane, tiles) == junction_contrast(membrane, tiles, min_interface_px=derived), \
+        "min_interface_px=None must be equivalent to passing the derived value"
+
+    painted, mapping = junction_label_array(tiles, min_interface_px=20)
+    assert set(mapping.values()) >= {(1, 5)}, mapping
+    assert (painted > 0).sum() < (tiles > 0).sum()
+    print("  -> junction map paints edges only, ready for the score overlay.")
+
+    # Cells separated by a gap (Cellpose leaves every pupae_E-cad cell
+    # detached) must still produce interfaces.
+    detached = tiles.copy()
+    detached[29:31, :] = 0
+    detached[:, 29:31] = 0
+    assert junction_contrast(membrane, detached, min_interface_px=20), "gap-separated cells must still be scored"
+    print("  -> cells separated by a thin gap are still bridged and scored.")
 
     # --- morphology_outlier: naturally-varying cells plus one merged blob.
     rng = np.random.default_rng(0)

@@ -98,6 +98,11 @@ class EpiQuantAPI:
         # scored frame (see segmentation_qc.fit_display_window). Cached so
         # every frame shares one window and stays mutually comparable.
         self._qc_display_cache: dict[str, dict] = {}
+        # Minimum junction interface size for `junction_contrast`, in band
+        # pixels. `None` = derive it from the project (see
+        # `get_junction_min_px`); an int is a user override.
+        self._junction_min_px: Optional[int] = None
+        self._junction_min_px_auto: Optional[int] = None
 
         self.matched_color = "#ffd633"
         self.unmatched_color = "#3388ff"
@@ -191,6 +196,8 @@ class EpiQuantAPI:
         self._neighbor_graph_cache.clear()  # graphs belong to the old project's masks
         self._raw_image_cache.clear()
         self._qc_display_cache.clear()
+        self._junction_min_px = None
+        self._junction_min_px_auto = None
         self.output_dirs = common.setup_output_dirs(output_base_dir)
         fmt = data_input.detect_mask_format(mask_folder)
         return {"format": fmt, "output_dirs": self.output_dirs}
@@ -355,6 +362,17 @@ class EpiQuantAPI:
         if metric == "boundary_contrast":
             raw = self._raw_frame_array(frame_number)
             return segmentation_qc.boundary_contrast(raw, fill_labels) if raw is not None else {}
+        if metric == "junction_contrast":
+            # Keyed by junction id, not cell label -- `_qc_render_labels` pairs
+            # this with a matching label array so the bad *edge* is painted
+            # rather than the two cells sharing it.
+            raw = self._raw_frame_array(frame_number)
+            if raw is None:
+                return {}
+            min_px = self.get_junction_min_px()["value"]
+            _painted, mapping = segmentation_qc.junction_label_array(fill_labels, min_interface_px=min_px)
+            scored = segmentation_qc.junction_contrast(raw, fill_labels, min_interface_px=min_px)
+            return {jid: scored[pair] for jid, pair in mapping.items() if pair in scored}
         if metric == "neighbor_count":
             return segmentation_qc.neighbor_count_deviation(
                 fill_labels, neighbor_graph=self._get_neighbor_graph(frame_number),
@@ -367,13 +385,123 @@ class EpiQuantAPI:
             return segmentation_qc.measurement_failures(self.cells_info, frame_number)
         return {}
 
+    def _qc_render_labels(
+        self, metric: str, fill_labels: np.ndarray, boundary_labels: np.ndarray, render_mode: str,
+    ) -> np.ndarray:
+        """Which label array a QC metric's scores should be painted onto.
+
+        `junction_contrast` is scored per cell-cell interface, so it needs the
+        junction map whose ids its scores are keyed by; the render-mode toggle
+        doesn't apply to it (a junction is already a line). Every other metric
+        is per cell and honours the toggle as usual.
+        """
+        if metric == "junction_contrast":
+            painted, _mapping = segmentation_qc.junction_label_array(
+                fill_labels, min_interface_px=self.get_junction_min_px()["value"],
+            )
+            return painted
+        return boundary_labels if render_mode == "outline" else fill_labels
+
+    # How many frames the LUT window is fitted from. Pooled rather than taken
+    # from frame 1 alone because a project's frames are not always comparable:
+    # `test_data/Demo_Seg_QC` holds unrelated samples whose contrast levels
+    # differ ~2x, so fitting on whichever happened to be first would clip every
+    # other frame to the top of the colormap. Three is enough to be
+    # representative without paying for a whole 86-frame movie.
+    _QC_FIT_FRAMES = 3
+
+    def get_junction_min_px(self) -> dict:
+        """`{"value": int, "auto": int, "is_override": bool}` -- the minimum
+        junction interface size used by `junction_contrast`.
+
+        Derived once per project from the same sampled frames `_qc_display`
+        uses, then cached: junction length scales with image resolution (the
+        25th percentile runs 14-40 band px across this project's datasets), so
+        a fixed constant is either too strict on a small frame or too
+        permissive on a large one. Pooling a few frames rather than reading
+        one keeps the threshold from drifting frame to frame; the measured
+        per-frame spread is only 17-18 px on `embryos_GBE_GAP43` and 20-22 px
+        on `Demo_Seg_QC`, so pooling costs nothing in accuracy.
+        """
+        if self._junction_min_px_auto is None:
+            suggestions = []
+            for frame in self._qc_fit_frames():
+                loaded = self._load_frame(frame)
+                if loaded is not None:
+                    suggestions.append(segmentation_qc.suggest_min_interface_px(loaded[0]))
+            self._junction_min_px_auto = (
+                int(np.median(suggestions)) if suggestions else segmentation_qc.MIN_INTERFACE_PX
+            )
+        return {
+            "value": int(self._junction_min_px if self._junction_min_px is not None else self._junction_min_px_auto),
+            "auto": int(self._junction_min_px_auto),
+            "is_override": self._junction_min_px is not None,
+        }
+
+    def set_junction_min_px(self, value: Optional[int] = None) -> dict:
+        """Override the minimum junction size, or pass `None`/0 to go back to
+        the derived value. Clears the LUT window, which was fitted from scores
+        computed under the previous threshold."""
+        self._junction_min_px = int(value) if value else None
+        self._qc_display_cache.pop("junction_contrast", None)
+        return self.get_junction_min_px()
+
+    def _qc_fit_frames(self) -> list:
+        """The frames used to derive project-wide QC settings."""
+        frames = self.get_frame_numbers()
+        if not frames:
+            return []
+        step = max(1, len(frames) // self._QC_FIT_FRAMES)
+        return frames[::step][: self._QC_FIT_FRAMES]
+
     def _qc_display(self, metric: str) -> dict:
         """`metric`'s LUT window for this project, fitted once and cached."""
         if metric not in self._qc_display_cache:
-            frames = self.get_frame_numbers()
-            sample = self._qc_scores(frames[0], metric) if frames else {}
-            self._qc_display_cache[metric] = segmentation_qc.fit_display_window(metric, sample)
+            sampled = self._qc_fit_frames()
+            pooled = {}
+            for offset, frame in enumerate(sampled):
+                # Keys collide across frames (a label id is per-frame), so
+                # namespace them -- only the value distribution matters here.
+                for key, value in self._qc_scores(frame, metric).items():
+                    pooled[(offset, key)] = value
+            self._qc_display_cache[metric] = segmentation_qc.fit_display_window(metric, pooled)
         return self._qc_display_cache[metric]
+
+    def copy_image_to_clipboard(self, data_uri: str) -> dict:
+        """Put a `data:image/png;base64,...` string on the system clipboard.
+
+        A fallback only. The page is served over `http://127.0.0.1:<port>/`
+        (pywebview auto-starts its own server for a filesystem path), which is
+        a secure context, so the frontend's `navigator.clipboard` should
+        normally handle this without a round-trip. This exists because that
+        path has never been exercised in the real native window.
+
+        Uses `AppKit.NSPasteboard`, which needs no new dependency -- pyobjc is
+        already installed transitively by pywebview's Cocoa backend. Other
+        platforms fall through to a clear error rather than a silent no-op.
+        """
+        try:
+            import base64
+
+            if "," not in data_uri:
+                return {"success": False, "message": "Not a data URI."}
+            png_bytes = base64.b64decode(data_uri.split(",", 1)[1])
+
+            if sys.platform != "darwin":
+                return {"success": False, "message": f"No clipboard fallback for {sys.platform}."}
+
+            from AppKit import NSPasteboard, NSPasteboardTypePNG
+            from Foundation import NSData
+
+            pasteboard = NSPasteboard.generalPasteboard()
+            pasteboard.clearContents()
+            ok = pasteboard.setData_forType_(
+                NSData.dataWithBytes_length_(png_bytes, len(png_bytes)), NSPasteboardTypePNG,
+            )
+            return {"success": bool(ok), "message": "" if ok else "NSPasteboard rejected the data."}
+        except Exception as e:
+            logger.exception("Clipboard copy failed")
+            return {"success": False, "message": str(e)}
 
     def get_qc_metric_names(self) -> list:
         return segmentation_qc.QC_METRIC_NAMES
@@ -389,7 +517,7 @@ class EpiQuantAPI:
         if loaded is None:
             return None
         fill_labels, boundary_labels, base_image = loaded
-        label_array = boundary_labels if render_mode == "outline" else fill_labels
+        label_array = self._qc_render_labels(metric, fill_labels, boundary_labels, render_mode)
         display = self._qc_display(metric)
         overlay = rendering.render_score_overlay(
             label_array, base_image, self._qc_scores(frame_number, metric), lut,
@@ -417,7 +545,7 @@ class EpiQuantAPI:
         fill_labels, boundary_labels, base_image = loaded
 
         if metric:
-            label_array = boundary_labels if render_mode == "outline" else fill_labels
+            label_array = self._qc_render_labels(metric, fill_labels, boundary_labels, render_mode)
             display = self._qc_display(metric)
             image = rendering.render_score_overlay(
                 label_array, base_image, self._qc_scores(frame_number, metric), lut,
@@ -453,14 +581,37 @@ class EpiQuantAPI:
         loaded = self._load_frame(frame_number)
         if loaded is None:
             return None
-        cell_id = rendering.cell_id_at_pixel(loaded[0], int(x), int(y))
+        fill_labels = loaded[0]
+        cell_id = rendering.cell_id_at_pixel(fill_labels, int(x), int(y))
         if cell_id is None:
             return None
+
         scores = {}
         for metric in segmentation_qc.QC_METRIC_NAMES:
+            if metric == "junction_contrast":
+                continue  # per-interface, reported separately below
             value = self._qc_scores(frame_number, metric).get(int(cell_id))
             scores[metric] = None if value is None else round(float(value), 3)
-        return {"cell_index": f"Cell{frame_number}_{cell_id}", "cell_id": int(cell_id), "scores": scores}
+
+        # For the clicked cell, list its own junctions worst-first: the point
+        # of the metric is to say WHICH edge is bad, not just that one is.
+        raw = self._raw_frame_array(frame_number)
+        junctions = []
+        if raw is not None:
+            junction_scores = segmentation_qc.junction_contrast(
+                raw, fill_labels, min_interface_px=self.get_junction_min_px()["value"],
+            )
+            for (a, b), value in junction_scores.items():
+                if cell_id in (a, b):
+                    junctions.append({"with_cell": int(b if a == cell_id else a), "contrast": round(float(value), 4)})
+            junctions.sort(key=lambda j: j["contrast"])
+
+        return {
+            "cell_index": f"Cell{frame_number}_{cell_id}",
+            "cell_id": int(cell_id),
+            "scores": scores,
+            "junctions": junctions,
+        }
 
     # ---- Classify (skippable) --------------------------------------------
 
