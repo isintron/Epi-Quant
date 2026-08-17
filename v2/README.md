@@ -681,13 +681,18 @@ filesystem path (`webview/util.py:75-84`, `webview/__init__.py:274`), even
 though `http_server=True` is never passed. That is a potentially-trustworthy
 origin, so `navigator.clipboard` is available and is the primary path (the
 `<img>.src` data URI needs no Python round-trip). `api.copy_image_to_clipboard`
-is a fallback via `AppKit.NSPasteboard`, added because **the native window has
-still never been click-tested**; pyobjc is already a transitive pywebview
-dependency so this costs no new requirement, and there is no PyInstaller spec
-for `v2/webview/` to update (the `gui_main.spec` in the docs targets the legacy
-PyQt5 `src/` app). Verified at the Python level by round-tripping a 40x25 PNG
-off the pasteboard at the exact pixel value; **it cannot be exercised from the
-dev browser**, which has no `window.pywebview`.
+is a fallback via `AppKit.NSPasteboard`, added because at the time the native
+window had never been click-tested and the primary path was therefore
+unproven; pyobjc is already a transitive pywebview dependency so this costs no
+new requirement, and there is no PyInstaller spec for `v2/webview/` to update
+(the `gui_main.spec` in the docs targets the legacy PyQt5 `src/` app). Verified
+at the Python level by round-tripping a 40x25 PNG off the pasteboard at the
+exact pixel value.
+
+*(Updated 2026-08-17: the click-through since confirmed
+`navigator.clipboard` works in the real WKWebView, so the primary path is
+proven and the fallback is now belt-and-braces. The fallback itself has still
+never executed — it only fires when the primary path throws.)*
 
 ### Round 5 follow-up 3: junction contrast — per-edge, not per-cell (2026-08-13)
 
@@ -830,7 +835,7 @@ skeleton grid closes with no background and touching cells; the ring is
 smaller than the filled mask and preserves the label set; `binary_mask` labels
 3 foreground blobs and keeps its background).
 
-### Round 5 follow-up: digit-less filenames, Cellpose round-trip, adaptive QC window (2026-08-12)
+### Round 5 follow-up 1: digit-less filenames, Cellpose round-trip, adaptive QC window (2026-08-12)
 
 Found by the user debugging the new QC view against `test_data/Demo_Seg_QC`
 (two *unrelated samples*, `Demo_WT`/`Demo_OE`, as TIFF boundary masks — not a
@@ -892,19 +897,46 @@ computes all centroids in one `bincount` pass instead of the per-cell
 
 ## pywebview UI (`v2/webview/`) — handoff notes
 
-**Status (updated 2026-08-11, after Round 5): substantially matured through
-five rounds of real user testing + feature work (see "Extended session
-changelog" below for the original round, then the numbered "Round 2"–"Round
-5" sections further down for everything since) — a real crash, a real
-click-to-cell bug, and a real tracking-correctness bug have all been found
-and fixed by actually using the app, not just code review, and Round 5 added
-a segmentation-QC view and a bounded local re-track. Still not click-tested
-through an actual native `pywebview` window in ANY round so far — everything
-below, across all five rounds, was verified via direct backend Python calls
-against real `test_data/` + the dev-mode mock in a real browser. That gap is
-now five rounds old; it should be the first thing a session with access to a
-real display does, before adding a sixth round of features on top of a UI
-nobody has physically clicked.** If you're picking this up in a new conversation, read
+**Status (updated 2026-08-16). All work through Round 5 follow-up 4 is
+COMMITTED and the working tree is clean** (`c3d231c` is the latest; `a0cd93e`
+and `c9850da` precede it). **The user considers the tracking-correction work
+feature-complete as of this point** — Rounds 1–5 covered swap safety,
+suggest-match, smart-stop propagate, collision guards, restricted pairing,
+the TA environment score, the track-lifecycle view, trajectory click-to-jump,
+and bounded local re-tracking. Treat further tracking features as a new
+request, not as continuing an in-progress arc; the natural remaining work is
+the verification debt below, not more functionality.
+
+Read the round sections in this order — note they are **not** in one
+consistent direction: "Extended session changelog" (the original round) is
+oldest, then "Round 2" → "Round 5" ascend, and then the four **"Round 5
+follow-up"** sections are ordered newest-first (follow-up 4 appears before
+follow-up 3, and so on). The follow-ups are where the segmentation-QC metrics
+actually took their current shape, so a reader who stops at "Round 5" will
+have an out-of-date picture of `segmentation_qc.py`.
+
+**The native-window click-through is DONE (2026-08-17) and was clean.** The
+user ran `python v2/webview/app.py` against real `test_data/` and exercised
+click-to-cell on full-size images, a full Extract/Track run with live
+progress, the QC overlay (metric/LUT switching, the `?` popover, the
+`Min junction` input) and the Send-to-clipboard button, reporting no
+misbehaviour. This retires the gap that stood open across all five previous
+rounds, in which everything had been verified only through backend Python
+calls plus the dev-mode mock's 1x1 stand-in images in an 800x450 viewport.
+
+Three specific consequences worth keeping:
+- **`navigator.clipboard` works in the real WKWebView.** That was the one
+  path that could not be tested from the dev browser, and it is the primary
+  copy path.
+- **The native folder pickers work** (`select_folder` →
+  `webview.create_file_dialog`). This was never in doubt after the fact: all
+  three path inputs are `readonly` (`index.html:37,42,47`), so `Browse…` is
+  the only way to set a project at all.
+- **The `?` popover stacks correctly at real window size.** It is the app's
+  first layered element — the stylesheet had no `z-index` or absolute/fixed
+  positioning before it.
+
+If you're picking this up in a new conversation, read
 `~/.claude/skills/epi-quant-webview-ui/SKILL.md` first — it has the file
 layout, the `EpiQuantAPI` naming convention, the progress-wiring template,
 and an "add a new pipeline step" checklist (still accurate, unchanged by
@@ -928,51 +960,56 @@ boundary-outline render toggle. Correct Tracking additionally has a
 matched/unmatched vs. per-cell-identity (Golden Angle or a reused qualitative
 LUT) color mode and a cell-label visibility toggle.
 
+Added since that description was written (Round 5 and its four follow-ups):
+**Extract** gained a segmentation-QC overlay (five selectable metrics, LUT
+picker, per-project auto-fitted colour window, click-to-inspect with a
+per-junction breakdown, a "Worst frames" triage button, a tunable
+`Min junction` size, and a `?` metric-help popover) plus colour-pickable
+outline and size-adjustable Cell-ID overlays. **Track** gained a bounded
+local re-track (`[Start, End]` with automatic seam reconciliation) and
+mtime-based stale-frame detection. The step nav gained a global
+**Send-to-clipboard** button that copies the current view — or the last view,
+on the two steps that have no preview — at native resolution.
+
 **Verified**: the entire backend, via `api.py`'s own `if __name__ == "__main__"` smoke-test harness (`python v2/webview/api.py --mask-folder ... --image-folder ... --output-dir ... [--classify --n-clusters 2]`), re-run
 repeatedly against all real datasets across this round's fixes, most
 recently `test_data/pupae_E-cad`, `test_data/AS_dorsal view_E-cad`, and
 `test_data/AS_LE_lateral view_E-cad` (86 frames, 226 tracks post-fix) —
 all pass end to end including manual classification/tracking corrections.
-The frontend was exercised via the **dev-mode mock** (`api.js` falls back to
-fixture data when `window.pywebview` is absent) served over a local
-`http.server` and driven with the Browser tool for every new control added
-this round — this proves the JS wiring/layout and call parameters are
-correct, but still only against fake 1×1-pixel mock images, not real
-rendered ones in a real window.
+The frontend is exercised at two levels. During development, via the
+**dev-mode mock** (`api.js` falls back to fixture data when
+`window.pywebview` is absent) served over a local `http.server` and driven
+with the Browser tool for every new control — this proves the JS wiring,
+layout and call parameters, but only against fake 1×1-pixel images. Keep
+using it while building: it is fast and needs no dataset. It is not
+sufficient on its own, which the 2026-08-17 click-through finally
+complemented — run the real app before calling a UI change done.
 
-**Not yet verified — do this next**: run the actual app
-(`pip install -r v2/webview/requirements.txt && python v2/webview/app.py`)
-and click through it for real, especially:
+**Verified in the real window (2026-08-17)**, closing what were items 1, 2,
+3, 4, 6 and 9 of this list: click-to-cell on full-size images, a full
+Extract/Track run with live progress, the QC overlay and its `?` popover and
+`Min junction` control, the native folder pickers, and the primary
+`navigator.clipboard` copy path. Reported clean.
 
-1. Click-to-cell on full-size real images through an actual browser click
-   (the underlying hit-testing bug — see changelog — is fixed and verified
-   at the Python level with real pixel coordinates, but never through a
-   literal mouse click on a real rendered image in a live window).
-2. The native folder-picker dialogs (`select_folder`, wraps
-   `webview.create_file_dialog`) — untested, since the dev-mode mock stubs
-   this out entirely.
-3. Whether progress bars/status text update smoothly during the longer real
-   runs (tracking `AS_LE_lateral view_E-cad`'s 86 frames took several
-   minutes in the backend-only harness — the `window.evaluate_js` push
-   wiring was never watched live in a real window).
-4. General visual/layout polish for the many new controls added this round
-   (zoom row, render-mode radios, color-mode radios + LUT picker, autoplay
-   row) — never seen in a real window, only the dev-mode mock's 800×450
-   Browser-tool viewport.
-5. **Re-benchmark the manuscript's tracking cell-loss numbers** — see the
-   "Tracking correctness" entry in the changelog below; this is not optional
-   busywork, the previously-reported ~10%/~60% comparison was measured
-   against the buggy merge algorithm.
-6. *(Added in Round 5.)* The segmentation-QC overlay's LUT tinting on real,
-   full-size rendered cells — only verified as base64 PNG bytes coming back
-   from `api.get_qc_overlay` and against the dev-mode mock's 1×1 stand-in
-   image, never actually looked at.
-7. *(Added in Round 5.)* The local re-track panel's Start/End inputs and
-   "Detect changed frames" button, end to end, against a real project the
-   user has actually hand-corrected in Cellpose/Fiji and reloaded — the
-   real-data verification re-tracked already-clean masks and a
-   Python-script-simulated "broken links" case, not an actual
-   hand-corrected `.npy` round-tripped through the real Extract step.
+**Still not verified — do this next:**
+
+1. **Re-benchmark the manuscript's tracking cell-loss numbers.** See the
+   "Tracking correctness" entry in the changelog below. Not a UI task, which
+   is why the click-through did not touch it, and not optional busywork: the
+   previously-reported ~10%/~60% comparison was measured against the buggy
+   merge algorithm.
+2. **The local re-track panel against a genuinely hand-corrected project** —
+   masks actually corrected in Cellpose/Fiji, reloaded, then re-tracked. The
+   real-data verification used already-clean masks plus a Python-simulated
+   "broken links" case (30 links broken, all 30 repaired exactly), and the
+   click-through did not cover this specific workflow.
+3. **The Python clipboard fallback** (`api.copy_image_to_clipboard`,
+   `AppKit.NSPasteboard`) has still never executed. It only runs when
+   `navigator.clipboard` throws, and in the real window the primary path
+   worked — so its success confirms the primary path, not the fallback. It is
+   verified at the Python level (a 40x25 PNG round-tripped off the pasteboard
+   at the exact pixel value). If clipboard copy ever misbehaves on another
+   machine or OS version, this is the first place to look.
 
 ### Extended session changelog (2026-08-08) — found via real usage, not code review
 
