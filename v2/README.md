@@ -63,6 +63,774 @@ Two rules are worth keeping in mind when adding a dataset:
   images sort `Demo_OE`, `Demo_WT`, `Demo_WT_handCorrection`, so pure position
   hands frames 2 and 3 each other's image.
 
+## Extraction performance: 12x, byte-identical (2026-08-18)
+
+Groundwork for the convoluted-shape descriptors (below), but useful on its own
+and independently verified. `extract_cell_info` got 12x faster overall with
+**identical output**, via three changes. It also answers reviewer 2's point 5
+about whether the pipeline scales to datasets of a few thousand cells: the two
+worst offenders were both O(n_cells x frame_area), so cost grew with frame size
+even when cell count did not.
+
+Profiled on `AS_dorsal view_E-cad` before any change:
+
+| per-cell work | share of extraction time |
+| --- | --- |
+| `np.where(outlines == cell_id)` over the **whole frame** | 55.8% |
+| `cv2.distanceTransform` over the **whole frame** | 35.4% |
+| everything else | 8.8% |
+
+1. **Bounding boxes.** `ndimage.find_objects` gives each cell's bbox once per
+   frame; the per-cell `np.where`, `fillPoly`, `findContours` and
+   `distanceTransform` now run on that window instead of the full array. Area,
+   arc length, vertex count and both radii are translation-invariant, so
+   cropping cannot change them; the columns that *are* absolute (centroid,
+   left/right boundary, the edge-cell test) get the window offset added back.
+2. **`_BBOX_MARGIN = 8`.** `cv2.distanceTransform` measures distance to the
+   nearest zero pixel, so a crop tight to the cell leaves its edge pixels with
+   no zero to measure from. Measured: margin 0 corrupts the Inscribed Circle
+   Radius of **260/2822** cells (saturated distance overflows the `int()` cast,
+   max error 65532); margin 1 already reproduces the full-frame result exactly.
+   8 is cheap headroom -- the cost scales with the bbox, not the frame. The
+   margin is *not* about the 5x5 chamfer mask width, which was the initial
+   (wrong) guess.
+3. **Row accumulation.** The old loop built a one-row DataFrame per cell and
+   `pd.concat`-ed it onto an accumulator -- quadratic, and after (1) it was
+   ~60% of what remained (cProfile). Rows are now collected as lists and the
+   DataFrame is built once.
+
+| dataset | cells | before | after | speedup |
+| --- | --- | --- | --- | --- |
+| `AS_dorsal view_E-cad` | 2822 | 12.57s | 0.65s | **19.4x** |
+| `AS_LE_lateral view_E-cad` | 9920 | 7.61s | 1.01s | 7.5x |
+| `pupae_E-cad` | 1213 | 4.72s | 0.08s | **60.7x** |
+| `embryos_GBE_GAP43` | 7474 | 5.29s | 0.81s | 6.5x |
+| `Demo_Seg_QC` | 211 | 0.11s | 0.04s | 3.1x |
+| `cp_dataset_puzzle-like_cells` | 2354 | 2.53s | 0.16s | 16.1x |
+| **total** | 24k | **32.8s** | **2.74s** | **12.0x** |
+
+**Verification.** Every value in all six tables is unchanged, and each written
+`Cells_info.xlsx` round-trips identically. Full `track_cells` output on
+`AS_dorsal view_E-cad` is identical including dtypes (captured via `git stash`
+so the comparison is against genuinely unmodified code).
+
+**One intentional difference:** `cells_info` now has `float64` columns where it
+previously had `object`. The old dtype was an artifact of concatenating onto an
+empty `pd.DataFrame(columns=...)`, and it forced Python-level arithmetic
+everywhere downstream. Values are equal and the Excel file is unchanged --
+confirmed by round-tripping both through `to_excel`/`read_excel` and comparing
+*with* dtype checking, since Excel stores numbers either way.
+
+### `tracking_only` extraction mode
+
+`extract_cell_info(..., tracking_only=True)` computes only the four columns
+`cell_tracking.build_cost_matrix` actually reads -- `Maximum Horizontal/Vertical
+Length` (its displacement gate) and `Center X/Y Coordinate` (the only nonzero
+entries in `DEFAULT_TRACKING_WEIGHTS`) -- leaving the other 14 `NaN`. The column
+set and order are unchanged, because several modules map columns positionally.
+A further 2.1-2.7x on top of the above, and the four columns are identical to a
+full extract.
+
+**This surfaced a real bug in `build_cost_matrix`.** It summed
+`weights[k] * (info2[k] - info1[k]) ** 2` over every column, and `0 * np.nan`
+is `np.nan` -- so a zero weight did **not** mean "ignore", and a single
+unpopulated column turned every cost into `NaN`, after which
+`linear_sum_assignment` rejected the whole matrix. Zero-weight columns are now
+skipped up front. Results for a fully-populated table are unchanged (the
+skipped terms contributed exactly 0, verified end-to-end above), and it also
+removes 14 of 18 multiplications from an O(n^2) Python loop.
+
+## Coordinate-outline input + the Vofely puzzle-cell benchmark (2026-08-18)
+
+Reviewer 2 asked for descriptors suited to "more convolve and complex cell
+shape (e.g. puzzle like cells)". `test_data/cp_dataset_puzzle-like_cells`
+turned out to contain **no puzzle-like cells at all** -- rendering all 12 masks
+and measuring gives a median solidity of 0.93-0.98 per image (real Arabidopsis
+pavement cells sit at 0.55-0.85); it is the Cellpose generalist grab-bag
+(spheroid nuclei, bacteria, PlantSeg ovules/root, CoNIC histology nuclei).
+
+The benchmark is now **Vofely et al. 2019, *New Phytologist***, Dryad
+`10.5061/dryad.g4q6pv3`, in `test_data/Vofeley_Dryad_dataset`: 11,346
+hand-traced cell outlines across 278 taxa, **solidity 0.512-0.968**. Only
+`CellCoordinates.zip` (19.6 MB) is needed; the 5.9 GB `CellImages.zip` is not,
+so there are no images -- visual checks render the outlines themselves.
+
+`load_outline_coordinates` + `convert_outline_coords_to_npy` import it. Four
+things about that deposit are load-bearing and were established by surveying it
+rather than by reading its README alone:
+
+- **Two file formats.** 6,235 files have no header and space-separated floats;
+  5,111 carry an `x\ty` header and tab-separated integers; one is a README.
+- **Two layouts.** The numeric-named files are each centred on their own
+  centroid and carry no spatial relationship; the `gp`/`JH` files are in shared
+  image-pixel coordinates. `_coords_share_a_frame` distinguishes them by
+  comparing centroid spread against typical cell size. Only the second kind
+  could support neighbour/tissue analyses -- but see the overlap caveat below.
+- **Leaf side must come from `SampleTable.csv`, never the filename.** The
+  deposit's own README warns its numeric side field is inconsistent. Parsing it
+  from filenames gave r = 0.9346 against the published table; the correct join
+  gives 0.9999.
+- **Traced outlines are not a segmentation and can overlap.** Nothing forced
+  the tracer to keep them disjoint, and a label image cannot put one pixel in
+  two cells, so painting them in sequence lets each cell silently erase parts
+  of its predecessors. Measured overlap as a fraction of total cell area:
+  `gp15-043` 0.0%, `gp15-046` 14.9%, the puzzle-like fern `gp17-003` **25.2%,
+  stacking up to 5 deep**. The converter therefore measures overlap and falls
+  back to grid tiling (with a logged warning) above
+  `max_overlap_fraction=0.01`, so no cell is ever truncated.
+
+**Rasterization scale.** `px_per_unit` must not go below 1.0: against solidity
+computed directly from the float coordinates, 1.0 and 2.0 px/unit reproduce it
+exactly (bias 0.0000, max error 0.0000, r = 1.00000 over 441 cells) while 0.5
+px/unit biases by -0.0056 with errors to 0.031. No cell fragments at any tested
+scale; rasterized area converges as expected (2.73% -> 0.34% over 1 -> 8
+px/unit, the usual O(perimeter/area) boundary term).
+
+**End-to-end external validation.** Raw `.txt` -> `.npy` -> `masks` ->
+solidity, against the authors' published `Table S1` per-species means, over 12
+samples spanning the full range: **r = 1.0000, bias +0.0001, max error
+0.0004**. Over all 336 matched species x side using the float coordinates
+directly: r = 0.9999, 99.7% within 0.02. This is external published ground
+truth, which matters because neither reference implementation's code may be
+copied (below).
+
+### Why the existing geometry cannot be reused for these cells
+
+`extract_cell_info` never reads `dat['masks']`. It takes
+`np.where(outlines == id)` -- **scanline order** -- and passes it straight to
+`cv2.fillPoly`, which bridges across every concavity. On near-convex cells this
+is invisible; on lobed cells it is catastrophic. Measured on the converted
+Vofely data:
+
+| group | solidity | median area error | median perimeter error |
+| --- | --- | --- | --- |
+| `gp15-043` Tabernaemontana | 0.97 | **+0.04%** | -0.31% |
+| `gp17-003` Adiantum fern | 0.53 | **+67%** (max +617%) | -9% |
+
+Rendered side by side, the fern's interdigitating lobes collapse into a solid
+slab. **So all new shape descriptors must derive their contour from
+`dat['masks']`, not from the fillPoly reconstruction.**
+
+This does **not** affect the manuscript: on `AS_dorsal view_E-cad` the median
+area error is +0.05% (p95 +2.31%) and perimeter -0.38%, with
+`AS_LE_lateral view_E-cad` and `pupae_E-cad` similar -- those cells sit at
+solidity 0.91-0.93, where the bias vanishes. Nothing needs re-running.
+
+### Licensing of the reference implementations
+
+Neither may be copied, so the descriptors are implemented from the **published
+method descriptions** (algorithms are citable; only their expression is
+copyrighted) and no code from either project is used:
+
+| tool | licence | consequence |
+| --- | --- | --- |
+| **PaCeQuant** (in MiToBo) | GPL-3.0 | copying would force Epi-Quant to GPL-3 |
+| **LobeFinder** (`George-wu509/LobeFinder`) | **no licence file** (verified via the GitHub API; the repo is one `.m` file) | all rights reserved by default -- copying not permitted at all |
+
+Correctness is therefore established by (i) synthetic shapes with analytically
+known lobe counts, (ii) two independent estimators asserted to agree, and
+(iii) the published-ground-truth comparison above, which is the one that
+actually settles it and needs no third-party code.
+
+## `shape_features.py` -- descriptors for convoluted cells (2026-08-18)
+
+Reviewer 2's main request. Per-cell descriptors in three families, all
+dimensionless or explicitly scale-normalized: convex hull (solidity, convexity,
+shape index), hull deviation (lobe count, max concavity depth, mean neck
+width), and elliptic Fourier (elongation, sin/cos 2psi, irregularity, plus
+optional raw coefficients). Cost is 0.29-0.50 ms/cell -- roughly 10% of what
+extraction itself costs even after the 12x speedup above.
+
+Everything reads its contour from `dat['masks']`; nothing reuses
+`extract_cell_info`'s fillPoly reconstruction, for the reason measured earlier
+(median +67% area error on genuinely lobed cells).
+
+**Validation** is against external published ground truth, not self-consistency
+-- which matters, because neither reference implementation's code may be
+copied (PaCeQuant is GPL-3.0, LobeFinder has no licence at all). Our per-species
+mean solidity vs the Vofely `Table S1` values, 16 samples spanning 0.51-0.97:
+**r = 1.00000, bias +0.0001, max error 0.00035**. Three further descriptors
+track published solidity from completely independent mathematics: max concavity
+depth r = -0.974, EFD irregularity r = -0.941, lobe count r = -0.888. Synthetic
+k-lobed shapes recover k exactly for k in 4/5/6/8 at amplitudes 0.20 and 0.45,
+and two independent estimators (hull deviation vs curvature sign runs) are
+asserted to agree on every one.
+
+### Three findings that changed the design
+
+**1. Curvature-derived scalars are not shippable.** The first version also
+emitted a curvature-based lobe count, concave fraction, bending energy and
+curvature standard deviation. They are exact on synthetics, but recomputing on
+`AS_dorsal view_E-cad` at smoothing sigma = 0.01/0.02/0.04/0.08 of the contour
+moved them by **70-100%** -- the median cell reported 10, then 5, then 2, then 0
+lobes -- while every hull- and Fourier-derived descriptor moved by **0.0%**.
+Curvature is a second derivative, so it amplifies the pixel-scale waviness of a
+segmented boundary; sweeping a curvature-magnitude cutoff from 0.0 to 0.5 left
+the instability untouched while the synthetics stayed exact, so no threshold
+rescues it. Feeding features like that into PCA is precisely the failure this
+work exists to fix, so they are not emitted. `Lobe Count` is the hull-deviation
+count instead -- which is also what LobeFinder's published method actually uses.
+The curvature code is kept, used by the self-test as an independent cross-check.
+
+**2. Perimeter needs a better estimator than `cv2.arcLength`, and the obvious
+correction is wrong.** Summing a pixel chain overestimates arc length. Measured
+against exact perimeters on rasterized circles (r=30..200), axis-aligned
+squares, those squares rotated 30 degrees, and 6/8-lobed cells:
+
+| estimator | mean \|err\| | max \|err\| |
+| --- | --- | --- |
+| raw `cv2.arcLength` | 4.42% | 7.29% |
+| Kulpa x0.9481 | 1.64% | 5.19% |
+| Vossepoel-Smeulders | 0.74% | 2.15% |
+| resample @2px | 0.80% | 1.63% |
+| **resample @3px (chosen)** | **0.31%** | **0.70%** |
+
+Kulpa's constant is tempting because `arcLength` is a near-uniform +5.5% on
+curved boundaries -- but an axis-aligned square has no staircase and is already
+exact, so the correction makes it 5.2% *too short*. Resampling at a fixed
+arc-length spacing has no such blind spot. This is not cosmetic: the shape index
+is compared against the rigidity threshold p* ~ 3.81 of Bi et al., and the raw
+estimator reports a perfect circle as 3.743 instead of 3.545 -- enough to move
+solid-like tissue across that threshold. Note this makes `Shape Index` here
+*more accurate than*, and so not directly comparable with, the existing
+`Circularity` column in `Cells_info.xlsx`, which still uses raw `arcLength`.
+
+**3. `cv2.convexityDefects` fails on real cells.** It requires the hull's vertex
+indices to be monotonic along the contour and raises otherwise. A cell with a
+one-pixel neck is traced out-and-back, so the same coordinate appears twice at
+non-adjacent positions and the ordering becomes ambiguous -- it happened on 4 of
+2822 cells in `AS_dorsal view_E-cad`, and deduplicating points does not fix it
+because the repeats are not adjacent. Replaced with `hull_deviation`, a
+vectorized point-to-segment distance from each contour point to the hull, which
+needs no ordering and so cannot fail that way. It also yields depth and count
+from one computation, and is closer to LobeFinder's stated convex-hull concept.
+Zero NaNs remain in the hull-derived columns on all test datasets.
+
+**Output goes to a separate `Cells_shape.xlsx`** (sheet `Shape`), joined to
+`Cells_info.xlsx` on `Cell Index` -- verified to join 1:1 on every dataset --
+rather than as extra columns, because `common.save_modified_rows` maps DataFrame
+column position to Excel column position and would write into the wrong columns
+of an existing file if the schema grew. EFD coefficient columns are named
+`efd_{h}_{c}`, the exact convention
+`figures/Epiquant_ShapeAnalysis_allMutants.ipynb` uses, so that notebook can
+read our output unmodified as a second implementation to check against.
+
+Failures are `NaN`, never `-1`: `segmentation_qc.measurement_failures` scans
+named columns for `-1` and `extract_cell_info`'s own check is column-blind, so
+reusing `-1` would make an unmeasurable cell indistinguishable from a real
+measurement failure. The only NaNs observed are cells whose contour is shorter
+than `2*order+1` points, which genuinely cannot support an order-10 transform.
+
+## `tissue_features.py` -- local tissue texture (2026-08-18)
+
+The second half of reviewer 2's point 4 ("Could they also implement local
+tissue texture parameters?"). Per cell, over its 1-ring: neighbour count, local
+hexagonal fraction, local nematic order `S = |<exp(2i psi)>|`, local mean shape
+index and solidity, local density, plus a per-frame neighbour-count entropy.
+Joins to `Cells_info.xlsx` and `Cells_shape.xlsx` on `Cell Index` -- verified
+1:1 on all four datasets. Cost 0.06-0.77 ms/cell. Fills the
+the packing/neighbour-count analyses the manuscript's Fig. 5G / 6B need.
+
+Three decisions that measurement forced:
+
+**1. Adjacency is edge-based, not dilation-based.**
+`adjacency.build_neighbor_graph` dilates each cell and sees what it reaches,
+which cannot distinguish "shares a wall" from "meets at a corner". On a
+synthetic square lattice it reports **8** neighbours per cell instead of 4,
+because the four diagonal cells touch at the vertex. That is not academic here:
+square packing is exactly what Tamada & Zallen (2015) describe in the Drosophila
+presumptive pharynx, and detecting such arrangements is the point of these
+descriptors. `build_interface_graph` counts shared border pixels via
+`segmentation_qc._interface_pixels` and gets both lattices right -- hex 6,
+square 4.
+
+Gaps must be closed first: `pupae_E-cad` has **0** raw interfaces (no two of its
+826 cells touch), and `_bridge_gaps` recovers 2341. Bridging was checked not to
+create corner adjacencies -- both lattices stay correct with it applied at every
+threshold from 1 to 8 px. The minimum interface is **2 px**, deliberately *not*
+`segmentation_qc.suggest_min_interface_px`: that returns 14-40 px here because
+it is tuned for scoring individual junctions in the QC overlay, and applying it
+to topology discards real walls, driving the median neighbour count from 6 to 4
+on all three datasets tested.
+
+**2. "Border cell" has to mean the tissue's edge, not just the image's.**
+`segmentation_qc.neighbor_count_deviation` excludes only frame-edge cells, which
+is right for its purpose and useless here: `AS_dorsal view_E-cad` is 70.7%
+background and `pupae_E-cad` 67.6%, and **not one cell in either touches the
+frame**, so that rule excluded nothing while 119 of 145 AS cells sat on the
+tissue rim. The symptom was a mean neighbour count of 5.24 where Euler's theorem
+puts a 2D packing at ~6. Background adjacency must also be measured *after*
+gap-closing, or it catches everything -- before bridging, all 826 `pupae` cells
+are within a few pixels of "background" because the inter-cell gaps are
+background too.
+
+With both rules, interior mean neighbour count is 5.98 / 5.92 / 5.69 / 5.94 on
+`AS_dorsal` / `pupae` / `embryos_GBE_GAP43` / `Demo_Seg_QC`, **median exactly 6
+on all four** -- which is the check that the topology is right.
+
+**3. Neighbour-count entropy is per frame, not per cell.** A 1-ring holds 6-7
+cells and the entropy of a 6-sample categorical distribution is mostly sampling
+noise; as a per-cell column it would enter PCA looking like a tissue-order
+readout while carrying almost none. It is computed over all non-border cells of
+a frame and broadcast, named `Frame Neighbor Entropy` so it cannot be mistaken
+for a per-cell quantity.
+
+Orientation `psi` comes from `shape_features`' `Sin2Theta`/`Cos2Theta`, never
+from `Cells_info.xlsx`'s `Fitted Ellipse Angle` -- that column is stored folded,
+so cells drawn 40 degrees apart can share a value (70 and 110 degrees both store
+20.0), and averaging directions from it would be meaningless. `S` itself is
+invariant to any global rotation or sign convention, so it does not depend on
+how the imaging frame was oriented; the per-cell sin/cos pair does, which is why
+the convention is fixed and tested.
+
+Self-test covers: hex lattice -> 6 neighbours, square -> 4, perfect lattice more
+ordered than a jittered one, aligned field `S`=1 vs isotropic `S`<0.15, the
+director convention (`psi` and `psi+pi` identical), rotation invariance, and an
+inset tissue that never touches the frame (the case that exposed finding 2).
+
+## `pca_kmeans.py` -- feature presets and feature-space repair (2026-08-18)
+
+`compute_pca` gains `standardize_mode`, `prune_correlation` and
+`sign_convention`; the module gains `FEATURE_PRESETS`, `efd_preset`,
+`standardize`, `prune_correlated` and `plot_shape_modes`. **Every new argument
+defaults to v1's behaviour**, verified: `Cells_info_PCA.xlsx` and the K-means
+labels are identical on `AS_dorsal view_E-cad`, `embryos_GBE_GAP43` and
+`cp_dataset_puzzle-like_cells`.
+
+Feature selection lives in the additive `FEATURE_FAMILIES` (see "New features"
+above). Two named lists sit outside that scheme and are not families:
+`legacy_13` (**since retired** -- see the column-deletion section below), which reproduced v1's exact PCA input and was asserted identical to
+`data_input.ML_FEATURE_COLUMNS`, and `tracking_only`, the four columns
+`cell_tracking.build_cost_matrix` reads. No family or list contains `P-Value` -- it is
+`4*pi/circularity**2`, a monotone function of `Circularity`, which is itself a
+monotone function of `Shape Index`: the same quantity three times. (The column
+stays in the schema for now; removing it shifts every later column's position
+and `common.save_modified_rows` writes Excel by position.)
+
+### What worked, and what did not
+
+The plan proposed correlation pruning **and** per-frame standardization as fixes
+for the size-dominated PC1. Measured on `cp_dataset_puzzle-like_cells`, they fix
+**different problems**, and only one of them addresses size at all.
+
+**Correlation pruning barely dents size dominance.** The 8 size proxies
+correlate at r = 0.88-0.94, so a 0.95 threshold mostly keeps them:
+
+| threshold | features kept | PC1 size share |
+| --- | --- | --- |
+| (none) | 13 | 85.5% |
+| r > 0.99 | 12 | 83.6% |
+| r > 0.95 | 10 | 77.9% |
+| r > 0.90 | 8 | 66.7% |
+| r > 0.85 | 6 | 36.7% |
+
+It only bites at 0.85, by which point it has discarded 7 of 13 features. Pruning
+is still worth having for genuine duplicates, but it is the wrong instrument
+here.
+
+**Per-frame standardization does not touch size dominance either** -- but it
+does exactly what it was actually for, which is the *between-image* confound.
+Measured as the share of PC1's variance explained by image identity:
+
+| feature set | global | per-frame |
+| --- | --- | --- |
+| v1's 13 features | 0.601 | **0.000** |
+| a ratio-only set | 0.180 | **0.000** |
+
+**The direct fix for size dominance is dimensionless features.** PC1's size
+share: v1's 13 features 85.5%, the same 13 with pruning at 0.95 77.9%, a
+ratio-only set **0.0%** (top loadings Shape Index 16%, Solidity 13%,
+Elongation 13%), a lobing-only set **0.0%** (Solidity 21%, Max Concavity
+Depth 19%, EFD Irregularity 15%). Every column in today's `hull` and `lobe`
+families is dimensionless by construction, so both land in that regime.
+
+So the three controls are not substitutes: **dimensionless features** for size
+dominance, **per-frame standardization** for the image confound, **pruning** for
+literal duplicates.
+
+### `plot_shape_modes`
+
+Writes `PCA_Shape_Modes.png`: the reconstructed cell outline at the 10th/30th/
+50th/70th/90th percentile along each of the first components of EFD shape
+space, against the mean shape. A port of `plot_modes`/`contour_of` from
+`figures/Epiquant_ShapeAnalysis_allMutants.ipynb`, and the reason the EFD route
+is worth having -- a component becomes a visible shape change rather than a
+percentage. On `AS_dorsal view_E-cad`: PC1 63.7% is elongation, PC2 10.0% a
+dorsoventral taper, PC3 8.9% a pear-shaped asymmetry.
+
+It fits PCA **without standardizing**, per `standardize`'s `"none"` mode and the
+collaborator's documented reason. `sign_convention` is on there because PCA
+signs are otherwise arbitrary and the panels would flip between runs.
+
+### The manuscript's shape parameter `p`
+
+`shape_features`' `Shape Index` **is** the manuscript's Fig. 5D/E/F shape
+parameter `p = P/sqrt(A)`. There is no separate module for it any more --
+`gap_analysis/shape_parameter.py` was deleted, since a second implementation of
+one division is a liability rather than an asset. Note `p` is read against Bi et
+al.'s rigidity threshold p* ~ 3.81, so the perimeter estimator matters: the old
+raw-`arcLength` route reported a perfect circle as 3.743 instead of 3.545.
+
+## API wiring for the new descriptors (2026-08-18)
+
+`webview/api.py` gains `start_shape_extraction` / `_run_shape_extraction`
+(threaded, `onShapeExtractDone` / `onShapeExtractError`, progress stage
+`"shape"`), `get_shape_feature_summary`, `load_existing_shape_features`,
+`get_feature_options`, `has_efd_coefficients`, and `feature_families` /
+`selected_features` / `prune_correlation` / `dataset_mode` on
+`run_classification`. `get_existing_results` reports `shape` and `tissue`.
+Shape extraction is **opt-in**: a user who only tracks never needs it.
+
+**Families are additive, and the selection dictates the scaler in Python.**
+`pca_kmeans.FEATURE_FAMILIES` holds each family and `family_columns()` unions
+them on top of the always-on `basic` base; `_feature_frame` returns the matrix
+and its standardize mode together, so the `efd` family cannot be run through
+`StandardScaler` no matter what the frontend sends, and it refuses to combine
+with any other family. The JS mock mirrors both rules, but the backend is the
+authority -- a UI that *can* get this wrong eventually will.
+
+**`ready` must mean "every column present", not "any".** A first version marked
+a family ready when its filtered column list was non-empty. That reported a
+mixed family as ready on a project with no shape table, because some of its
+columns come from `Cells_info.xlsx` -- so the UI would enable it and the run
+would then fail. Now verified both ways: every family reported ready runs
+successfully, and every family reported not-ready names exactly what it is
+missing.
+
+Missing columns raise a readable `ValueError` naming them and pointing at the
+shape step, rather than surfacing as a bare pandas `KeyError`; `load_cells_info`
+reads whatever Excel exists, so a legacy project hitting a shape-dependent
+preset was the realistic path to that.
+
+**`dataset_mode`** answers the pooling question. `"time_series"` (default, v1's
+behaviour) pools every frame -- correct for a movie of one specimen and required
+if the result will be tracked. `"independent_samples"` runs PCA and K-means per
+frame, for folders of unrelated images where pooling makes the leading component
+partly "which image is this" (measured: image identity explains 0.601 of PC1's
+variance on `cp_dataset_puzzle-like_cells`). Cluster labels are then per-frame,
+so `cluster_1` in one image is unrelated to `cluster_1` in another -- documented
+on the method, because the colour legend cannot express that.
+
+**Verified** via the headless harness, which now takes `--shape`:
+
+```
+python3 v2/webview/api.py --mask-folder "test_data/AS_dorsal view_E-cad/masks" \
+  --image-folder "test_data/AS_dorsal view_E-cad/images" \
+  --output-dir /tmp/epiq_smoke --classify --shape --n-clusters 2
+```
+
+On `AS_dorsal view_E-cad` every family combination runs — `basic` 8 features /
+global, `basic+hull` 11, `basic+lobe` 12, `basic+tissue` 13 (1780 of 2824 cells;
+border cells have no neighbour count by construction), `basic+hull+lobe` 15,
+`basic+hull+lobe+tissue` 20, and `efd` 40 / **none** — EFD refuses to combine
+with another family, `independent_samples` runs, an unknown family is rejected
+by name, and leading edge, tracking and every overlay still run afterwards.
+
+`NaN`/`inf` are converted to `null` before crossing the bridge: `json.dumps`
+emits bare `NaN`, which `JSON.parse` rejects, and the tissue table legitimately
+contains NaN for border cells.
+
+## ⚠️ FIXED: degenerate ellipse fits made extraction non-deterministic (2026-08-18)
+
+**This changes numbers on manuscript datasets** -- see the impact table below.
+Fixed with the user's explicit approval.
+
+Surfaced while regression-testing the work above, and **pre-existing** --
+confirmed by `git stash`-ing every change and reproducing it on the original
+code.
+
+**Symptom.** `extract_cell_info` was not reproducible. Four consecutive runs
+over `cp_dataset_puzzle-like_cells` in one process gave different tables,
+always differing on `Cell1564_255`, a **6-pixel** cell whose major axis came
+back 7.48 on one run and 15.11 on the next. `cv2.fitEllipse` on a point set
+that small is numerically degenerate.
+
+**The real damage was to the feature, not the reproducibility.** When the minor
+axis was *exactly* 0 the old `!= 0` guard caught it and wrote the `-1`
+sentinel; a tiny nonzero axis slipped straight through and made
+`Ellipse Major/Minor Axis Ratio` enormous -- 5443 on `AS_LE_lateral view_E-cad`
+against a median of 3.15, 13421 on the puzzle set. One such value inflated that
+column's standard deviation to 54.65, so after `StandardScaler` **99% of cells
+were compressed into z = [-0.055, 0.134]** while the artifact sat at z = 99.5.
+Real elongation variation (median 3.15, p99 10.14) was squeezed into a fifth of
+a standard deviation, leaving PCA almost nothing from an axis that carries 93%
+of PC3's loading -- all because of a handful of 1-6 pixel objects.
+
+**Fix.** `_MIN_ELLIPSE_AXIS_PX = 2.0`: a fit whose smaller semi-axis is below
+that falls through to the same `-1` sentinel a failed fit already used. The
+threshold was chosen by sweeping it against determinism over all six datasets,
+five interleaved runs each -- 1.0 px left `AS_LE_lateral` still flaky (its
+`Cell71_124`, a 5-px 2-vertex line of pixels, measured 1.00 on one run and 1.01
+on the next, straddling the cut), 1.5 px was already enough, 2.0 px buys margin
+for four more cells out of 23,994. The 1st percentile of genuine minor axes is
+7-12 px, so nothing real is near it.
+
+**Impact** (all six datasets now identical across 8 interleaved runs):
+
+| dataset | cells changed | ratio max | ratio SD | elongation z-range (99%) | cluster changes |
+| --- | --- | --- | --- | --- | --- |
+| `AS_dorsal view_E-cad` | 2 / 2822 (0.07%) | 9.95 → 9.95 | 1.08 → 1.08 | 7.60 → 7.58 | 7 (0.25%) |
+| `AS_LE_lateral view_E-cad` | 4 / 9920 (0.04%) | **5443 → 19.79** | **54.65 → 1.85** | **0.19 → 5.54** | 10 (0.10%) |
+| `pupae_E-cad` | 1 / 1213 (0.08%) | 6.27 → 6.27 | 0.64 → 0.64 | — | — |
+| `embryos_GBE_GAP43` | 0 | 5.29 → 5.29 | unchanged | — | — |
+| `Demo_Seg_QC` | 0 | 8.63 → 8.63 | unchanged | — | — |
+| `cp_dataset_puzzle-like_cells` | 3 / 2354 (0.13%) | **13421 → 9.73** | **276.59 → 0.85** | **0.02 → 6.53** | 14 (0.59%) |
+
+Every changed cell has an area of 5-26 px. The elongation feature's usable
+z-range recovers 29x on `AS_LE_lateral` and 326x on the puzzle set; PC3 rises
+from 7.8% to 11.1% on the latter as that axis stops being an artifact.
+`AS_dorsal` barely moves because it had no tiny-nonzero fits -- which is the
+check that the fix is targeted rather than broad.
+
+**For the manuscript:** classification changes by 0.10-0.25% of cells on the two
+dorsal-closure datasets. That is unlikely to disturb the reported ~100%
+AS/LE accuracy, but anything quoting exact per-cluster counts should be re-run.
+This is independent of, and additional to, the `_merge_tracking_pairs`
+cell-loss re-benchmark already outstanding in `CLAUDE.local.md`.
+
+## Frontend for the new descriptors (2026-08-18)
+
+Two additions, no new pipeline step -- shape extraction belongs to Extract and
+feature selection to Classify.
+
+**Extract** gains a `#shape-descriptors` sub-panel, hidden until extraction
+finishes: checkboxes for local tissue texture and raw EFD coefficients, an
+`<details>` for EFD order / contour points / smoothing, a Compute button, and a
+median summary table per descriptor. It is opt-in and says so -- a user going
+straight to tracking never needs it.
+
+**Classify** gains a feature-mode `<select>`, a checkbox group for the chosen
+preset, a dataset-mode radio pair, an "Advanced" `<details>` for correlation
+pruning, and a line under the status reporting what actually went in
+(`"7 features (convolution, global), 2822 cells, all frames pooled."`).
+
+Three behaviours worth knowing:
+
+- **Modes the project cannot run are disabled in the dropdown**, labelled
+  "— run shape descriptors first", and the select falls back to `geometric`.
+  This is the same all-columns-present rule the backend uses, so anything
+  selectable will actually run.
+- **Selecting EFD replaces the checkbox group** with an explanation rather than
+  offering coefficients individually, and the note reads "no standardization".
+  The backend enforces both regardless of what the frontend sends.
+- **`populateFeatureOptions()` runs on every entry to Classify**, from
+  `goToStep`, not once. A user can run shape extraction *after* first visiting
+  Classify, and a cached list would leave the new modes greyed out;
+  `onShapeExtractDone` also refreshes it.
+
+**Verified by driving the dev-mode mock in a real browser** (`python3 -m
+http.server` in `frontend/`, then scripted clicks):
+
+| checked | result |
+| --- | --- |
+| before shape extraction | `geometric` enabled, the other four **disabled**, auto-selected `geometric`, checkboxes populated |
+| after shape extraction | all five enabled; summary tables rendered (2 tables, 5 rows) |
+| switch to EFD | checkbox group replaced by the explanation, note = "no standardization" |
+| switch back to convolution | checkboxes repopulate |
+| dataset-mode radio | note switches to the per-image warning |
+| run classification | status + `"2 features (convolution, global), 500 cells, each image clustered on its own — cluster_1 in one image is unrelated to cluster_1 in another."` |
+
+The mock in `frontend/api.js` mirrors the backend contract, including the
+mode-dictates-the-scaler rule, so this path exercises the real wiring rather
+than a stub that always succeeds.
+
+**Not yet click-tested in the real pywebview window** -- the dev browser cannot
+run the actual pipeline. That is the one remaining gap for this work.
+
+## New features: method, dependency, improvement, flaw (2026-08-18)
+
+One row per shipped descriptor. "Flaw" is what it genuinely cannot do -- read it
+before choosing a feature set.
+
+| feature | how it is computed | needs | improved over v1 | known flaw |
+| --- | --- | --- | --- | --- |
+| `Cell Area` | pixel count of `dat['masks']` | cv2 | no longer re-fills the outline; **+46% error on lobed cells removed** | none material |
+| `Cell Perimeter` | boundary resampled at 3 px, then summed | cv2/numpy | staircase bias removed (raw `arcLength` is +5.5%); **−32% error on lobed cells removed** | ~0.3% residual; `int()`-rounded for schema compatibility |
+| `Approximate Polygon Vertex Count` | `approxPolyDP(contour, epsilon=2px)` on the mask contour | cv2 | measured on the real outline, not the bridged one (**was 0.41x on lobed cells**) | **fixed 2 px epsilon is resolution-dependent** — the same cell imaged at 2x gives a different count |
+| `Circumscribed Circle Radius` | `minEnclosingCircle` on the mask contour | cv2 | now from the mask (it was already the one fillPoly barely affected, -0.2%) | `int()`-truncated |
+| `Inscribed Circle Radius` | `distanceTransform` on the true mask raster | cv2 | **+104% error on lobed cells removed** | `int()`-truncated |
+| `Solidity` | `A / A_hull`, both via `contourArea` | cv2 | new | none — the cleanest lobing measure |
+| `Convexity` | `P_hull / P` | cv2 | new | hull perimeter is exact, cell perimeter estimated → slight upward bias |
+| `Shape Index` | `P / sqrt(A)` (Bi et al.) | cv2 | new; replaces the deleted `gap_analysis` stub | **compactness, not anisotropy** — rises with both elongation and lobing |
+| `Lobe Count` | runs of contour ≥5% of R_eq inside the hull | cv2/numpy | new | counts concavities; a lobe merged with its neighbour reads as one |
+| `Max Concavity Depth` | max hull deviation / R_eq | cv2/numpy | new | one deep notch dominates |
+| `Mean Neck Width` | chord across each concavity / R_eq | cv2/numpy | new | undefined for a convex cell (reported 0) |
+| `EFD Irregularity` | ‖harmonics ≥2‖ after size normalization | **pyefd** | new | **not purely lobing** — 0.119 for a smooth 8:1 ellipse vs 0.268 for a 6-lobed round cell |
+| `Elongation`, `Sin2Theta`, `Cos2Theta` | SVD of EFD harmonic 1 | **pyefd** | replaces the folded `Fitted Ellipse Angle` | elongation compressed (true 4.0 reads 3.08) and Spearman 0.9913 with the ellipse ratio; sin/cos are absolute orientation. **In no PCA family** |
+| `Neighbor Count`, `Local Hexagonal Fraction` | shared-border pixels after gap-bridging | scipy/numpy | new; separates edge-sharing from corner-touching (hex 6, square 4) | border cells are NaN by construction, so they drop out of a run |
+| `Local Nematic Order` | `|<exp(2i psi)>|` over the 1-ring | numpy | new | a 1-ring is ~7 cells, so it cannot reach 0 even for random orientations |
+| `Local Mean Shape Index / Solidity` | 1-ring means | numpy | new | inherits each underlying flaw |
+| `efd_{h}_{c}` (40) | Kuhl & Giardina elliptic Fourier | **pyefd** | start-point invariant to 6e-16 (pyefd's own `normalize=True` is not) | order 10 truncates fine detail; **must not be standardized** |
+
+**Dependencies:** only **`pyefd`** was added (MIT, numpy-only) — everything else
+uses cv2 / numpy / scipy / sklearn, already present. scikit-image is *not*
+required.
+
+**Dropped from every feature family, with the measured reason:**
+`Fitted Ellipse Angle` (stored folded — 70° and 110° both become 20.0),
+`Circularity` and `P-Value` (monotone functions of `Shape Index`),
+`Frame Neighbor Entropy` (within-frame variance exactly 0 — pooled it encodes
+only "which frame"), `Local Density` (px⁻², not comparable across
+magnifications), `Elongation` / `Sin2Theta` / `Cos2Theta` (see the table). All
+are still written to the xlsx files; they are simply not offered as PCA inputs.
+
+**The Extract summary panel lists only what Classify can select.** It is built
+from `pca_kmeans.FEATURE_FAMILIES`, the same source the family checkboxes use,
+so it cannot drift from them. An earlier version listed the `SCALE_INVARIANT_*`
+columns instead, which conflated "is dimensionless" (a property of the maths)
+with "is offered as a feature" (a design decision) -- so it kept advertising
+`Elongation`, `Sin2Theta`, `Cos2Theta` and `Frame Neighbor Entropy` after they
+had been retired from every family. Those columns are still computed and still
+written to the xlsx (`Sin2Theta`/`Cos2Theta` feed `Local Nematic Order`, and
+`Frame Neighbor Entropy` is a real per-frame statistic), so the panel names them
+under "Also written to the xlsx, not offered as features" rather than hiding
+them.
+
+**Feature families are additive.** `Basic geometrics` is the always-on base and
+`Convex hull`, `Convolution/lobe` and `Local tissue texture` stack on top of it.
+`Elliptic Fourier` is exclusive and unstandardized. Within `Basic geometrics`,
+`Maximum Horizontal/Vertical Length` and their ratio are offered but **unchecked
+by default**: they measure the cell's orientation relative to the image axes, so
+rotating one real fern cell from 0° to 90° swings the ratio from 2.458 to 0.407
+while solidity and shape index do not move. Tick them only for a deliberately
+aligned specimen, as in the manuscript's AP/DV convention.
+
+## ⚠️ Geometry now measured on `dat['masks']` (2026-08-18)
+
+**Changes manuscript numbers — approved by the user.** `extract_cell_info` used
+to re-fill the scanline-ordered outline with `cv2.fillPoly`, which bridges every
+concavity. All five affected columns now read `dat['masks']` directly.
+
+**Only `Cell Perimeter` additionally uses the 3 px resampling**, and that is not
+an oversight: resampling exists to stop a *sum along the boundary* accumulating
+staircase error, and perimeter is the only one of the five that sums along the
+boundary. `Cell Area` is a pixel count (exact, and resampling would make it
+worse -- a polygon through pixel centres under-counts by roughly P/2);
+`Inscribed Circle Radius` comes from a raster distance transform; and both
+`Circumscribed Circle Radius` and `Approximate Polygon Vertex Count` come from
+extremal/simplified points on the contour, where no error accumulates. Their
+remaining flaws are different ones -- `int()` truncation on the two radii, and a
+resolution-dependent fixed epsilon on the vertex count.
+
+On real puzzle cells (Adiantum fern, solidity 0.51) the errors this removes:
+
+| column | before | after |
+| --- | --- | --- |
+| `Cell Area` | +46.4% | **0.00%** |
+| `Cell Perimeter` | −31.8% | **−0.01%** |
+| `Circularity` | +236% | **+1.01%** |
+| `Inscribed Circle Radius` | +104% | **−1.55%** |
+| `Approximate Polygon Vertex Count` | 0.41× | exact |
+
+On the near-convex project datasets, with the data held constant and only the
+code varying: `Cell Area` ±0.06%, `Cell Perimeter` **−4.0 to −5.0%** (the
+staircase correction), `Circularity` **+8.0 to +11.3%** (which follows exactly:
+`C = 4πA/P²`, so a ×0.9504 perimeter predicts ×1.1072 and ×1.1045 was observed),
+and `Inscribed R` / `Vertex Count` / `Circumscribed R` unchanged. Classification
+moves 0.00% (`embryos_GBE_GAP43`) to 1.59% (`AS_dorsal view_E-cad`) of cells.
+
+**The safety gate held: the four columns `cell_tracking.build_cost_matrix` reads
+— `Maximum Horizontal/Vertical Length` and `Center X/Y Coordinate` — are
+byte-identical on all six datasets, and so is full `track_cells` output.** They
+are not derived from the reconstruction, which is why the fix could be made
+without touching tracking at all.
+
+**Deliberately not changed:** `Center X/Y` is the mean of the *boundary* pixels,
+not the area centroid — 6.6% of R_eq off on lobed cells (max 18.4%). It is a
+tracking input, so moving it would change tracking; that is a separate decision.
+The four `Fitted Ellipse *` columns also still fit the outline ring, so they keep
+their exact values.
+
+> **Note on baselines:** `test_data/AS_dorsal view_E-cad` and
+> `AS_LE_lateral view_E-cad` masks were hand-corrected on 2026-08-20 (four and
+> several frames respectively). Any regression baseline captured before that date
+> will show spurious differences. Re-capture before comparing.
+
+## Shortened feature labels in Classify (2026-08-18)
+
+Display only. `pca_kmeans.FEATURE_DISPLAY_NAMES` maps a real column name to a
+shorter label; the checkbox `value`, the DataFrame, the xlsx and every lookup
+keep the full name, and the UI carries it as a tooltip. The principle is to drop
+words that carry no information in a per-cell table: **"Cell"** (everything here
+is a cell), **"Fitted"/"Approximate"** (how it was measured, not what it is) and
+**"Circle"** (implied by "Radius").
+
+| shown | real column |
+| --- | --- |
+| Area | `Cell Area` |
+| Perimeter | `Cell Perimeter` |
+| Ellipse Major Axis | `Fitted Ellipse Major Axis` |
+| Ellipse Minor Axis | `Fitted Ellipse Minor Axis` |
+| Ellipse Axis Ratio | `Ellipse Major/Minor Axis Ratio` |
+| Vertex Count | `Approximate Polygon Vertex Count` |
+| Circumscribed Radius | `Circumscribed Circle Radius` |
+| Inscribed Radius | `Inscribed Circle Radius` |
+| Max Horizontal Length | `Maximum Horizontal Length` |
+| Max Vertical Length | `Maximum Vertical Length` |
+| H/V Length Ratio | `Horizontal/Vertical Length Ratio` |
+
+The `base` tag was dropped from the family picker at the same time -- Basic
+geometrics being locked-on already says it.
+
+**Guarded by the self-test:** every key must be a real column, and **no short
+label may collide with a real column name** -- if one did, a lookup could
+silently resolve the label instead of the column it stands for. Unmapped columns
+(the hull/lobe/tissue families, whose names are already short) fall through
+unchanged.
+
+## Three columns deleted from `Cells_info.xlsx` (2026-08-18)
+
+**Changes the output schema, 18 columns -> 15 -- approved by the user.** They
+appeared in every exported table while being offered in no feature family, which
+was actively confusing.
+
+| removed | why it was safe |
+| --- | --- |
+| `Fitted Ellipse Angle` | stored **folded** (`180 - a if a > 90`), a mirror reflection rather than a modulo, so orientations 40 degrees apart shared a value (70 and 110 both stored 20.0). Not invertible, therefore unusable as a direction. Orientation now comes from `shape_features`' `Sin2Theta`/`Cos2Theta`, recomputed from the elliptic-Fourier harmonic-1 SVD. |
+| `Circularity` | exactly recoverable as `4*pi*A/P^2` from two columns that remain. Verified against the stored column to within its own 2-decimal rounding (max diff 0.005), with all 2824 sentinel rows reproduced. |
+| `P-Value` | `4*pi/circularity**2` -- a monotone function of a monotone function of `Shape Index`. The same quantity a third time. |
+
+**Two consumers had to be rewired, both verified:**
+
+- `segmentation_qc.morphology_outlier` read the `Circularity` column; it now
+  derives it from `Cell Area` and `Cell Perimeter`. Per-cell scores move by a
+  median of **0.0000** (p95 0.024, max 0.094) and 0.89% of cells shift by more
+  than 0.05 -- that difference is the *old* column's 2-decimal rounding being
+  removed, so the new value is the more accurate one. The set of worst-scoring
+  cells the overlay highlights overlaps 93.4% on average, and no frame falls
+  below 50%.
+- `segmentation_qc.measurement_failures` scanned all three for `-1`. Removing
+  them loses **no** detection: the same 12 failures across all 24 frames of
+  `AS_dorsal view_E-cad`, because each was `-1` exactly when a surviving column
+  already was.
+
+**`legacy_13` is retired.** It named two of the deleted columns, so it can no
+longer be assembled -- and it would not have reproduced v1's numbers anyway
+once geometry moved to the mask (perimeter ~-5%, circularity ~+10%). `src/`
+stays frozen and is the reference for exact v1 reproduction.
+`data_input.ML_FEATURE_COLUMNS` is now the 11-column `basic` family, and the
+self-test asserts the two stay the same set.
+
+### The positional coupling this exposed
+
+`cell_tracking` indexed `CELLS_INFO_COLUMNS` **positionally** in two places:
+`DEFAULT_TRACKING_WEIGHTS` was the literal `[0]*12 + [1, 1] + [0]*4`, and the
+displacement gate read `info1[1]`, `info1[2]`, `info2[12]`, `info2[13]`.
+Deleting `Fitted Ellipse Angle` (index 9) moved `Center X/Y` from 12/13 to
+**11/12**, so both would have silently started reading
+`Inscribed Circle Radius` and `Center X` -- no error, just wrong tracks.
+
+Both now resolve **by name** (`DEFAULT_TRACKING_WEIGHTS` is built from a
+membership test; the gate uses `_gate_indices`, which raises if a needed column
+is absent), so the schema can change again without this trap.
+
+**Gate result: full `track_cells` output on `AS_dorsal view_E-cad` is
+byte-identical across the change.**
+
+**Backward compatible.** A legacy 18-column `Cells_info.xlsx` still loads,
+classifies (the extra columns are simply not selected) and passes QC --
+verified end to end.
+
 ## Input format flexibility (reviewer-requested extension)
 
 A peer reviewer asked for the pipeline to accept segmentation input beyond
@@ -231,14 +999,14 @@ dropdown) is completely untouched.
 | `manual_correction_tracking.py`       | Module 4b — tracking correction (`gui_cell_track.py`), plus swap-safe correction / suggest-match / smart-stop propagate (new, see below)                                          |
 | `trajectory_visualization.py`         | Module 5 — trajectory replay + displacement field (`gui_plot_track.py`, `gui_cell_direction.py`) + lifetime-map scaffold                                                        |
 | `rendering.py`                        | Overlay compositing for the webview UI (see below) — cluster/tracking/trajectory tinting, click-to-cell pixel lookup, PNG encoding                                                  |
-| `adjacency.py`                        | Same-frame cell-adjacency (neighbor) graph via mask-dilation overlap — new, shared by the tracking-correction termination check and`gap_analysis/packing_analysis.py` (see below) |
+| `adjacency.py`                        | Same-frame cell-adjacency graph via mask-dilation overlap — gap-tolerant, used by the tracking-correction termination check. Cannot separate edge-sharing from corner-touching; `tissue_features.build_interface_graph` does that |
 | `webview/`                            | The pywebview desktop UI itself (see "pywebview UI" section below)                                                                                                                   |
 | `gap_analysis/`                       | Stub modules for manuscript analyses with no v1 implementation (see below)                                                                                                           |
 
 Build/dependency order: `common` → `data_input` → `pca_kmeans` →
 `manual_correction_classification` (parity-check gate here, see below) →
 `cell_tracking` → `manual_correction_tracking` → `trajectory_visualization`.
-`gap_analysis/` has no real dependencies on the above except `packing_analysis.py`,
+`gap_analysis/` has no real dependencies on the above,
 which imports `adjacency.py`. `rendering.py` depends on `data_input.py` only;
 `webview/` depends on everything.
 
@@ -278,7 +1046,7 @@ pool a human picks from.
 module) — the first same-population cell-adjacency graph in this codebase
 (`manual_correction_classification.get_adjacent_cells` is cross-cluster-only).
 Dilates each cell's own bounding-box-restricted mask and checks which other
-labels fall inside; a thin wrapper in `gap_analysis/packing_analysis.py`
+labels fall inside; `tissue_features.build_interface_graph`
 delegates to it, incidentally filling that manuscript-analysis stub
 (Fig.5G/6B) as a byproduct — `compute_neighbor_count_distribution`/
 `compute_area_vs_neighbor_count` remain unimplemented.
@@ -1178,14 +1946,19 @@ Confirmed missing from `src/` entirely (stub files created in
 1. **Cross-genotype (WT vs. `pyd`) statistical comparison** — Fig.5A-C,E,G,
    Fig.6A,B,D,E. `gui_comparison.py` ("Correct Cell Classification Results")
    is single-dataset correction UI only; no two-dataset comparison exists
-   anywhere. → `gap_analysis/genotype_comparison.py`
+   anywhere. → **stub deleted 2026-08-18**; a genotype comparison is a
+   statistics/plotting job over two finished `Cells_*.xlsx` sets, not a
+   pipeline module, so an empty placeholder was only misleading.
 2. **Packing / neighbor-count analysis** — Fig.5G, Fig.6B. No cell-adjacency
    graph exists in v1 (vertex count via `cv2.approxPolyDP` describes a
-   cell's own contour, not its neighbor count). → `gap_analysis/packing_analysis.py`
-3. **Shape parameter `p = perimeter / sqrt(area)`** — Fig.5D/E/F. Not
-   computed anywhere. Distinct from the existing `Cells_info.xlsx`
-   `'P-Value'` column (`4*pi/circularity**2`) — do not conflate the two. →
-   `gap_analysis/shape_parameter.py`
+   cell's own contour, not its neighbor count). → **implemented** in
+   `tissue_features.py` (`Neighbor Count`, `Local Hexagonal Fraction`); stub
+   deleted.
+3. **Shape parameter `p = perimeter / sqrt(area)`** — Fig.5D/E/F. Distinct
+   from the existing `Cells_info.xlsx` `'P-Value'` column
+   (`4*pi/circularity**2`) — do not conflate the two. → **implemented** as
+   `shape_features`' `Shape Index`, on a correctly-measured perimeter; stub
+   deleted.
 4. **Oscillation period/amplitude analysis** — Fig.4B, Fig.6D/E. Only an
    unrelated MSD power-law exponent (gamma) exists (duplicated in
    `gui_cell_shadow_plot.py` / `gui_quantitative_analysis.py`). →

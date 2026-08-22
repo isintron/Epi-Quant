@@ -27,31 +27,48 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
+import data_input
+
 logger = logging.getLogger(__name__)
 
-# The 18 Cells_info.xlsx columns used to build the tracking cost matrix.
-# NOTE: `build_cost_matrix`'s gating check and weight application are
-# hardcoded to specific POSITIONS in this list (index 1/2 = Max
-# Horizontal/Vertical Length, used for the plausible-displacement gate;
-# index 12/13 = Center X/Y, the only weighted features) — this is inherited
-# directly from v1's positional (not name-based) indexing. Reordering this
-# list without updating those positions, or passing a differently-ordered
-# `feature_columns` to `build_cost_matrix`, will silently break the gate and
-# weighting. In practice, only `DEFAULT_TRACKING_WEIGHTS` is meant to be
-# varied; the column order should be left as-is.
-DEFAULT_TRACKING_FEATURES = [
-    "Cell Area", "Maximum Horizontal Length", "Maximum Vertical Length", "Horizontal/Vertical Length Ratio",
-    "Cell Perimeter", "Approximate Polygon Vertex Count", "Fitted Ellipse Minor Axis",
-    "Fitted Ellipse Major Axis", "Ellipse Major/Minor Axis Ratio", "Fitted Ellipse Angle",
-    "Circumscribed Circle Radius", "Inscribed Circle Radius", "Center X Coordinate",
-    "Center Y Coordinate", "Cell Left Boundary", "Cell Right Boundary", "Circularity", "P-Value",
-]
+# The Cells_info.xlsx columns used to build the tracking cost matrix -- taken
+# from the schema itself so the two can never disagree.
+#
+# v1 indexed this list POSITIONALLY for both the displacement gate and the
+# weights, which made the column order silently load-bearing. Both are now
+# resolved by NAME (see `_gate_indices` and `DEFAULT_TRACKING_WEIGHTS`), so
+# adding or removing a column cannot quietly repoint them at the wrong data.
+DEFAULT_TRACKING_FEATURES = list(data_input.CELLS_INFO_COLUMNS)
 
-# Only Center X/Y (positions 12, 13) actually contribute -- this already
-# reduces to pure centroid Euclidean distance, matching the manuscript's
-# stated tracking method. Kept as-is; exposed as a real parameter rather
-# than a hardcoded literal.
-DEFAULT_TRACKING_WEIGHTS = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]
+# Columns the plausible-displacement gate reads: a match is rejected when the
+# centroid moved further than the cell's own bounding-box extent.
+GATE_EXTENT_COLUMNS = ("Maximum Horizontal Length", "Maximum Vertical Length")
+GATE_CENTER_COLUMNS = ("Center X Coordinate", "Center Y Coordinate")
+
+
+def _gate_indices(feature_columns: list) -> tuple:
+    """Positions of the gate's four columns within `feature_columns`."""
+    try:
+        return tuple(feature_columns.index(c) for c in GATE_EXTENT_COLUMNS + GATE_CENTER_COLUMNS)
+    except ValueError as missing:
+        raise ValueError(
+            f"feature_columns is missing a column the displacement gate needs: {missing}"
+        ) from None
+
+# Only Center X/Y actually contribute -- this reduces to pure centroid
+# Euclidean distance, matching the manuscript's stated tracking method. Kept as
+# behaviour; exposed as a real parameter rather than a hardcoded literal.
+#
+# Built by NAME rather than written out positionally. The previous literal
+# `[0]*12 + [1, 1] + [0]*4` silently encoded that Center X/Y sat at indices
+# 12/13; when three columns were dropped from `CELLS_INFO_COLUMNS` on
+# 2026-08-18 they moved to 11/12, and a positional literal would have started
+# weighting `Inscribed Circle Radius` and `Center X` instead -- with no error,
+# just wrong tracks.
+DEFAULT_TRACKING_WEIGHTS = [
+    1 if column in ("Center X Coordinate", "Center Y Coordinate") else 0
+    for column in DEFAULT_TRACKING_FEATURES
+]
 
 
 def build_cost_matrix(
@@ -73,6 +90,18 @@ def build_cost_matrix(
     if weights is None:
         weights = DEFAULT_TRACKING_WEIGHTS
 
+    # Zero-weight columns are skipped rather than multiplied by zero. With all
+    # but two of the default columns weighted 0, `0 * value` was already pure
+    # overhead; more importantly `0 * np.nan` is `np.nan`, so a single
+    # unpopulated column silently turned every cost into NaN and
+    # `linear_sum_assignment` then rejected the whole matrix. That made it
+    # impossible to track from a table where irrelevant columns are absent
+    # (e.g. `data_input.extract_cell_info(..., tracking_only=True)`).
+    # Results for a fully-populated table are unchanged: the skipped terms
+    # contributed exactly 0.
+    scored = [k for k in range(len(feature_columns)) if weights[k] != 0]
+    extent_x, extent_y, center_x, center_y = _gate_indices(list(feature_columns))
+
     idx1 = list(cells_frame1.index)
     idx2 = list(cells_frame2.index)
     cells_relation = np.zeros((len(idx1), len(idx2)))
@@ -82,13 +111,14 @@ def build_cost_matrix(
         for j, id2 in enumerate(idx2):
             info2 = list(cells_frame2.loc[id2, feature_columns])
 
-            max_distance = max(info1[1], info1[2])
-            if abs(info2[12] - info1[12]) > max_distance or abs(info2[13] - info1[13]) > max_distance:
+            max_distance = max(info1[extent_x], info1[extent_y])
+            if (abs(info2[center_x] - info1[center_x]) > max_distance
+                    or abs(info2[center_y] - info1[center_y]) > max_distance):
                 cells_relation[i, j] = np.nan
                 continue
 
             distance_sq = 0.0
-            for k in range(len(feature_columns)):
+            for k in scored:
                 distance_sq += weights[k] * (info2[k] - info1[k]) ** 2
             cells_relation[i, j] = np.sqrt(distance_sq)
 

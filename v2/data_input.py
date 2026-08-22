@@ -46,30 +46,100 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 from scipy.ndimage import distance_transform_edt as ndimage_distance_transform_edt
+from scipy.ndimage import find_objects as ndimage_find_objects
 from scipy.ndimage import label as ndimage_label
 
 logger = logging.getLogger(__name__)
 
-# Full 18-column schema written to Cells_info.xlsx. Order matches
-# src/gui_main.py:958-965 exactly (downstream modules rely on this order).
+# 15-column schema written to Cells_info.xlsx. Column ORDER is load-bearing:
+# `cell_tracking.DEFAULT_TRACKING_WEIGHTS` indexes into it positionally, so the
+# two must be changed together.
+#
+# Three columns from v1's 18 were removed on 2026-08-18 because they confused
+# users by appearing in the output while being offered nowhere in Classify:
+#   `Fitted Ellipse Angle` -- stored FOLDED (`180 - a if a > 90`), a mirror
+#       reflection rather than a modulo, so orientations 40 degrees apart share
+#       a value (70 and 110 both stored 20.0). Not invertible, so unusable as a
+#       direction. Orientation now comes from `shape_features`' Sin2Theta /
+#       Cos2Theta, recomputed from the elliptic-Fourier harmonic-1 SVD.
+#   `Circularity` -- exactly recoverable as `4*pi*A/P^2` from two columns that
+#       remain; verified against the stored column to within its own 2-decimal
+#       rounding (max diff 0.005) with all 2824 sentinel rows reproduced.
+#   `P-Value` -- `4*pi/circularity**2`, a monotone function of a monotone
+#       function of `Shape Index`. The same quantity a third time.
+# Neither `Circularity` nor `P-Value` was ever a QC signal in its own right:
+# dropping both from `segmentation_qc.measurement_failures` detected exactly the
+# same 12 failures across 24 frames of `AS_dorsal view_E-cad`.
 CELLS_INFO_COLUMNS = [
     "Cell Area", "Maximum Horizontal Length", "Maximum Vertical Length", "Horizontal/Vertical Length Ratio",
     "Cell Perimeter", "Approximate Polygon Vertex Count",
     "Fitted Ellipse Minor Axis", "Fitted Ellipse Major Axis", "Ellipse Major/Minor Axis Ratio",
-    "Fitted Ellipse Angle", "Circumscribed Circle Radius",
+    "Circumscribed Circle Radius",
     "Inscribed Circle Radius", "Center X Coordinate", "Center Y Coordinate", "Cell Left Boundary",
-    "Cell Right Boundary", "Circularity", "P-Value",
+    "Cell Right Boundary",
 ]
 
-# The 13-column subset used as the default PCA/K-means feature set (excludes
-# raw position/boundary columns: Center X/Y, Left/Right Boundary). Ported
-# from FeatureSelectionDialog.features, src/gui_main.py:96-99.
+# Default PCA/K-means feature set: every column except the raw positions
+# (Center X/Y, Left/Right Boundary), which locate a cell rather than describe
+# it. This is `pca_kmeans.FEATURE_FAMILIES["basic"]`.
+#
+# **v1's 13-feature list is retired.** It contained `Fitted Ellipse Angle` and
+# `Circularity`, both removed above, so it can no longer be assembled -- and it
+# would no longer reproduce v1's numbers in any case, since the switch to
+# mask-derived geometry moved perimeter by ~-5% and circularity by ~+10%.
+# `src/` remains frozen and is the reference for exact v1 reproduction.
 ML_FEATURE_COLUMNS = [
     "Cell Area", "Fitted Ellipse Major Axis", "Fitted Ellipse Minor Axis", "Ellipse Major/Minor Axis Ratio",
-    "Fitted Ellipse Angle", "Cell Perimeter", "Maximum Horizontal Length", "Maximum Vertical Length",
+    "Cell Perimeter", "Maximum Horizontal Length", "Maximum Vertical Length",
     "Horizontal/Vertical Length Ratio", "Approximate Polygon Vertex Count",
-    "Circumscribed Circle Radius", "Inscribed Circle Radius", "Circularity",
+    "Circumscribed Circle Radius", "Inscribed Circle Radius",
 ]
+
+# Background margin added around each cell's bounding box before the per-cell
+# raster work in `extract_cell_info`. `cv2.distanceTransform` measures distance
+# to the nearest zero pixel, so a crop tight to the cell leaves its edge pixels
+# with no zero to measure from. Measured on `AS_dorsal view_E-cad`: margin 0
+# corrupts the Inscribed Circle Radius of 260/2822 cells (the saturated
+# distance overflows the `int()` cast, max error 65532); margin 1 is already
+# enough to reproduce the full-frame result exactly. 8 is kept as cheap
+# headroom -- the cost scales with the (small) bbox area, not the frame.
+_BBOX_MARGIN = 8
+
+# Smallest ellipse semi-axis, in pixels, that `cv2.fitEllipse` is trusted to
+# have measured. Below this the fit is degenerate and its output is not even
+# reproducible.
+#
+# Found while regression-testing: `extract_cell_info` was not deterministic.
+# Four consecutive runs over `cp_dataset_puzzle-like_cells` in one process gave
+# different tables, always differing on `Cell1564_255` -- a **6-pixel** cell
+# whose major axis came back 7.48 on one run and 15.11 on the next. Confirmed
+# pre-existing by reproducing it on the unmodified code.
+#
+# The reproducibility was the symptom; the damage was to the feature. When the
+# minor axis was exactly 0 the old `!= 0` guard caught it, but a tiny nonzero
+# axis slipped through and made `Ellipse Major/Minor Axis Ratio` enormous:
+# 5443 on `AS_LE_lateral view_E-cad` (median 3.15) and 13421 on the puzzle set.
+# One such value inflated that column's standard deviation to 54.65, so after
+# `StandardScaler` 99% of cells were compressed into z = [-0.055, 0.134] while
+# the artifact sat at z = 99.5 -- real elongation variation (median 3.15,
+# p99 10.14) squeezed into a fifth of a standard deviation, leaving PCA almost
+# nothing but the artifact on an axis that carries 93% of PC3's loading.
+#
+# Threshold chosen by sweeping it against determinism over all six test
+# datasets, five interleaved runs each:
+#
+#   1.0 px -> `AS_LE_lateral` still flaky   33/23994 cells sentinelled (0.14%)
+#   1.5 px -> deterministic                 35/23994 (0.15%)
+#   2.0 px -> deterministic                 39/23994 (0.16%)
+#   3.0 px -> deterministic                 52/23994 (0.22%)
+#
+# 1.0 px is knife-edge: `Cell71_124` (5 px, 2 polygon vertices -- a line of
+# pixels) measured a minor axis of 1.00 on one run and 1.01 on the next, so it
+# fell on either side of the cut depending on the run. 1.5 px is already
+# enough, and 2.0 px buys margin for four more cells out of twenty-four
+# thousand. The 1st percentile of genuine minor axes is 7-12 px across these
+# datasets, so nothing real is anywhere near the threshold.
+_MIN_ELLIPSE_AXIS_PX = 2.0
 
 
 def _extract_frame_number(filename: str) -> float:
@@ -576,6 +646,171 @@ def convert_tiff_masks_to_npy(
     return written_paths
 
 
+def load_outline_coordinates(path: str) -> Optional[np.ndarray]:
+    """One cell outline from a whitespace-delimited `x y` text file, as an
+    open `(N, 2)` float array (a repeated closing point is dropped).
+
+    Handles both variants found in the Vofely et al. 2019 Dryad deposit
+    (`10.5061/dryad.g4q6pv3`), surveyed across all 11,346 of its files:
+    6,235 have no header and space-separated floats, 5,111 carry an `x\\ty`
+    header and tab-separated integers. Returns `None` for anything
+    unparseable or shorter than 10 points (its `README.txt` included).
+    """
+    if os.path.basename(path).lower() == "readme.txt":
+        return None
+    try:
+        with open(path, errors="replace") as handle:
+            first = handle.readline()
+        try:
+            [float(token) for token in first.split()]
+            skip_rows = 0
+        except ValueError:
+            skip_rows = 1
+        coords = np.loadtxt(path, skiprows=skip_rows)
+    except Exception:
+        return None
+    if coords.ndim != 2 or coords.shape[1] != 2 or len(coords) < 10:
+        return None
+    if np.allclose(coords[0], coords[-1]):
+        coords = coords[:-1]
+    return coords.astype(np.float64)
+
+
+def _coords_share_a_frame(cells: list[np.ndarray]) -> bool:
+    """Whether a group of outlines is laid out in one shared image frame or
+    each centred on its own centroid.
+
+    Both occur in the Vofely deposit and they need different handling: the
+    `gp`/`JH` files are in shared image-pixel coordinates and keep the field
+    of view (so neighbour/tissue analyses are meaningful), while the numeric
+    files are individually centred and carry no spatial relationship at all.
+    Decided by comparing the spread of centroids against typical cell size --
+    independently centred cells all sit on top of each other.
+    """
+    if len(cells) < 2:
+        return False
+    centroids = np.array([c.mean(axis=0) for c in cells])
+    centroid_spread = np.ptp(centroids, axis=0).max()
+    typical_cell = np.median([max(np.ptp(c[:, 0]), np.ptp(c[:, 1])) for c in cells])
+    return bool(centroid_spread > typical_cell)
+
+
+def convert_outline_coords_to_npy(
+    coords_folder: str,
+    npy_output_folder: str,
+    px_per_unit: float = 1.0,
+    group_pattern: str = r"^(.*?)[-.]\d+$",
+    margin: int = 8,
+    max_overlap_fraction: float = 0.01,
+    progress_cb: Optional[Callable[[str, int], None]] = None,
+) -> list[str]:
+    """Convert a folder of per-cell outline coordinate `.txt` files into
+    Cellpose-style `.npy` frames for `extract_cell_info`. Returns the written
+    paths, ordered by group name.
+
+    Built for the Vofely et al. 2019 Dryad pavement-cell deposit, whose cells
+    are hand-traced outlines rather than a segmentation, one file per cell.
+    Files are grouped into frames by `group_pattern` (default: the stem minus
+    its trailing `-N`/`.N` cell number, which matches both of that deposit's
+    naming conventions).
+
+    `px_per_unit` scales the coordinates before rasterizing. **Do not go below
+    1.0**: measured against solidity computed directly from the float
+    coordinates, 1.0 and 2.0 px/unit reproduce it exactly (bias 0.0000,
+    max error 0.0000, r = 1.00000 over 441 cells), while 0.5 px/unit
+    introduces a -0.0056 bias and errors up to 0.031.
+
+    Groups already in shared image coordinates keep their layout; groups whose
+    cells are each centred on their own centroid are tiled onto a grid, since
+    they carry no true spatial relationship (see `_coords_share_a_frame`).
+    Grid-tiled frames must not be used for neighbour or tissue-level analyses.
+    """
+    os.makedirs(npy_output_folder, exist_ok=True)
+    pattern = re.compile(group_pattern)
+
+    groups: dict[str, list[str]] = {}
+    for filename in sorted(os.listdir(coords_folder)):
+        if not filename.endswith(".txt"):
+            continue
+        stem = filename[:-4]
+        match = pattern.match(stem)
+        groups.setdefault(match.group(1) if match else stem, []).append(
+            os.path.join(coords_folder, filename)
+        )
+
+    written_paths = []
+    total = len(groups)
+    for idx, (group_name, paths) in enumerate(sorted(groups.items())):
+        cells = [c for c in (load_outline_coordinates(p) for p in paths) if c is not None]
+        if not cells:
+            continue
+
+        scaled = [c * px_per_unit for c in cells]
+        placed = None
+        if _coords_share_a_frame(scaled):
+            origin = np.array([min(c[:, 0].min() for c in scaled), min(c[:, 1].min() for c in scaled)])
+            shared = [c - origin + margin for c in scaled]
+            width = int(max(c[:, 0].max() for c in shared)) + margin + 1
+            height = int(max(c[:, 1].max() for c in shared)) + margin + 1
+
+            # Hand-traced outlines are not a segmentation: nothing forced the
+            # tracer to keep them disjoint, and a label image cannot represent
+            # a pixel belonging to two cells. Painting them in sequence would
+            # let each cell silently erase parts of the ones before it.
+            # Measured on the Vofely deposit: `gp15-043` overlaps 0.0%, but
+            # `gp15-046` overlaps 14.9% of total cell area and the puzzle-like
+            # `gp17-003` fern 25.2%, stacking up to 5 deep. So the layout is
+            # only kept when the overlap is negligible.
+            coverage = np.zeros((height, width), dtype=np.int32)
+            total_area = 0
+            for c in shared:
+                one = np.zeros((height, width), dtype=np.uint8)
+                cv2.fillPoly(one, [np.round(c).astype(np.int32).reshape(-1, 1, 2)], 1)
+                coverage += one
+                total_area += int(one.sum())
+            overlap = int((coverage > 1).sum())
+            if total_area and overlap / total_area > max_overlap_fraction:
+                logger.warning(
+                    "%s: traced outlines overlap over %.1f%% of their total area (max %d cells deep); "
+                    "tiling to a grid instead of keeping the image layout, so no cell is truncated. "
+                    "Neighbor/tissue-level analyses are not meaningful for this group.",
+                    group_name, 100 * overlap / total_area, int(coverage.max()),
+                )
+            else:
+                placed = shared
+
+        if placed is None:
+            cell_w = int(max(np.ptp(c[:, 0]) for c in scaled)) + 2 * margin + 1
+            cell_h = int(max(np.ptp(c[:, 1]) for c in scaled)) + 2 * margin + 1
+            columns = int(np.ceil(np.sqrt(len(scaled))))
+            rows = int(np.ceil(len(scaled) / columns))
+            width, height = columns * cell_w, rows * cell_h
+            placed = []
+            for i, c in enumerate(scaled):
+                row, column = divmod(i, columns)
+                placed.append(
+                    c - [c[:, 0].min(), c[:, 1].min()] + [column * cell_w + margin, row * cell_h + margin]
+                )
+
+        cast = np.uint16 if len(placed) < 2 ** 16 - 1 else np.uint32
+        labeled = np.zeros((height, width), dtype=cast)
+        for i, c in enumerate(placed, 1):
+            cv2.fillPoly(labeled, [np.round(c).astype(np.int32).reshape(-1, 1, 2)], int(i))
+
+        out_path = os.path.join(npy_output_folder, f"{group_name}.npy")
+        np.save(
+            out_path,
+            {"masks": labeled, "outlines": thin_label_outlines(labeled).astype(cast)},
+            allow_pickle=True,
+        )
+        written_paths.append(out_path)
+
+        if progress_cb is not None:
+            progress_cb(f"Converted {group_name} ({len(placed)} cells)...", int((idx + 1) / total * 100))
+
+    return written_paths
+
+
 def prepare_segmentation_folder(
     mask_folder: str,
     npy_output_folder: Optional[str] = None,
@@ -636,11 +871,62 @@ def is_edge_cell(cell_pixels: tuple[np.ndarray, np.ndarray], height: int, width:
     return False
 
 
+# Arc-length spacing, in pixels, at which a traced boundary's perimeter is
+# measured. See `contour_perimeter`.
+PERIMETER_SPACING_PX = 3.0
+
+
+def contour_perimeter(
+    contour: np.ndarray, spacing: float = PERIMETER_SPACING_PX, min_points: int = 32
+) -> float:
+    """Perimeter measured on the boundary resampled to a fixed arc-length
+    `spacing`, rather than by summing the raw pixel chain.
+
+    Summing a pixel chain overestimates arc length -- a staircase is longer
+    than the diagonal it approximates -- and the error depends on the
+    boundary's orientation, so it cannot be removed by a constant. Measured
+    against exact perimeters on rasterized shapes (circles r=30..200, axis-
+    aligned squares, the same squares at 30 degrees, and 6/8-lobed cells):
+
+        estimator                mean |err|   max |err|
+        raw cv2.arcLength           4.42%       7.29%
+        Kulpa x0.9481               1.64%       5.19%
+        Vossepoel-Smeulders         0.74%       2.15%
+        resample @2px               0.80%       1.63%
+        resample @3px (this)        0.31%       0.70%
+
+    Kulpa's constant looks appealing because `arcLength` is a near-uniform
+    +5.5% on curved boundaries, but an axis-aligned square has no staircase at
+    all and is already exact, so the correction makes it 5.2% too short.
+    Resampling has no such blind spot: it reads the square exactly and the
+    circle to 0.6%.
+
+    This matters beyond tidiness. The shape index p = P/sqrt(A) is compared
+    against the rigidity threshold p* ~ 3.81 of Bi et al.; the raw estimator
+    reports a perfect circle as 3.743 instead of 3.545, which is enough to move
+    solid-like tissue across that threshold.
+
+    `min_points` keeps small cells from being under-sampled, at the cost of a
+    finer spacing than requested for them.
+    """
+    closed = np.vstack([contour, contour[0]])
+    step = np.hypot(*np.diff(closed, axis=0).T)
+    arc = np.concatenate([[0.0], np.cumsum(step)])
+    total = arc[-1]
+    if total <= 0:
+        return 0.0
+    n_points = max(min_points, int(total / spacing))
+    target = np.linspace(0.0, total, n_points, endpoint=False)
+    resampled = np.column_stack([np.interp(target, arc, closed[:, 0]), np.interp(target, arc, closed[:, 1])])
+    return float(np.hypot(*np.diff(np.vstack([resampled, resampled[0]]), axis=0).T).sum())
+
+
 def extract_cell_info(
     npy_folder: str,
     output_path: Optional[str] = None,
     exclude_edge_cells: bool = False,
     progress_cb: Optional[Callable[[str, int], None]] = None,
+    tracking_only: bool = False,
 ) -> tuple[pd.DataFrame, int]:
     """Extract the 18-column geometric feature table for every cell across all
     frames in `npy_folder` (Cellpose `.npy` output, each a dict with an
@@ -652,10 +938,22 @@ def extract_cell_info(
 
     `progress_cb(message, percent)` is called once per frame if provided.
 
+    `tracking_only=True` computes only the four columns
+    `cell_tracking.build_cost_matrix` actually reads and leaves the rest `NaN`,
+    for users who only want to track and never classify. The column set and
+    order are unchanged either way.
+
     Ported from `bio_extract_cell_info`, src/gui_main.py:956-1092.
     Returns `(cells_info, fig_num)` exactly as v1 did.
     """
-    cells_info = pd.DataFrame(columns=CELLS_INFO_COLUMNS)
+    # Rows are accumulated as plain lists and turned into a DataFrame once at
+    # the end. The previous version built a one-row DataFrame per cell and
+    # `pd.concat`-ed it onto an accumulator, which is quadratic and, after the
+    # bounding-box change above, had become ~60% of total extraction time
+    # (measured with cProfile on `AS_dorsal view_E-cad`) -- more than all the
+    # image processing combined.
+    row_index: list[str] = []
+    row_values: list[np.ndarray] = []
     fig_num = 0
 
     npy_files = list_segmentation_files(npy_folder)
@@ -669,9 +967,13 @@ def extract_cell_info(
             continue
         dat = np.load(os.path.join(npy_folder, filename), allow_pickle=True).item()
         outlines = dat["outlines"]
+        # The FILLED per-cell label array. Everything the old code derived by
+        # re-filling the outline ring with `cv2.fillPoly` is now measured on
+        # this instead -- see `_MASK_DERIVED_NOTE`. Legacy `.npy` files written
+        # before Cellpose stored `'masks'` fall back to the old reconstruction.
+        fill_labels = dat.get("masks")
         height, width = outlines.shape
         fig_num += 1
-        cells_info_fig = pd.DataFrame(columns=CELLS_INFO_COLUMNS)
         # Via `resolve_frame_numbers` rather than a private regex, so the
         # `Cell{frame}_{id}` indices written here always resolve back to a
         # file for `_npy_path_for_frame`/`_find_matching_image`. The old
@@ -687,23 +989,85 @@ def extract_cell_info(
         unique_ids = np.unique(outlines)
         unique_ids = unique_ids[unique_ids != 0]
 
+        # Per-cell bounding boxes, so the per-cell work below scans only each
+        # cell's own neighborhood instead of the whole frame. Profiling the
+        # previous full-frame version on `AS_dorsal view_E-cad`: `np.where`
+        # over the whole array was 55.8% of extraction time and
+        # `distanceTransform` over the whole array another 35.4% -- both
+        # O(n_cells * frame_area). `find_objects` returns a list positionally
+        # indexed by `label - 1` (None for absent labels), which is why it is
+        # indexed rather than iterated.
+        bboxes = ndimage_find_objects(outlines)
+
         for cell_id in unique_ids:
-            positions = np.where(outlines == cell_id)
+            # Indexed, not guarded: `cell_id` came from `np.unique(outlines)`,
+            # so the label is present and `find_objects` cannot return None for
+            # it. A `None` here would mean the array is not what this function
+            # documents, and raising says so rather than silently dropping a
+            # cell from the table.
+            bbox = bboxes[cell_id - 1]
+            y0 = max(0, bbox[0].start - _BBOX_MARGIN)
+            y1 = min(height, bbox[0].stop + _BBOX_MARGIN)
+            x0 = max(0, bbox[1].start - _BBOX_MARGIN)
+            x1 = min(width, bbox[1].stop + _BBOX_MARGIN)
+            window = outlines[y0:y1, x0:x1]
+
+            local = np.where(window == cell_id)
+            # Absolute frame coordinates, matching the pre-bbox behaviour that
+            # every column below (centroid, left/right boundary, edge test) is
+            # defined in.
+            positions = (local[0] + y0, local[1] + x0)
 
             if exclude_edge_cells and is_edge_cell(positions, height, width, margin=3):
                 continue
 
+            if tracking_only:
+                # Only the four columns `cell_tracking.build_cost_matrix`
+                # actually reads: Maximum Horizontal/Vertical Length (its
+                # displacement gate) and Center X/Y Coordinate (the only
+                # nonzero entries in DEFAULT_TRACKING_WEIGHTS). Everything
+                # else is left NaN -- the column set and its order are
+                # unchanged, since downstream code maps columns positionally.
+                cy = int(np.mean(positions[0]))
+                cx = int(np.mean(positions[1]))
+                ap = np.max(positions[1]) - np.min(positions[1])
+                dv = np.max(positions[0]) - np.min(positions[0])
+                cell_info = [
+                    np.nan, ap, dv, ap / dv if dv != 0 else -1, np.nan, np.nan,
+                    np.nan, np.nan, np.nan, np.nan, np.nan,
+                    cx, cy, np.min(positions[1]), np.max(positions[1]),
+                ]
+                # Rounded like the full path so the populated columns come out
+                # float64 rather than int64; without it the two modes produce
+                # numerically equal tables with different dtypes.
+                row_index.append(f"Cell{fig_id}_{cell_id}")
+                row_values.append(np.round(cell_info, 2))
+                continue
+
+            # Kept in absolute coordinates because `cv2.fitEllipse` consumes it
+            # further down; only the raster work below is done in the crop.
             contour_points = np.array([positions[1], positions[0]]).T.reshape(-1, 1, 2)
 
-            fill_img = np.zeros_like(outlines, dtype=np.uint8)
-            cv2.fillPoly(fill_img, [contour_points], 1)
+            # Local coordinates for the raster work: area, arc length, vertex
+            # count and both radii are all translation-invariant, so cropping
+            # cannot change them.
+            if fill_labels is not None:
+                fill_img = (fill_labels[y0:y1, x0:x1] == cell_id).astype(np.uint8)
+            else:
+                local_points = np.array([local[1], local[0]]).T.reshape(-1, 1, 2)
+                fill_img = np.zeros(window.shape, dtype=np.uint8)
+                cv2.fillPoly(fill_img, [local_points], 1)
             cell_area = np.sum(fill_img)
 
-            contours, _ = cv2.findContours(fill_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(fill_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
             if len(contours) > 0:
-                filled_contour = contours[0]
-                cell_arclength = int(cv2.arcLength(filled_contour, True))
+                filled_contour = max(contours, key=cv2.contourArea)
+                # Measured on the resampled boundary rather than by summing the
+                # pixel chain: `cv2.arcLength` overestimates a digitized outline
+                # by ~5.5% and the error depends on its orientation, so it
+                # cannot be removed by a constant. See `contour_perimeter`.
+                cell_arclength = int(round(contour_perimeter(filled_contour.reshape(-1, 2).astype(np.float64))))
                 vertices = cv2.approxPolyDP(filled_contour, 2, True)
 
                 _, radius = cv2.minEnclosingCircle(filled_contour)
@@ -727,14 +1091,15 @@ def extract_cell_info(
                 circularity = -1
                 p_value = -1
 
-            if len(contour_points) >= 5:
-                cell_ellipse = cv2.fitEllipse(contour_points)
-                ratio_long_and_short_axes = (
-                    cell_ellipse[1][1] / cell_ellipse[1][0] if cell_ellipse[1][0] != 0 else -1
-                )
+            cell_ellipse = cv2.fitEllipse(contour_points) if len(contour_points) >= 5 else None
+            if cell_ellipse is not None and min(cell_ellipse[1]) < _MIN_ELLIPSE_AXIS_PX:
+                # Degenerate fit: fall through to the same `-1` sentinel a
+                # failed fit already uses. See `_MIN_ELLIPSE_AXIS_PX`.
+                cell_ellipse = None
+            if cell_ellipse is not None:
+                ratio_long_and_short_axes = cell_ellipse[1][1] / cell_ellipse[1][0]
                 cell_ellipse_angle = 180 - cell_ellipse[2] if cell_ellipse[2] > 90 else cell_ellipse[2]
             else:
-                cell_ellipse = None
                 ratio_long_and_short_axes = -1
                 cell_ellipse_angle = -1
 
@@ -749,16 +1114,15 @@ def extract_cell_info(
                 cell_area, ap, dv, aspect_ratio, cell_arclength, len(vertices),
                 cell_ellipse[1][0] if cell_ellipse is not None else -1,
                 cell_ellipse[1][1] if cell_ellipse is not None else -1,
-                ratio_long_and_short_axes, cell_ellipse_angle,
+                ratio_long_and_short_axes,
                 min_enclosing_circle_radius, max_inner_circle_radius,
-                cx, cy, np.min(positions[1]), np.max(positions[1]), circularity, p_value,
+                cx, cy, np.min(positions[1]), np.max(positions[1]),
             ]
             cell_info = np.round(cell_info, 2)
-            cell_index = f"Cell{fig_id}_{cell_id}"
-            cell_info_df = pd.DataFrame([cell_info], index=[cell_index], columns=CELLS_INFO_COLUMNS)
-            cells_info_fig = pd.concat([cells_info_fig, cell_info_df])
+            row_index.append(f"Cell{fig_id}_{cell_id}")
+            row_values.append(cell_info)
 
-        cells_info = pd.concat([cells_info, cells_info_fig])
+    cells_info = pd.DataFrame(row_values, index=row_index, columns=CELLS_INFO_COLUMNS)
 
     invalid_rows = cells_info[(cells_info == -1).any(axis=1)]
     if not invalid_rows.empty:
@@ -834,6 +1198,44 @@ if __name__ == "__main__":
               % (ncells(blob_labels), 100 * (blob_labels == 0).mean()))
         assert ncells(blob_labels) == 3, "must label the foreground blobs, not the background"
         assert (blob_labels == 0).sum() > 0, "binary_mask background is real empty space, not a separator"
+
+        # Coordinate-outline import. A lobed star and a plain square, written
+        # in both on-disk variants (headerless floats / `x\ty` header), far
+        # enough apart to share a frame without overlapping.
+        coords_dir = os.path.join(tmp, "coords")
+        os.makedirs(coords_dir, exist_ok=True)
+        angle = np.linspace(0, 2 * np.pi, 400, endpoint=False)
+        radius = 40 * (1 + 0.35 * np.cos(6 * angle))
+        star = np.column_stack([radius * np.cos(angle) + 100, radius * np.sin(angle) + 100])
+        square = np.column_stack(
+            [np.r_[np.linspace(-30, 30, 100), np.full(100, 30.0), np.linspace(30, -30, 100), np.full(100, -30.0)] + 400,
+             np.r_[np.full(100, -30.0), np.linspace(-30, 30, 100), np.full(100, 30.0), np.linspace(30, -30, 100)] + 100]
+        )
+        np.savetxt(os.path.join(coords_dir, "sample-1.txt"), star)
+        with open(os.path.join(coords_dir, "sample-2.txt"), "w") as handle:
+            handle.write("x\ty\n")
+            for x, y in square:
+                handle.write(f"{x}\t{y}\n")
+
+        coord_out = os.path.join(tmp, "coords_npy")
+        written = convert_outline_coords_to_npy(coords_dir, coord_out)
+        assert len(written) == 1, f"both cells belong to one group, got {len(written)} frames"
+        coord_masks = np.load(written[0], allow_pickle=True).item()["masks"]
+        assert ncells(coord_masks) == 2, f"expected 2 cells, got {ncells(coord_masks)}"
+        for label in (1, 2):
+            _, parts = ndimage_label(coord_masks == label)
+            assert parts == 1, f"cell {label} was split into {parts} pieces"
+        # The star is lobed, the square is convex: solidity must separate them,
+        # and the square's must be ~1.
+        solidity = {}
+        for label in (1, 2):
+            found, _ = cv2.findContours((coord_masks == label).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            outline = max(found, key=cv2.contourArea)
+            solidity[label] = cv2.contourArea(outline) / cv2.contourArea(cv2.convexHull(outline))
+        print("coordinate import: cells=%d solidity star=%.3f square=%.3f"
+              % (ncells(coord_masks), min(solidity.values()), max(solidity.values())))
+        assert max(solidity.values()) > 0.99, "the convex square must have solidity ~1"
+        assert min(solidity.values()) < 0.75, "the 6-lobed star must have clearly sub-1 solidity"
 
         print("\nAll data_input self-tests passed.")
 

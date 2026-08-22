@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 
 
-def compute_pc3_density_distributions(wt_scores: pd.Series, mutant_scores: pd.Series) -> dict:
-    """PC3 score density-distribution comparison between genotypes at GBR
+def compute_pc_density_distributions(wt_scores: pd.Series, mutant_scores: pd.Series) -> dict:
+    """PC value density-distribution comparison between genotypes at GBR
     and DC stages. Per manuscript Fig.6F,G (WT converges to a unimodal
     compact distribution at DC; pyd remains bimodal)."""
     raise NotImplementedError
@@ -25,7 +25,7 @@ def compute_trajectory_distance(wt_trajectory: np.ndarray, mutant_trajectory: np
 
 
 def compute_dtw_divergence(wt_trajectory: np.ndarray, mutant_trajectory: np.ndarray) -> dict:
-    """Dynamic Time Warping divergence between WT and mutant PC1-3
+    """Dynamic Time Warping divergence between WT and mutant PC value
     trajectories, testing whether divergence reflects structural differences
     rather than mere phase shifts. Per manuscript Fig.6I. Needs a new
     dependency (`fastdtw`/`dtaidistance`) to implement."""

@@ -105,7 +105,7 @@
       </div>
       <div class="field-row">
         <label class="checkbox-label"><input type="checkbox" id="extract-show-outline"> Outline</label>
-        <input type="color" id="extract-outline-color-input" value="#00ff00">
+        <input type="color" id="extract-outline-color-input" value="#ff0000">
         <label class="checkbox-label"><input type="checkbox" id="extract-show-labels"> Cell ID</label>
         <label>Size <input type="number" id="extract-label-size-input" class="small-input" value="10" min="6" max="30"></label>
       </div>
@@ -178,6 +178,38 @@
       <div id="extract-qc-status" class="status-line"></div>
     </div>
 
+    <div id="shape-descriptors" class="sub-panel" style="display:none">
+      <h3>Shape descriptors <span class="tag">optional</span></h3>
+      <p class="hint">Adds convex-hull, lobing and elliptic-Fourier descriptors per cell, plus
+         local tissue-texture measures. Needed only for the Convex hull, Convolution/lobe,
+         Local tissue texture and Elliptic Fourier families in Classify &mdash; skip it if you are
+         going straight to tracking.</p>
+      <div class="field-row">
+        <label class="checkbox-label"><input type="checkbox" id="shape-include-tissue" checked>
+          Local tissue texture (neighbour count, hexagonality, nematic order)</label>
+      </div>
+      <div class="field-row">
+        <label class="checkbox-label"><input type="checkbox" id="shape-with-coefficients">
+          Raw elliptic-Fourier coefficients (required for the Elliptic Fourier family)</label>
+      </div>
+      <details>
+        <summary>Advanced</summary>
+        <div class="field-row">
+          <label>EFD order</label>
+          <input type="number" id="shape-efd-order" value="10" min="3" max="30" class="small-input">
+          <label>Contour points</label>
+          <input type="number" id="shape-contour-points" value="256" min="64" step="64" class="small-input">
+          <label>Smoothing (fraction of contour)</label>
+          <input type="number" id="shape-smoothing" value="0.02" min="0" max="0.2" step="0.01" class="small-input">
+        </div>
+      </details>
+      <div class="field-row">
+        <button id="run-shape-btn" class="secondary-btn">Compute shape descriptors</button>
+      </div>
+      <div id="shape-status" class="status-line"></div>
+      <div id="shape-summary" class="shape-summary"></div>
+    </div>
+
     <div class="next-step-choices" id="extract-next-choices" style="display:none">
       <button id="go-to-classify" class="primary-btn">Classify cells →</button>
       <button id="skip-classification" class="secondary-btn">Skip classification, track directly →</button>
@@ -186,6 +218,23 @@
 
   <section id="step-classify" class="step-section">
     <h2>Classify Cells</h2>
+
+    <div class="field-row">
+      <label>Features</label>
+      <div id="feature-families" class="family-picker"></div>
+    </div>
+    <div id="feature-groups"></div>
+
+    <div class="field-row">
+      <label>These frames are</label>
+      <label class="radio-label"><input type="radio" name="dataset-mode" value="time_series" id="dataset-time-series" checked>
+        one specimen over time</label>
+      <label class="radio-label"><input type="radio" name="dataset-mode" value="independent_samples" id="dataset-independent">
+        unrelated images</label>
+    </div>
+    <p class="hint" id="dataset-mode-note">Pooled into one feature space. Required if you will track
+       these cells.</p>
+
     <div class="field-row">
       <label class="radio-label"><input type="radio" name="n-clusters-mode" value="auto" id="n-clusters-auto" checked> Auto (silhouette-selected)</label>
       <span class="k-range-row">
@@ -197,10 +246,19 @@
       <label class="radio-label"><input type="radio" name="n-clusters-mode" value="manual" id="n-clusters-manual"> Manual:</label>
       <input type="number" id="n-clusters-input" value="2" min="2" class="small-input">
     </div>
+    <details id="classify-advanced">
+      <summary>Advanced</summary>
+      <div class="field-row">
+        <label>Drop features correlated above</label>
+        <input type="number" id="prune-correlation" placeholder="off" min="0.5" max="1" step="0.05" class="small-input">
+        <span class="hint-inline">Blank = off. 0.95 barely helps size dominance; 0.85 is where it bites.</span>
+      </div>
+    </details>
     <div class="field-row">
       <button id="run-classification-btn" class="primary-btn">Run Classification</button>
     </div>
     <div id="classify-status" class="status-line"></div>
+    <div id="classify-features-used" class="hint"></div>
 
     <div id="classify-results" style="display:none">
       <h3>Cluster Legend &amp; Colors</h3>

@@ -419,3 +419,121 @@ details summary {
   color: var(--accent);
   font-size: 13px;
 }
+
+/* Shape-descriptor panel in Extract, and the feature selector in Classify.
+   Both added for the convoluted-shape descriptors (see v2/README.md). */
+.sub-panel {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.sub-panel h3 {
+  margin-top: 0;
+}
+
+/* `.tag` already exists but only scoped inside .popover; the panel headings
+   and the summary table need it too. */
+.sub-panel .tag,
+.summary-table .tag {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-left: 4px;
+}
+
+.hint-inline {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Family picker: the additive checkbox row that replaced the old single-select
+   dropdown. */
+.family-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+}
+
+/* One bordered group per checked family: set name in the legend (top-left),
+   feature checkboxes wrapping inside, Select all / Unselect all bottom-right. */
+.feature-group {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 8px 0;
+  padding: 6px 12px 8px;
+}
+
+.feature-group legend {
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.feature-group-boxes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+}
+
+.feature-group .checkbox-label {
+  font-size: 13px;
+  flex: 0 0 auto;
+}
+
+.feature-group .hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+
+.feature-group-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.shape-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin-top: 10px;
+}
+
+.shape-summary h4 {
+  margin: 4px 0;
+  font-size: 13px;
+  text-transform: capitalize;
+}
+
+.summary-table {
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.summary-table th,
+.summary-table td {
+  text-align: left;
+  padding: 2px 10px 2px 0;
+  color: var(--muted);
+}
+
+.summary-table td:nth-child(2) {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg, inherit);
+}

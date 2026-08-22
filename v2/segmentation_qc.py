@@ -458,7 +458,19 @@ def morphology_outlier(
         return {}
 
     area = frame["Cell Area"].astype(float).to_numpy()
-    circularity = frame["Circularity"].astype(float).to_numpy()
+    perimeter = frame["Cell Perimeter"].astype(float).to_numpy()
+    # Computed here rather than read from a stored column. The `Circularity`
+    # column was removed from `Cells_info.xlsx` on 2026-08-18 (it is a monotone
+    # function of `Shape Index` and was confusing users by appearing in the
+    # output while being offered nowhere in Classify); it is exactly recoverable
+    # from the two columns above, verified against the old column to within its
+    # own 2-decimal rounding (max diff 0.005) with every sentinel row
+    # reproduced. `where=` keeps the -1/0 sentinel rows out of the division;
+    # they fall out of `valid` below either way.
+    circularity = np.divide(
+        4 * np.pi * area, perimeter ** 2,
+        out=np.full_like(area, -1.0, dtype=float), where=perimeter > 0,
+    )
     inscribed = frame["Inscribed Circle Radius"].astype(float).to_numpy()
     circumscribed = frame["Circumscribed Circle Radius"].astype(float).to_numpy()
 
@@ -526,8 +538,13 @@ def measurement_failures(cells_info: pd.DataFrame, frame_number: int) -> Dict[in
     if frame.empty:
         return {}
 
-    sentinel_negative = ["Circularity", "P-Value", "Cell Perimeter", "Fitted Ellipse Major Axis",
-                         "Fitted Ellipse Minor Axis", "Ellipse Major/Minor Axis Ratio", "Fitted Ellipse Angle"]
+    # `Circularity`, `P-Value` and `Fitted Ellipse Angle` were removed from the
+    # schema on 2026-08-18. Dropping them here loses no detection: they were
+    # -1 exactly when a column that remains already was, and re-running this
+    # over `AS_dorsal view_E-cad` with and without them found the same 12
+    # failures across all 24 frames.
+    sentinel_negative = ["Cell Perimeter", "Fitted Ellipse Major Axis",
+                         "Fitted Ellipse Minor Axis", "Ellipse Major/Minor Axis Ratio"]
     sentinel_zero = ["Approximate Polygon Vertex Count", "Circumscribed Circle Radius", "Inscribed Circle Radius"]
 
     present_negative = [c for c in sentinel_negative if c in frame.columns]
@@ -625,11 +642,18 @@ if __name__ == "__main__":
     print("  -> cells separated by a thin gap are still bridged and scored.")
 
     # --- morphology_outlier: naturally-varying cells plus one merged blob.
+    # `morphology_outlier` now derives circularity from area and perimeter (the
+    # stored `Circularity` column was removed from the schema), so fixtures give
+    # the perimeter that PRODUCES the circularity they mean to test.
+    def perimeter_for(area, circularity):
+        return float(np.sqrt(4 * np.pi * area / circularity))
+
     rng = np.random.default_rng(0)
     rows = []
     for i in range(1, 21):
         area = float(rng.normal(100, 8)) if i < 20 else 5000.0  # cell 20 is merged
-        rows.append({"Cell Index": f"Cell1_{i}", "Cell Area": area, "Circularity": 0.8,
+        rows.append({"Cell Index": f"Cell1_{i}", "Cell Area": area,
+                     "Cell Perimeter": perimeter_for(area, 0.8),
                      "Inscribed Circle Radius": 5, "Circumscribed Circle Radius": 7})
     morph = morphology_outlier(pd.DataFrame(rows), 1)
     normals = [morph[i] for i in range(1, 20)]
@@ -642,9 +666,9 @@ if __name__ == "__main__":
 
     # Degenerate frame: most cells identical makes the MAD exactly 0, which
     # must not hide the one cell that differs.
-    tied = [{"Cell Index": f"Cell1_{i}", "Cell Area": 100.0, "Circularity": 0.8,
+    tied = [{"Cell Index": f"Cell1_{i}", "Cell Area": 100.0, "Cell Perimeter": perimeter_for(100.0, 0.8),
              "Inscribed Circle Radius": 5, "Circumscribed Circle Radius": 7} for i in range(1, 10)]
-    tied.append({"Cell Index": "Cell1_10", "Cell Area": 5000.0, "Circularity": 0.8,
+    tied.append({"Cell Index": "Cell1_10", "Cell Area": 5000.0, "Cell Perimeter": perimeter_for(5000.0, 0.8),
                  "Inscribed Circle Radius": 5, "Circumscribed Circle Radius": 7})
     tied_scores = morphology_outlier(pd.DataFrame(tied), 1)
     assert tied_scores[10] == 0.0, tied_scores
@@ -667,9 +691,9 @@ if __name__ == "__main__":
 
     # --- measurement_failures: both sentinel conventions.
     fails = pd.DataFrame([
-        {"Cell Index": "Cell1_1", "Circularity": 0.8, "Approximate Polygon Vertex Count": 6},
-        {"Cell Index": "Cell1_2", "Circularity": -1.0, "Approximate Polygon Vertex Count": 6},   # -1 branch
-        {"Cell Index": "Cell1_3", "Circularity": 0.8, "Approximate Polygon Vertex Count": 0},    # zero-contour branch
+        {"Cell Index": "Cell1_1", "Cell Perimeter": 40.0, "Approximate Polygon Vertex Count": 6},
+        {"Cell Index": "Cell1_2", "Cell Perimeter": -1.0, "Approximate Polygon Vertex Count": 6},  # -1 branch
+        {"Cell Index": "Cell1_3", "Cell Perimeter": 40.0, "Approximate Polygon Vertex Count": 0},  # zero-contour branch
     ])
     flags = measurement_failures(fails, 1)
     print("\nmeasurement_failures:", flags)

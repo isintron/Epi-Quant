@@ -26,6 +26,7 @@
     ],
     trackNumbers: [1, 2, 3, 4, 5],
     hasLeadingEdge: false,
+    hasShape: false,
   };
 
   function delay(ms) {
@@ -47,7 +48,7 @@
       };
     },
     async get_existing_results() {
-      return { extraction: false, classification: false, tracking: false };
+      return { extraction: false, classification: false, tracking: false, shape: false, tissue: false };
     },
     async load_existing_extraction() {
       return { frame_count: mockState.frameCount, cell_count: 500 };
@@ -67,6 +68,79 @@
         window.onExtractDone && window.onExtractDone({ frame_count: mockState.frameCount, cell_count: 500 });
       })();
       return true;
+    },
+    async start_shape_extraction(_includeTissue, _order, _points, _sigma, _coeffs) {
+      (async () => {
+        for (let p = 0; p <= 100; p += 50) {
+          await delay(120);
+          window.onProgress && window.onProgress({ stage: "shape", message: `mock shape ${p}`, percent: p });
+        }
+        mockState.hasShape = true;
+        window.onShapeExtractDone && window.onShapeExtractDone(await mockApi.get_shape_feature_summary());
+      })();
+      return true;
+    },
+    async get_shape_feature_summary() {
+      if (!mockState.hasShape) return {};
+      const column = (median) => ({ median, q1: median * 0.9, q3: median * 1.1, missing: 0 });
+      return {
+        shape: {
+          cell_count: 500,
+          columns: { Solidity: column(0.93), "Shape Index": column(4.12), "Lobe Count": column(3) },
+          diagnostics: ["Mask Area", "Elongation", "Sin2Theta", "Cos2Theta"],
+        },
+        tissue: {
+          cell_count: 500,
+          columns: { "Neighbor Count": column(6), "Local Nematic Order": column(0.82) },
+          diagnostics: ["Local Density", "Frame Neighbor Entropy"],
+        },
+      };
+    },
+    async load_existing_shape_features() {
+      mockState.hasShape = true;
+      return mockApi.get_shape_feature_summary();
+    },
+    async get_feature_options() {
+      const ready = mockState.hasShape;
+      const family = (label, columns, extra = {}) => ({
+        label, columns, default_off: [], base: false, exclusive: false, note: "",
+        // Mirrors pca_kmeans.FEATURE_DISPLAY_NAMES: cosmetic only, the real
+        // column name stays the checkbox value.
+        display: Object.fromEntries(columns.map((c) => [c, ({
+          "Cell Area": "Area",
+          "Cell Perimeter": "Perimeter",
+          "Ellipse Major/Minor Axis Ratio": "Ellipse Axis Ratio",
+          "Maximum Horizontal Length": "Max Horizontal Length",
+          "Maximum Vertical Length": "Max Vertical Length",
+          "Horizontal/Vertical Length Ratio": "H/V Length Ratio",
+        })[c] || c])),
+        ready: extra.base ? true : ready, missing: ready || extra.base ? [] : ["Solidity"], ...extra,
+      });
+      return {
+        families: {
+          // Column names here must be the REAL ones -- `display` is the only
+          // place a shortened label may appear. Getting that wrong in the mock
+          // hides exactly the bug the mock exists to catch.
+          basic: family("Basic geometrics",
+            ["Cell Area", "Cell Perimeter", "Ellipse Major/Minor Axis Ratio",
+             "Maximum Horizontal Length", "Maximum Vertical Length", "Horizontal/Vertical Length Ratio"],
+            { base: true, ready: true, missing: [],
+              default_off: ["Maximum Horizontal Length", "Maximum Vertical Length", "Horizontal/Vertical Length Ratio"],
+              note: "H/V lengths measure orientation, not shape - tick them only if your specimen is axis-aligned." }),
+          hull: family("Convex hull / compactness", ["Solidity", "Convexity", "Shape Index"],
+            { note: "Solidity and Convexity are the only clean lobing measures." }),
+          lobe: family("Convolution / lobe",
+            ["Lobe Count", "Max Concavity Depth", "Mean Neck Width", "EFD Irregularity"]),
+          tissue: family("Local tissue texture",
+            ["Neighbor Count", "Local Hexagonal Fraction", "Local Nematic Order",
+             "Local Mean Shape Index", "Local Mean Solidity"]),
+          efd: family("Elliptic Fourier coefficients", [],
+            { exclusive: true, note: "Used alone and without standardization." }),
+        },
+        has_shape: ready,
+        has_tissue: ready,
+        dataset_modes: ["time_series", "independent_samples"],
+      };
     },
     async get_frame_count() {
       return mockState.frameCount;
@@ -117,8 +191,18 @@
         Dark2: ["#1b9e77", "#d95f02", "#7570b3", "#e7298a", "#66a61e", "#e6ab02", "#a6761d", "#666666"],
       };
     },
-    async run_classification(_n, _k, _rs) {
-      return { cluster_sizes: { cluster_1: 120, cluster_2: 30 }, k_used: 2 };
+    async run_classification(_n, _k, _rs, featureFamilies, selectedFeatures, _prune, datasetMode) {
+      const families = featureFamilies && featureFamilies.length ? featureFamilies : ["basic"];
+      return {
+        cluster_sizes: { cluster_1: 120, cluster_2: 30 },
+        k_used: 2,
+        features_used: selectedFeatures && selectedFeatures.length ? selectedFeatures : ["Cell Area", "Circularity"],
+        feature_families: families,
+        // Mirrors the backend rule that EFD is never standardized.
+        standardize_mode: families.includes("efd") ? "none" : "global",
+        dataset_mode: datasetMode || "time_series",
+        cells_used: 500,
+      };
     },
     async set_cluster_colors(colorMap) {
       mockState.clusterLegend.forEach((c) => {

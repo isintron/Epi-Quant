@@ -1,18 +1,20 @@
 """Cell-adjacency (neighbor) graphs from filled per-cell label arrays, plus
 the cross-frame "environment score" built on top of them.
 
-No cell-adjacency graph exists anywhere in `src/` or the rest of `v2/` --
 `manual_correction_classification.get_adjacent_cells` is a KDTree-based
 cross-cluster-only check (used for the classification "cluster borders"
-visualization), not a general same-population neighbor primitive.
-`gap_analysis/packing_analysis.py`'s `build_neighbor_graph` stub is the
-explicit placeholder for exactly what this module provides; see that
-module for how it delegates here.
+visualization), not a general same-population neighbor primitive, so this
+module is the only general adjacency graph in the project.
 
-This module is deliberately separate from `gap_analysis/` (which is an
-explicitly deferred, stub-only package per its own docstring) since it is
-real runtime logic used by the live "Correct Tracking" webview UI, not a
-manuscript-analysis stub.
+**Adjacency here is dilation-based**, which tolerates the gaps segmentation
+tools leave (on `test_data/pupae_E-cad` no two of its 826 cells touch at all:
+at `dilation_px=1` every cell is isolated, at the default 2 the median
+neighbour count is 6). What it cannot do is tell "shares a wall" from "meets
+at a corner" -- on a synthetic square lattice it reports 8 neighbours per cell
+instead of 4. `tissue_features.build_interface_graph` counts shared border
+pixels instead and gets both lattices right; use that for packing/topology
+analyses, and this one where gap-tolerant proximity is what is wanted (the
+live "Correct Tracking" environment score).
 """
 
 from typing import Dict, Mapping, Set

@@ -6,6 +6,7 @@
 *.code-workspace
 bibliography/
 figures/
+人机协同点击测试指南.md
 
 # Claude
 .claude/

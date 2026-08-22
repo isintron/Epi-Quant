@@ -55,9 +55,18 @@ import manual_correction_tracking
 import pca_kmeans
 import rendering
 import segmentation_qc
+import shape_features
+import tissue_features
 import trajectory_visualization
 
 logger = logging.getLogger(__name__)
+
+
+def _finite(value) -> Optional[float]:
+    """`float(value)`, or `None` for NaN/inf -- `json.dumps` emits bare `NaN`
+    for those, which `JSON.parse` on the frontend side rejects."""
+    number = float(value)
+    return number if np.isfinite(number) else None
 
 
 class EpiQuantAPI:
@@ -70,6 +79,14 @@ class EpiQuantAPI:
         self.output_dirs: Optional[dict] = None
 
         self.cells_info: Optional[pd.DataFrame] = None
+        # Shape/tissue descriptors live in their own tables, joined to
+        # `cells_info` on `Cell Index` only when classification needs them.
+        # They are NOT extra columns in `Cells_info.xlsx`: `common.save_modified_rows`
+        # maps DataFrame column position onto Excel column position, so growing
+        # that schema would silently write into the wrong columns of an
+        # existing file.
+        self.cells_shape: Optional[pd.DataFrame] = None
+        self.cells_tissue: Optional[pd.DataFrame] = None
         self.clustering_data: Optional[pd.DataFrame] = None
         self.cluster_color_map: dict[int, str] = {}
         self.hidden_cluster_labels: set[int] = set()
@@ -213,11 +230,27 @@ class EpiQuantAPI:
         tracking_path = os.path.join(
             self.output_dirs["cell_track_output"], "all_cell_tracking", "all_cell_merged_tracking_results.xlsx",
         )
+        classification_dir = self.output_dirs["cell_classification_output"]
         return {
             "extraction": os.path.isfile(cells_info_path),
             "classification": os.path.isfile(clustering_path),
             "tracking": os.path.isfile(tracking_path),
+            "shape": os.path.isfile(os.path.join(classification_dir, "Cells_shape.xlsx")),
+            "tissue": os.path.isfile(os.path.join(classification_dir, "Cells_tissue.xlsx")),
         }
+
+    def load_existing_shape_features(self) -> dict:
+        """Load previously written `Cells_shape.xlsx` / `Cells_tissue.xlsx`
+        instead of recomputing them."""
+        classification_dir = self.output_dirs["cell_classification_output"]
+        for attribute, filename, sheet in (
+            ("cells_shape", "Cells_shape.xlsx", "Shape"),
+            ("cells_tissue", "Cells_tissue.xlsx", "Tissue"),
+        ):
+            path = os.path.join(classification_dir, filename)
+            if os.path.isfile(path):
+                setattr(self, attribute, pd.read_excel(path, sheet_name=sheet, index_col="Cell Index"))
+        return self.get_shape_feature_summary()
 
     def load_existing_extraction(self) -> dict:
         """Load a previously written `Cells_info.xlsx` instead of re-running
@@ -292,6 +325,107 @@ class EpiQuantAPI:
         except Exception as e:
             logger.exception("Extraction failed")
             self._notify("onExtractError", {"message": str(e)})
+
+    def start_shape_extraction(
+        self,
+        include_tissue: bool = True,
+        efd_order: int = 10,
+        n_contour_points: int = 256,
+        smoothing_sigma_fraction: float = 0.02,
+        with_coefficients: bool = False,
+    ) -> bool:
+        """Compute the convoluted-shape and tissue-texture descriptors.
+
+        Separate from `start_extraction` and optional, because a user who only
+        wants to track never needs them. They are cheap (0.3-0.8 ms/cell, ~10%
+        of extraction) but they are also meaningless without a decision about
+        what to do with them, so they are opt-in rather than automatic.
+        """
+        thread = threading.Thread(
+            target=self._run_shape_extraction,
+            args=(include_tissue, efd_order, n_contour_points, smoothing_sigma_fraction, with_coefficients),
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _run_shape_extraction(
+        self,
+        include_tissue: bool,
+        efd_order: int,
+        n_contour_points: int,
+        smoothing_sigma_fraction: float,
+        with_coefficients: bool,
+    ) -> None:
+        try:
+            if not self.npy_folder:
+                self.npy_folder = data_input.prepare_segmentation_folder(
+                    self.mask_folder, image_folder=self.image_folder
+                )
+            self.cells_shape = shape_features.extract_shape_features(
+                self.npy_folder,
+                output_path=self.output_dirs["cell_classification_output"],
+                efd_order=efd_order,
+                n_contour_points=n_contour_points,
+                smoothing_sigma_fraction=smoothing_sigma_fraction,
+                with_coefficients=with_coefficients,
+                progress_cb=self._progress_cb("shape"),
+            )
+            if include_tissue:
+                self.cells_tissue = tissue_features.extract_tissue_features(
+                    self.npy_folder,
+                    shape_info=self.cells_shape,
+                    output_path=self.output_dirs["cell_classification_output"],
+                    progress_cb=self._progress_cb("shape"),
+                )
+            self._notify("onShapeExtractDone", self.get_shape_feature_summary())
+        except Exception as e:
+            logger.exception("Shape descriptor extraction failed")
+            self._notify("onShapeExtractError", {"message": str(e)})
+
+    def get_shape_feature_summary(self) -> dict:
+        """Median and IQR per descriptor, so the frontend can show what was
+        computed without shipping the whole table across the bridge.
+
+        The listed columns come from `pca_kmeans.FEATURE_FAMILIES` -- the same
+        source the Classify step selects from -- so this panel can only ever
+        show things the user can actually pick. An earlier version listed the
+        `SCALE_INVARIANT_*` columns instead, which conflated "is dimensionless"
+        (a property of the maths) with "is offered as a feature" (a design
+        decision) and so kept advertising `Elongation`, `Sin2Theta`,
+        `Cos2Theta` and `Frame Neighbor Entropy` after they had been retired
+        from every family.
+
+        Retired and internal columns are still computed and still written to
+        the xlsx -- `Sin2Theta`/`Cos2Theta` feed `Local Nematic Order`, and
+        `Frame Neighbor Entropy` is a legitimate per-frame statistic -- so they
+        are reported as a `diagnostics` count rather than silently dropped.
+        """
+        offered = {c for spec in pca_kmeans.FEATURE_FAMILIES.values() for c in spec["columns"]}
+        summary = {}
+        for label, frame in (("shape", self.cells_shape), ("tissue", self.cells_tissue)):
+            if frame is None or frame.empty:
+                continue
+            present = [c for c in frame.columns if c in offered]
+            diagnostics = [
+                c for c in frame.columns
+                if c not in offered and not str(c).startswith("efd_")
+            ]
+            described = frame[present].describe()
+            summary[label] = {
+                "cell_count": int(len(frame)),
+                "diagnostics": diagnostics,
+                "columns": {
+                    column: {
+                        "median": _finite(described.loc["50%", column]),
+                        "q1": _finite(described.loc["25%", column]),
+                        "q3": _finite(described.loc["75%", column]),
+                        "missing": int(frame[column].isna().sum()),
+                    }
+                    for column in present
+                },
+            }
+        return summary
 
     def get_frame_count(self) -> int:
         if self.cells_info is not None:
@@ -618,22 +752,170 @@ class EpiQuantAPI:
     def get_palette_presets(self) -> dict[str, list[str]]:
         return rendering.get_palette_presets()
 
+    def _joined_features(self) -> pd.DataFrame:
+        """`cells_info` joined with the shape and tissue tables on `Cell Index`."""
+        frame = self.cells_info.set_index("Cell Index")
+        for extra in (self.cells_shape, self.cells_tissue):
+            if extra is not None and not extra.empty:
+                frame = frame.join(extra, how="left")
+        return frame
+
+    def has_efd_coefficients(self) -> bool:
+        return bool(
+            self.cells_shape is not None
+            and any(str(c).startswith("efd_") for c in self.cells_shape.columns)
+        )
+
+    def get_feature_options(self) -> dict:
+        """The additive feature families the Classify step may offer.
+
+        `basic` is the always-on base; every other family is added on top. `efd`
+        is exclusive and unstandardized. A family is `ready` only when **every**
+        column it names is present -- testing "any column present" would mark a
+        family ready on a project with no shape table just because one of its
+        columns happens to come from `Cells_info.xlsx`, and the run would then
+        fail after the user had already selected it.
+        """
+        available = set(self._joined_features().columns) if self.cells_info is not None else set()
+        families = {}
+        for name, spec in pca_kmeans.FEATURE_FAMILIES.items():
+            if name == "efd":
+                ready = self.has_efd_coefficients()
+                columns, missing = [], [] if ready else ["efd_* coefficients"]
+            else:
+                columns = list(spec["columns"])
+                missing = [c for c in columns if c not in available]
+                ready = not missing
+            families[name] = {
+                "label": spec["label"],
+                "columns": columns,
+                # Short labels for display only -- the values above stay the
+                # real column names, which is what every lookup uses.
+                "display": {c: pca_kmeans.display_name(c) for c in columns},
+                "default_off": list(spec.get("default_off", ())),
+                "base": bool(spec.get("base")),
+                "exclusive": bool(spec.get("exclusive")),
+                "note": spec.get("note", ""),
+                "ready": ready,
+                "missing": missing,
+            }
+        return {
+            "families": families,
+            "has_shape": self.cells_shape is not None,
+            "has_tissue": self.cells_tissue is not None,
+            "dataset_modes": ["time_series", "independent_samples"],
+        }
+
+    def _feature_frame(
+        self, feature_families: Optional[list], selected_features: Optional[list]
+    ) -> tuple[pd.DataFrame, str]:
+        """The matrix to hand PCA, plus the standardize mode the selection
+        mandates. Raises with a readable message rather than letting a missing
+        column surface as a bare `KeyError` from pandas."""
+        families = list(feature_families) if feature_families else ["basic"]
+        unknown = [f for f in families if f not in pca_kmeans.FEATURE_FAMILIES]
+        if unknown:
+            raise ValueError(
+                f"unknown feature family {unknown[0]!r}; expected one of {list(pca_kmeans.FEATURE_FAMILIES)}"
+            )
+
+        joined = self._joined_features()
+
+        if "efd" in families:
+            # Exclusive by construction: an orthogonal basis is taken whole, and
+            # mixing it with hand-crafted scalars would double-count shape.
+            if len(families) > 1:
+                raise ValueError(
+                    "The elliptic-Fourier family is used on its own - deselect the other families."
+                )
+            if not self.has_efd_coefficients():
+                raise ValueError(
+                    "EFD needs the raw Fourier coefficients. Re-run shape extraction with "
+                    "'Raw elliptic-Fourier coefficients' enabled."
+                )
+            columns = [c for c in joined.columns if str(c).startswith("efd_")]
+            standardize_mode = pca_kmeans.FEATURE_FAMILIES["efd"]["standardize"]
+        else:
+            columns = list(selected_features) if selected_features else pca_kmeans.family_columns(families)
+            missing = [c for c in columns if c not in joined.columns]
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} feature(s) are not available in this project: {', '.join(missing[:6])}"
+                    + (" ..." if len(missing) > 6 else "")
+                    + ". Run the shape-descriptor step in Extract first."
+                )
+            standardize_mode = "global"
+
+        frame = joined.loc[:, columns].apply(pd.to_numeric, errors="coerce")
+        before = len(frame)
+        frame = frame.dropna()
+        if frame.empty:
+            raise ValueError("No cells have a complete set of the selected features.")
+        if len(frame) < before:
+            logger.info("Dropped %d cell(s) with missing values from classification", before - len(frame))
+        return frame, standardize_mode
+
     def run_classification(
-        self, n_clusters: Union[int, str] = "auto", k_range: tuple = (2, 9), random_state: Optional[int] = None,
+        self,
+        n_clusters: Union[int, str] = "auto",
+        k_range: tuple = (2, 9),
+        random_state: Optional[int] = None,
+        feature_families: Optional[list] = None,
+        selected_features: Optional[list] = None,
+        prune_correlation: Optional[float] = None,
+        dataset_mode: str = "time_series",
     ) -> dict:
-        filtered = self.cells_info.set_index("Cell Index").loc[:, data_input.ML_FEATURE_COLUMNS]
-        pca_df = pca_kmeans.compute_pca(filtered, output_dir=self.output_dirs["cell_classification_output"])
+        """PCA + K-means over the chosen feature set.
+
+        `dataset_mode` decides whether frames share one feature space:
+
+        - `"time_series"` (default, and v1's behaviour) pools every frame. This
+          is correct for a movie of one specimen, and required if the result
+          will be tracked -- tracking needs one consistent space across frames.
+        - `"independent_samples"` runs PCA and K-means **per frame**. Use it
+          when the frames are unrelated images, where pooling makes the leading
+          component partly "which image is this": measured on
+          `cp_dataset_puzzle-like_cells` (12 unrelated images), image identity
+          explains 0.601 of PC1's variance under pooling. Cluster labels are
+          then per-frame, so `cluster_1` in one image is unrelated to
+          `cluster_1` in another.
+        """
+        features, standardize_mode = self._feature_frame(feature_families, selected_features)
 
         if isinstance(n_clusters, str) and n_clusters != "auto":
             n_clusters = int(n_clusters)
+        k_range = tuple(k_range)
+        output_dir = self.output_dirs["cell_classification_output"]
 
-        clustering_df = pca_kmeans.cluster_cells_kmeans(
-            pca_df,
-            output_dir=self.output_dirs["cell_classification_output"],
-            n_clusters=n_clusters,
-            k_range=tuple(k_range),
-            random_state=random_state,
-        )
+        if dataset_mode == "independent_samples":
+            frames = pd.Series([str(i).split("_")[0] for i in features.index], index=features.index)
+            parts = []
+            for frame_id, chunk in features.groupby(frames, sort=False):
+                if len(chunk) < 3:
+                    logger.info("Skipping %s: only %d cell(s), too few to cluster", frame_id, len(chunk))
+                    continue
+                chunk_pca = pca_kmeans.compute_pca(
+                    chunk, standardize_mode=standardize_mode, prune_correlation=prune_correlation
+                )
+                parts.append(pca_kmeans.cluster_cells_kmeans(
+                    chunk_pca, n_clusters=n_clusters, k_range=k_range, random_state=random_state
+                ))
+            if not parts:
+                raise ValueError("No frame had enough cells to cluster independently.")
+            clustering_df = pd.concat(parts, ignore_index=True)
+        elif dataset_mode == "time_series":
+            pca_df = pca_kmeans.compute_pca(
+                features,
+                output_dir=output_dir,
+                standardize_mode=standardize_mode,
+                prune_correlation=prune_correlation,
+            )
+            clustering_df = pca_kmeans.cluster_cells_kmeans(
+                pca_df, output_dir=output_dir, n_clusters=n_clusters, k_range=k_range, random_state=random_state,
+            )
+        else:
+            raise ValueError(f"unknown dataset mode {dataset_mode!r}; expected 'time_series' or 'independent_samples'")
+
         clustering_df["modified"] = False
         self.clustering_data = clustering_df
         self._border_cell_cache.clear()
@@ -641,6 +923,11 @@ class EpiQuantAPI:
         return {
             "cluster_sizes": clustering_df["Cell_Type"].value_counts().to_dict(),
             "k_used": int(clustering_df["Cluster_Label"].nunique()),
+            "features_used": list(features.columns),
+            "feature_families": list(feature_families) if feature_families else ["basic"],
+            "standardize_mode": standardize_mode,
+            "dataset_mode": dataset_mode,
+            "cells_used": int(len(features)),
         }
 
     def set_cluster_colors(self, color_map: dict) -> None:
@@ -1170,6 +1457,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-folder", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--classify", action="store_true", help="Run classify + leading-edge + boundary-split tracking")
+    parser.add_argument("--shape", action="store_true", help="Also compute shape/tissue descriptors and exercise every feature mode")
     parser.add_argument("--n-clusters", default="2")
     args = parser.parse_args()
 
@@ -1187,10 +1475,61 @@ if __name__ == "__main__":
     raw_img = api.get_raw_frame_image(first_frame)
     print(f"Raw frame {first_frame} image: {len(raw_img) if raw_img else 0} base64 chars")
 
+    if args.shape:
+        print("\n== shape + tissue descriptors ==")
+        api._run_shape_extraction(
+            include_tissue=True, efd_order=10, n_contour_points=256,
+            smoothing_sigma_fraction=0.02, with_coefficients=True,
+        )
+        assert api.cells_shape is not None, "shape extraction failed, see log above"
+        summary = api.get_shape_feature_summary()
+        for table, block in summary.items():
+            medians = {k: round(v["median"], 3) for k, v in list(block["columns"].items())[:5] if v["median"] is not None}
+            print(f"  {table}: {block['cell_count']} cells, medians {medians} ...")
+
+        options = api.get_feature_options()
+        ready = {name: spec["ready"] for name, spec in options["families"].items()}
+        print(f"  families ready: {ready}")
+        not_ready = {n: s["missing"][:3] for n, s in options["families"].items() if not s["ready"]}
+        print(f"  missing for not-ready families: {not_ready or 'none'}")
+
     if args.classify:
         print("\n== classification ==")
         n_clusters_arg = args.n_clusters if args.n_clusters == "auto" else int(args.n_clusters)
         print(api.run_classification(n_clusters=n_clusters_arg, random_state=42))
+
+        if args.shape:
+            options = api.get_feature_options()["families"]
+            # Families are ADDITIVE: each is stacked on top of basic.
+            for combo in ([], ["hull"], ["lobe"], ["tissue"], ["hull", "lobe"], ["hull", "lobe", "tissue"]):
+                if any(not options[f]["ready"] for f in combo):
+                    print(f"  families {['basic'] + combo}: not ready, skipped")
+                    continue
+                result = api.run_classification(n_clusters=2, random_state=42, feature_families=["basic"] + combo)
+                label = "+".join(["basic"] + combo)
+                print(f"  {label:28} scaler={result['standardize_mode']:7} "
+                      f"{len(result['features_used']):2d} features, {result['cells_used']:5d} cells -> {result['cluster_sizes']}")
+            if options["efd"]["ready"]:
+                efd_result = api.run_classification(n_clusters=2, random_state=42, feature_families=["efd"])
+                print(f"  {'efd (exclusive)':28} scaler={efd_result['standardize_mode']:7} "
+                      f"{len(efd_result['features_used']):2d} features, {efd_result['cells_used']:5d} cells -> {efd_result['cluster_sizes']}")
+                assert efd_result["standardize_mode"] == "none", "EFD must never be standardized"
+                try:
+                    api.run_classification(feature_families=["efd", "hull"], n_clusters=2)
+                    raise AssertionError("EFD must refuse to combine with another family")
+                except ValueError as err:
+                    print(f"  efd exclusivity enforced: {err}")
+            per_image = api.run_classification(
+                n_clusters=2, random_state=42, feature_families=["basic", "hull"],
+                dataset_mode="independent_samples",
+            )
+            print(f"  dataset_mode=independent_samples -> {per_image['cluster_sizes']}")
+            try:
+                api.run_classification(feature_families=["nonsense"])
+            except ValueError as err:
+                print(f"  unknown family rejected: {err}")
+            # Re-run the default so later steps see the expected clustering.
+            api.run_classification(n_clusters=n_clusters_arg, random_state=42)
 
         presets = api.get_palette_presets()
         print(f"Palette presets available: {list(presets.keys())}")

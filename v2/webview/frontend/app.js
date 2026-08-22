@@ -22,6 +22,9 @@ const state = {
   trajectoryFrame: 1,
 
   clusterLegend: [],
+  // Cached get_feature_options() result, refreshed on every entry to Classify
+  // and after shape extraction.
+  featureOptions: null,
   selectedCellForCorrection: null, // {cell_index, cluster_label, cell_type} -- last-clicked cell, informational only
   activeReassignCluster: null, // cluster_label picked as the reassignment target; persists across clicks/frames until toggled off
   selectedTrackCell: null, // {cell_index, cell_id, track_id}
@@ -134,6 +137,7 @@ function enableStep(step) {
 
 function goToStep(step) {
   if (!enabledSteps.has(step)) return;
+  if (step === "classify") populateFeatureOptions();
   document.querySelectorAll(".step-section").forEach((el) => el.classList.remove("active"));
   document.querySelectorAll(".step-btn").forEach((el) => el.classList.remove("active"));
   document.getElementById(`step-${step}`).classList.add("active");
@@ -287,6 +291,7 @@ async function onExtractDone(data) {
   document.getElementById("start-extraction-btn").disabled = false;
   document.getElementById("extract-preview").style.display = "block";
   document.getElementById("extract-next-choices").style.display = "flex";
+  document.getElementById("shape-descriptors").style.display = "block";
   enableStep("classify");
   // Seed the minimum-junction box with the value derived from this project's
   // own junction lengths, so the number shown is the one actually in use.
@@ -298,6 +303,68 @@ async function onExtractDone(data) {
   }
   syncExtractQcPanels();
   await showExtractFrame(state.extractFrame);
+}
+
+async function handleRunShapeExtraction() {
+  const includeTissue = document.getElementById("shape-include-tissue").checked;
+  const withCoefficients = document.getElementById("shape-with-coefficients").checked;
+  const efdOrder = parseInt(document.getElementById("shape-efd-order").value, 10);
+  const contourPoints = parseInt(document.getElementById("shape-contour-points").value, 10);
+  const smoothing = parseFloat(document.getElementById("shape-smoothing").value);
+
+  setStatus("shape-status", "Computing shape descriptors…");
+  document.getElementById("run-shape-btn").disabled = true;
+  try {
+    await window.EpiQuantAPI.start_shape_extraction(
+      includeTissue, efdOrder, contourPoints, smoothing, withCoefficients,
+    );
+  } catch (err) {
+    setStatus("shape-status", `Error: ${err}`, "error");
+    document.getElementById("run-shape-btn").disabled = false;
+  }
+}
+
+function renderShapeSummary(summary) {
+  const host = document.getElementById("shape-summary");
+  host.innerHTML = "";
+  Object.entries(summary || {}).forEach(([table, block]) => {
+    const rows = Object.entries(block.columns)
+      .map(([name, stats]) => {
+        const median = stats.median === null ? "—" : stats.median.toFixed(3);
+        const missing = stats.missing ? ` <span class="tag">${stats.missing} n/a</span>` : "";
+        return `<tr><td>${name}</td><td>${median}</td><td>${missing}</td></tr>`;
+      })
+      .join("");
+    const section = document.createElement("div");
+    // Diagnostics are computed and written to the xlsx but are not offered as
+    // PCA features, so they are named rather than tabulated -- listing them
+    // alongside the selectable ones is what made the retired columns look
+    // pickable.
+    const diagnostics = (block.diagnostics || []).length
+      ? `<p class="hint">Also written to the xlsx, not offered as features:
+         ${block.diagnostics.join(", ")}.</p>`
+      : "";
+    section.innerHTML =
+      `<h4>${table} — ${block.cell_count} cells</h4>` +
+      `<table class="summary-table"><thead><tr><th>descriptor</th><th>median</th><th></th></tr></thead>` +
+      `<tbody>${rows}</tbody></table>` +
+      diagnostics;
+    host.appendChild(section);
+  });
+}
+
+async function onShapeExtractDone(summary) {
+  setStatus("shape-status", "Shape descriptors ready.", "success");
+  document.getElementById("run-shape-btn").disabled = false;
+  renderShapeSummary(summary);
+  // The Classify step may already have been visited, so its mode list has to
+  // be rebuilt now rather than only on first entry.
+  await populateFeatureOptions();
+}
+
+function onShapeExtractError(data) {
+  setStatus("shape-status", `Shape extraction failed: ${data.message}`, "error");
+  document.getElementById("run-shape-btn").disabled = false;
 }
 
 function onExtractError(data) {
@@ -435,6 +502,17 @@ async function afterClassificationReady(result) {
   );
   document.getElementById("classify-results").style.display = "block";
 
+  const used = document.getElementById("classify-features-used");
+  if (used && result.features_used) {
+    const scaler = result.standardize_mode === "none" ? "no standardization" : result.standardize_mode;
+    const pooling = result.dataset_mode === "independent_samples"
+      ? "each image clustered on its own — cluster_1 in one image is unrelated to cluster_1 in another"
+      : "all frames pooled";
+    used.textContent =
+      `${result.features_used.length} features (${(result.feature_families || []).join(" + ")}, ${scaler}), ` +
+      `${result.cells_used} cells, ${pooling}.`;
+  }
+
   await populatePalettePresets();
   await applyPaletteToAllClusters();
   await refreshClusterLegend();
@@ -449,6 +527,116 @@ async function afterClassificationReady(result) {
   enableStep("track");
 }
 
+// Populated from get_feature_options() on every entry to Classify -- not once
+// -- because a user can run shape extraction after already visiting this step,
+// and a cached list would leave the new families greyed out.
+async function populateFeatureOptions() {
+  const options = await window.EpiQuantAPI.get_feature_options();
+  state.featureOptions = options;
+  state.featureSelection = state.featureSelection || {};
+
+  const picker = document.getElementById("feature-families");
+  picker.innerHTML = "";
+  Object.entries(options.families).forEach(([name, spec]) => {
+    const label = document.createElement("label");
+    label.className = "checkbox-label";
+    // `basic` is the always-on base every other family stacks onto, so it is
+    // checked and locked rather than merely checked.
+    const checked = spec.base || (state.checkedFamilies || []).includes(name) ? " checked" : "";
+    const disabled = spec.base || !spec.ready ? " disabled" : "";
+    label.innerHTML =
+      `<input type="checkbox" class="family-checkbox" value="${name}"${checked}${disabled}> ${spec.label}` +
+      (spec.ready ? "" : ' <span class="tag">run shape descriptors first</span>');
+    picker.appendChild(label);
+  });
+  picker.querySelectorAll(".family-checkbox").forEach((el) => {
+    el.addEventListener("change", handleFamilyChange);
+  });
+  handleFamilyChange();
+}
+
+function checkedFamilies() {
+  return Array.from(document.querySelectorAll(".family-checkbox:checked")).map((el) => el.value);
+}
+
+function handleFamilyChange() {
+  const options = state.featureOptions;
+  if (!options) return;
+  let families = checkedFamilies();
+
+  // EFD is exclusive: an orthogonal basis is taken whole and is never
+  // standardized, so it cannot be mixed with the hand-crafted scalars. The
+  // backend enforces this too -- this only keeps the UI honest about it.
+  const efdOn = families.includes("efd");
+  document.querySelectorAll(".family-checkbox").forEach((el) => {
+    if (el.value === "efd") return;
+    const spec = options.families[el.value];
+    el.disabled = efdOn || spec.base || !spec.ready;
+    // Selecting EFD clears the others; deselecting it must bring the base
+    // back, or nothing is selected at all and the next run fails validation
+    // with no visible cause.
+    if (efdOn) el.checked = false;
+    else if (spec.base) el.checked = true;
+  });
+  families = efdOn ? ["efd"] : checkedFamilies();
+  state.checkedFamilies = families;
+
+  const host = document.getElementById("feature-groups");
+  host.innerHTML = "";
+  if (efdOn) {
+    host.innerHTML =
+      `<p class="hint">${options.families.efd.note} All coefficients from the extraction are used;
+       there is nothing to tick, because dropping arbitrary harmonics from a basis is not a
+       meaningful subset.</p>`;
+    return;
+  }
+
+  families.forEach((name) => {
+    const spec = options.families[name];
+    if (!spec.ready || !spec.columns.length) return;
+    const group = document.createElement("fieldset");
+    group.className = "feature-group";
+    group.dataset.family = name;
+    const boxes = spec.columns
+      .map((column) => {
+        const off = spec.default_off.includes(column);
+        const remembered = state.featureSelection[column];
+        const on = remembered === undefined ? !off : remembered;
+        const id = `feature-cb-${column.replace(/[^A-Za-z0-9]/g, "-")}`;
+        // `value` stays the real column name; only the visible text is shortened.
+        const shown = (spec.display && spec.display[column]) || column;
+        return `<label class="checkbox-label" title="${column}"><input type="checkbox" id="${id}" value="${column}"${on ? " checked" : ""}> ${shown}</label>`;
+      })
+      .join("");
+    group.innerHTML =
+      `<legend>${spec.label}</legend>` +
+      `<div class="feature-group-boxes">${boxes}</div>` +
+      (spec.note ? `<p class="hint">${spec.note}</p>` : "") +
+      `<div class="feature-group-actions">
+         <button type="button" class="link-btn" data-action="all">Select all</button>
+         <button type="button" class="link-btn" data-action="none">Unselect all</button>
+       </div>`;
+    host.appendChild(group);
+  });
+
+  host.querySelectorAll(".link-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const group = btn.closest(".feature-group");
+      group.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+        cb.checked = btn.dataset.action === "all";
+        state.featureSelection[cb.value] = cb.checked;
+      });
+    });
+  });
+  host.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+    cb.addEventListener("change", () => { state.featureSelection[cb.value] = cb.checked; });
+  });
+}
+
+function selectedFeatureColumns() {
+  return Array.from(document.querySelectorAll("#feature-groups input[type=checkbox]:checked")).map((el) => el.value);
+}
+
 async function handleRunClassification() {
   const isAuto = document.getElementById("n-clusters-auto").checked;
   const nClusters = isAuto ? "auto" : parseInt(document.getElementById("n-clusters-input").value, 10);
@@ -456,11 +644,24 @@ async function handleRunClassification() {
     parseInt(document.getElementById("k-range-min").value, 10),
     parseInt(document.getElementById("k-range-max").value, 10),
   ];
+  const families = state.checkedFamilies && state.checkedFamilies.length ? state.checkedFamilies : ["basic"];
+  const isEfd = families.includes("efd");
+  const selected = isEfd ? null : selectedFeatureColumns();
+  const datasetMode = document.querySelector("input[name='dataset-mode']:checked").value;
+  const pruneRaw = document.getElementById("prune-correlation").value;
+  const prune = pruneRaw === "" ? null : parseFloat(pruneRaw);
+
+  if (!isEfd && selected.length < 2) {
+    setStatus("classify-status", "Select at least two features.", "error");
+    return;
+  }
 
   setStatus("classify-status", "Running PCA + K-means…");
   document.getElementById("run-classification-btn").disabled = true;
   try {
-    const result = await window.EpiQuantAPI.run_classification(nClusters, kRange, null);
+    const result = await window.EpiQuantAPI.run_classification(
+      nClusters, kRange, null, families, selected, prune, datasetMode,
+    );
     await afterClassificationReady(result);
   } catch (err) {
     setStatus("classify-status", `Error: ${err}`, "error");
@@ -1454,6 +1655,14 @@ function init() {
   document.getElementById("n-clusters-manual").addEventListener("change", updateNClustersModeUI);
   updateNClustersModeUI();
   document.getElementById("run-classification-btn").addEventListener("click", handleRunClassification);
+  document.getElementById("run-shape-btn").addEventListener("click", handleRunShapeExtraction);
+  document.querySelectorAll("input[name='dataset-mode']").forEach((el) => {
+    el.addEventListener("change", () => {
+      document.getElementById("dataset-mode-note").textContent = el.value === "independent_samples"
+        ? "PCA and K-means run per image. Use this for folders of unrelated samples, where pooling makes the leading component partly 'which image is this'. Not suitable if you will track these cells."
+        : "Pooled into one feature space. Required if you will track these cells.";
+    });
+  });
   document.getElementById("palette-preset-select").addEventListener("change", async () => {
     await applyPaletteToAllClusters();
     await refreshClusterLegend();
@@ -1567,6 +1776,8 @@ function init() {
   window.onProgress = onProgress;
   window.onExtractDone = onExtractDone;
   window.onExtractError = onExtractError;
+  window.onShapeExtractDone = onShapeExtractDone;
+  window.onShapeExtractError = onShapeExtractError;
   window.onTrackDone = onTrackDone;
   window.onRetrackDone = onRetrackDone;
   window.onRetrackError = onRetrackError;
