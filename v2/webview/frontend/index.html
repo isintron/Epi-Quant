@@ -344,6 +344,49 @@
     <h2>Track Cells</h2>
     <div id="track-mode-options" class="field-row"></div>
     <div class="field-row">
+      <label>Match cells by</label>
+      <label><input type="radio" name="track-cost-mode" value="hybrid" checked> Centroid + mask overlap</label>
+      <label><input type="radio" name="track-cost-mode" value="centroid"> Centroid only</label>
+      <label><input type="radio" name="track-cost-mode" value="overlap"> Mask overlap (IoU) only</label>
+      <button id="overlap-help-btn" class="help-btn" aria-label="How are cells matched between frames?">?</button>
+    </div>
+    <div class="field-row">
+      <label>Mask-overlap weight
+        <input type="number" id="overlap-weight-input" class="small-input" min="0" max="50" step="0.1" value="1">
+      </label>
+      <label><input type="checkbox" id="motion-compensation-input"> Motion compensation</label>
+      <label><input type="checkbox" id="gap-closing-input"> Close 1-frame gaps</label>
+      <label><input type="checkbox" id="drift-register-input"> Register masks (drift)</label>
+    </div>
+    <div id="registration-status" class="status-line"></div>
+    <div id="overlap-help-popover" class="popover" style="display:none">
+      <div class="popover-head">
+        <strong>How cells are matched between frames</strong>
+        <button id="overlap-help-close" class="help-btn" aria-label="Close">&times;</button>
+      </div>
+      <p><code>cost = centroid distance + weight &times; (1 &minus; IoU) &times; cell diameter</code></p>
+      <p>The <strong>mask-overlap</strong> term asks how much the two outlines actually overlap. A cell
+         landing on its own previous outline pays nothing; one that doesn't overlap at all pays a full
+         cell diameter. It decides the near-ties where centroid distance has no information left.
+         <em>Centroid only</em> sets the weight to 0; <em>Mask overlap only</em> drops the distance term.
+         Either way the plausible-displacement limit still applies, so a distant cell can't win on a
+         sliver of overlap.</p>
+      <p><strong>Motion compensation</strong> predicts each cell forward from its own previous
+         displacement instead of assuming it stays put, then measures from the prediction. It suits a
+         movie with real coherent drift &mdash; a translating tissue, or stage drift.</p>
+      <p><strong>Close 1-frame gaps</strong> lets a track that loses its cell for one frame re-attach
+         instead of ending and a new ID being issued. It runs as a second matching pass over whole track
+         segments, after the frame-to-frame pass &mdash; the same two-stage structure u-track and TrackMate
+         use. It changes track counts, and therefore cell-loss&nbsp;%.</p>
+      <p><strong>Measured on a germband dataset, the default already wins</strong> (wrong-link rate):
+         centroid&nbsp;+&nbsp;overlap <strong>4.9%</strong>, IoU-only 5.0%, centroid-only 5.5%,
+         with motion compensation 9.6%. The swaps there come from about 8&nbsp;px of per-frame centroid
+         jitter with neighbours only 26&nbsp;px away &mdash; an ambiguity none of these terms resolves.
+         Motion compensation actively hurts because that jitter isn't persistent, so extrapolating it
+         adds noise; it suits a movie that genuinely drifts. <strong>Try these on your own data; don't
+         assume they help.</strong></p>
+    </div>
+    <div class="field-row">
       <button id="start-tracking-btn" class="primary-btn">Track Cells</button>
     </div>
     <div class="progress-bar" id="track-progress-bar" style="display:none"><div class="progress-fill"></div></div>
@@ -377,6 +420,7 @@
       <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="identity"> Cell identity</label>
       <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="environment"> Environment score</label>
       <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="lifecycle"> Track lifecycle</label>
+      <label class="radio-label"><input type="radio" name="correct-track-color-mode" value="agreement"> Link agreement</label>
     </div>
     <div class="field-row" id="correct-track-uniform-colors">
       <label>Matched color <input type="color" id="matched-color-input" value="#ffd633"></label>
@@ -404,8 +448,15 @@
           <option value="BrBG">BrBG</option>
         </select>
       </label>
+      <label>Clean above
+        <input type="number" id="environment-deadband-input" class="small-input" min="0" max="1" step="0.05" value="0.75">
+      </label>
+      <label>Offer repair below
+        <input type="number" id="environment-repair-input" class="small-input" min="0" max="1" step="0.05" value="0.5">
+      </label>
       <label class="radio-label"><input type="radio" name="correct-track-env-direction" value="prev" checked> vs previous</label>
       <label class="radio-label"><input type="radio" name="correct-track-env-direction" value="next"> vs next</label>
+      <label class="radio-label"><input type="radio" name="correct-track-env-direction" value="both"> vs both (worst)</label>
     </div>
     <p class="hint" id="correct-track-environment-hint" style="display:none">
       Dark = this cell's neighbours changed a lot between the two frames — worth inspecting for a
@@ -413,6 +464,43 @@
       error: a division or delamination lowers it legitimately. Uncoloured cells can't be scored
       (unmatched, or the track is absent in the compared frame).
     </p>
+    <div class="field-row" id="correct-track-agreement" style="display:none">
+      <span class="control-group-label">Disagrees with overlap reference</span>
+      <label>Agrees <input type="color" id="agreement-agrees-color-input" value="#4a90d9"></label>
+      <label>Disagrees <input type="color" id="agreement-disagrees-color-input" value="#ff3b30"></label>
+      <label>Can't judge <input type="color" id="agreement-unjudgeable-color-input" value="#a06bd4"></label>
+      <label>Broken <input type="color" id="agreement-broken-color-input" value="#ffcc00"></label>
+      <label class="checkbox-label"><input type="checkbox" id="agreement-register-input" checked> Registered reference</label>
+      <button id="agreement-help-btn" class="help-btn" aria-label="What does this show?">?</button>
+    </div>
+    <div id="agreement-counts" class="status-line"></div>
+    <div id="agreement-help-popover" class="popover" style="display:none">
+      <div class="popover-head">
+        <strong>Link agreement &mdash; not an error map</strong>
+        <button id="agreement-help-close" class="help-btn" aria-label="Close">&times;</button>
+      </div>
+      <p>Each cell is compared against <strong>its highest-overlap successor</strong> in the next frame.
+         Red means this tracking chose a <em>different</em> cell than mask overlap would have.
+         <strong>That is a disagreement, not an error</strong> &mdash; overlap is a reference, not the truth.</p>
+      <p><strong>The reference is biased, in a known direction.</strong> It favours costs that follow mask
+         overlap and penalises costs that predict motion: on a germband dataset the correlation between
+         cost and overlap is &minus;0.85 without motion prediction but only &minus;0.71 with it. A change
+         that moved links <em>toward</em> the truth and away from the biggest-overlap cell would look worse
+         here, and this view could not tell the difference.</p>
+      <p><strong>Violet cells could not be judged at all</strong> &mdash; their best overlap is too low for
+         "which cell is the successor" to have an answer. That is about a quarter of cells on a germband
+         dataset, so grey is common and is not a grade.</p>
+      <p><strong>Registered reference.</strong> If the tissue drifts as a whole, comparing masks where they
+         sit exaggerates every disagreement. On a germband dataset the drift is ~6.9&nbsp;px per frame
+         against a 13&nbsp;px cell radius, and shifting the masks by it takes the reference's own median
+         self-overlap from <strong>0.377 to 0.709</strong> &mdash; unregistered it is barely above its own
+         0.3 usability threshold. Tissue Analyzer registers before matching for this reason. The same
+         tracking scores 4.9% or 14.0% disagreement depending only on this switch, so it is shown, not
+         hidden.</p>
+      <p>Click a flagged cell to see <strong>both overlaps</strong> &mdash; the reference's pick and the one
+         this tracking chose. Most disagreements are near-ties: 65% of them differ by less than 0.15 IoU.</p>
+      <p>Use it to find cells worth <em>looking at</em>, then judge them with the correction tools below.</p>
+    </div>
     <div class="field-row" id="correct-track-lifecycle" style="display:none">
       <label>Lost at next frame <input type="color" id="lifecycle-lost-color-input" value="#ff3b30"></label>
       <label>New since previous <input type="color" id="lifecycle-new-color-input" value="#34c759"></label>
@@ -451,7 +539,7 @@
     <ul id="correct-track-suggest-list" class="status-line" style="display:none"></ul>
     <div id="correct-track-suggest-check" class="field-row" style="display:none">
       <button id="check-suggest-holds-btn" class="secondary-btn">Check how far this holds →</button>
-      <label class="checkbox-label"><input type="checkbox" id="restrict-unmatched-checkbox" checked> Pair with unmatched cells only</label>
+      <label class="checkbox-label"><input type="checkbox" id="restrict-unmatched-checkbox"> Pair with unmatched cells only</label>
     </div>
     <div id="suggest-check-result" class="status-line"></div>
     <ul id="suggest-check-moves-list" class="status-line" style="display:none"></ul>
@@ -517,6 +605,70 @@
     <div class="render-mode-controls">
       <label class="radio-label"><input type="radio" name="trajectory-render-mode" value="mask" checked> Filled mask</label>
       <label class="radio-label"><input type="radio" name="trajectory-render-mode" value="outline"> Outlines</label>
+    </div>
+    <div class="render-mode-controls">
+      <span class="control-group-label">Colour</span>
+      <label class="radio-label"><input type="radio" name="trajectory-color-mode" value="highlight" checked> Single track</label>
+      <label class="radio-label"><input type="radio" name="trajectory-color-mode" value="dynamics"> Cell dynamics</label>
+    </div>
+    <div class="field-row" id="correct-track-dynamics" style="display:none">
+      <label>Division <input type="color" id="dynamics-division-color-input" value="#34c759"></label>
+      <label>Delamination <input type="color" id="dynamics-delamination-color-input" value="#ff3b30"></label>
+      <label>Rearrangement (T1) <input type="color" id="dynamics-t1-color-input" value="#ffd633"></label>
+      <label class="checkbox-label"><input type="checkbox" id="dynamics-axes-checkbox" checked> T1 axes</label>
+      <label>Show
+        <select id="t1-axis-filter-select">
+          <option value="all" selected>all</option>
+          <option value="persistent_unjudgeable">settled + can't judge</option>
+          <option value="persistent">settled only</option>
+        </select>
+      </label>
+      <label>Hysteresis
+        <input type="number" id="t1-enter-input" class="small-input" min="0" max="200" step="1" placeholder="off">
+        /
+        <input type="number" id="t1-exit-input" class="small-input" min="0" max="200" step="1" placeholder="off">
+      </label>
+      <label>T1 must hold
+        <input type="number" id="t1-persist-input" class="small-input" min="0" max="10" step="1" value="1">
+        frame(s)
+      </label>
+      <button id="save-lineage-btn" class="secondary-btn">Save lineage sheet</button>
+      <button id="dynamics-help-btn" class="help-btn" aria-label="What do these mean?">?</button>
+    </div>
+    <div id="dynamics-t1-counts" class="status-line"></div>
+    <div id="dynamics-help-popover" class="popover" style="display:none">
+      <div class="popover-head">
+        <strong>Cell dynamics</strong>
+        <button id="dynamics-help-close" class="help-btn" aria-label="Close">&times;</button>
+      </div>
+      <p><strong>Solid = you confirmed it. Faded = an unconfirmed candidate.</strong> Click a cell to
+         see the evidence and accept or reject it; only confirmed events enter the lineage sheet.</p>
+      <dl>
+        <dt>Division</dt>
+        <dd>A track ends while two mutually-adjacent tracks begin beside it, their areas summing to
+            roughly the mother's. <strong>Inferred from geometry and unvalidated</strong> &mdash; there is no
+            reference implementation to check against, because TissueMiner reads divisions from a
+            mask Tissue Analyzer paints rather than detecting them.</dd>
+        <dt>Delamination</dt>
+        <dd>A track ends away from the tissue margin with the cell's area shrinking AND ending small
+            relative to its neighbours. Both terms are needed: a cell that vanishes at full size is a
+            broken track, not a cell leaving the epithelium.</dd>
+        <dt>Rearrangement (T1)</dt>
+        <dd>Neighbour exchange &mdash; two cells lose contact while two others gain it. Shown with its
+            orientation axis (blue = bond gained, orange = bond lost); the two reinforce, so a
+            regional mean gives the direction of intercalation. <strong>Hysteresis</strong> takes two
+            numbers, enter/exit (try 25 / 15): a contact counts once it exceeds <em>enter</em>, stops
+            once it drops below <em>exit</em>, and holds its previous verdict in between, so a shrinking
+            bond cannot flicker. A single hard threshold does the opposite &mdash; measured at 20&nbsp;px
+            it raised the one-frame reversal rate from 21% to 32%, worse than no filter. An exchange that has not
+            <em>settled</em> renders faded, with a dashed axis: on a germband dataset <strong>21% of raw
+            events reverse within one frame</strong>. Raise <em>T1 must hold</em> to demand more frames;
+            <strong>0 shows every raw event</strong>, which is what TissueMiner counts. Nothing is ever
+            hidden &mdash; both totals are shown, because a one-frame flicker may be noise or may be a
+            real reversible exchange, and this cannot tell them apart.</dd>
+      </dl>
+      <p class="hint">Cells at the image border are excluded from delamination before anything else
+         is tested &mdash; they left the field of view rather than the tissue.</p>
     </div>
     <div class="image-click-wrap"><img id="trajectory-overlay-img" class="frame-preview"></div>
     <div id="trajectory-status" class="status-line"></div>

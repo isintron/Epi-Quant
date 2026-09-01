@@ -23,7 +23,9 @@ import numpy as np
 from scipy import ndimage
 
 
-def build_neighbor_graph(fill_labels: np.ndarray, dilation_px: int = 2) -> Dict[int, Set[int]]:
+def build_neighbor_graph(
+    fill_labels: np.ndarray, dilation_px: int = 2, return_weights: bool = False,
+):
     """Return `{cell_id: {neighbor_cell_id, ...}}` for every non-zero label
     in `fill_labels`.
 
@@ -43,10 +45,28 @@ def build_neighbor_graph(fill_labels: np.ndarray, dilation_px: int = 2) -> Dict[
     `scipy.ndimage.find_objects`) rather than dilating the whole frame per
     label, so per-cell cost scales with that cell's own footprint size, not
     the frame's total cell count.
+
+    `return_weights=True` returns `{cell_id: {neighbor_id: strength}}` instead,
+    where strength is the neighbour's pixel count inside the dilated footprint
+    -- a proxy for contact length.
+
+    **Why the weight matters.** TissueMiner derives neighbours from a
+    `directed_bonds` half-edge table: a polygonal mesh where two cells are
+    neighbours iff they share an edge. That is combinatorial, with no marginal
+    cases. Dilation admits a continuum instead -- a 2 px contact and a 47 px
+    contact are both simply "neighbour" -- and the T1 flicker lives in exactly
+    that continuum. Measured on `embryos_GBE_GAP43`, contacts that disappear
+    are systematically weak: median 34 px of dilated contact against 47 px for
+    contacts that survive, with 49% of disappearing contacts below the 25th
+    percentile of surviving ones. See `topology.contacts_in_track_space`'s
+    hysteresis, which is what consumes these weights.
+
+    Default behaviour is unchanged and asserted identical in the self-test.
     """
     graph: Dict[int, Set[int]] = {}
+    weights: Dict[int, Dict[int, int]] = {}
     if fill_labels.size == 0:
-        return graph
+        return weights if return_weights else graph
 
     height, width = fill_labels.shape
     objects = ndimage.find_objects(fill_labels)
@@ -64,13 +84,32 @@ def build_neighbor_graph(fill_labels: np.ndarray, dilation_px: int = 2) -> Dict[
         window = fill_labels[r0:r1, c0:c1]
         cell_mask = window == label
         dilated_mask = ndimage.binary_dilation(cell_mask, iterations=dilation_px)
-        neighbor_labels = set(np.unique(window[dilated_mask]).tolist()) - {0, label}
+        touched = window[dilated_mask]
+        found, counts = np.unique(touched, return_counts=True)
+        neighbor_labels = set(found.tolist()) - {0, label}
 
         graph.setdefault(label, set()).update(neighbor_labels)
         for neighbor in neighbor_labels:
             graph.setdefault(neighbor, set()).add(label)
 
-    return graph
+        if return_weights:
+            # Every label gets an entry, isolated ones included, so the weighted
+            # form has exactly the same key set as the unweighted graph. Without
+            # this, a cell with no neighbours is present in one and absent from
+            # the other, and any caller that iterates both disagrees about which
+            # cells exist.
+            weights.setdefault(label, {})
+            for neighbor, count in zip(found.tolist(), counts.tolist()):
+                if neighbor in (0, label):
+                    continue
+                # Symmetric by construction: the pair's strength is the larger
+                # of the two one-sided counts, so A->B and B->A never disagree
+                # and a hysteresis test cannot depend on iteration order.
+                strength = max(int(count), weights.get(label, {}).get(neighbor, 0))
+                weights.setdefault(label, {})[neighbor] = strength
+                weights.setdefault(neighbor, {})[label] = strength
+
+    return weights if return_weights else graph
 
 
 def environment_scores(
@@ -167,6 +206,17 @@ if __name__ == "__main__":
     assert graph[3] == set(), f"expected C to have no neighbors, got {graph[3]}"
     assert graph[4] == set(), f"expected D to have no neighbors, got {graph[4]}"
     print("Neighbor-graph assertions passed.")
+
+    # --- weighted form: identical topology, plus contact strength
+    weighted = build_neighbor_graph(grid, return_weights=True)
+    assert {k: set(v) for k, v in weighted.items()} == {k: set(v) for k, v in graph.items()}, (
+        "return_weights must not change WHICH cells are neighbours, only add strengths")
+    for cell, neighbours in weighted.items():
+        for neighbour, strength in neighbours.items():
+            assert strength > 0, (cell, neighbour, strength)
+            assert weighted[neighbour][cell] == strength, "contact strength must be symmetric"
+    print("Weighted form: same topology, symmetric strengths, isolated cells kept:",
+          {k: dict(v) for k, v in sorted(weighted.items())})
 
     # --- environment_scores -------------------------------------------------
     # Cell of interest is track 100. At the current frame it neighbors tracks

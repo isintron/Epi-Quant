@@ -27,6 +27,13 @@
     trackNumbers: [1, 2, 3, 4, 5],
     hasLeadingEdge: false,
     hasShape: false,
+    trackingCost: { mode: "hybrid", overlap_weight: 1.0, centroid_weight: 1.0,
+                    motion_compensation: false, max_frame_gap: 0, drift_mode: "none" },
+    t1PersistFrames: 1,
+    t1Enter: null, t1Exit: null, t1AxisFilter: "all",
+    registerReference: true,
+    deadBand: 0.75,
+    repairThreshold: 0.5,
   };
 
   function delay(ms) {
@@ -153,6 +160,50 @@
     },
     async get_qc_metric_names() {
       return ["junction_contrast", "boundary_contrast", "morphology", "neighbor_count", "measurement_failures"];
+    },
+    async get_tracking_cost() {
+      return { ...mockState.trackingCost, default_overlap_weight: 1.0 };
+    },
+    async set_tracking_cost(mode, overlapWeight, motionCompensation, maxFrameGap, driftMode) {
+      if (driftMode) mockState.trackingCost.drift_mode = driftMode;
+      if (maxFrameGap !== null && maxFrameGap !== undefined) {
+        mockState.trackingCost.max_frame_gap = Math.max(0, maxFrameGap);
+      }
+      if (overlapWeight !== null && overlapWeight !== undefined && !Number.isNaN(overlapWeight)) {
+        mockState.trackingCost.overlap_weight = Math.max(0, overlapWeight);
+      }
+      if (mode) {
+        mockState.trackingCost.mode = mode;
+        mockState.trackingCost.centroid_weight = mode === "overlap" ? 0 : 1;
+        if (mode === "centroid") mockState.trackingCost.overlap_weight = 0;
+        else if (mockState.trackingCost.overlap_weight === 0) mockState.trackingCost.overlap_weight = 1;
+      }
+      if (motionCompensation !== null && motionCompensation !== undefined) {
+        mockState.trackingCost.motion_compensation = !!motionCompensation;
+      }
+      return { ...mockState.trackingCost, default_overlap_weight: 1.0 };
+    },
+    async get_t1_persistence() {
+      return { value: mockState.t1PersistFrames, enter_px: mockState.t1Enter,
+               exit_px: mockState.t1Exit, axis_filter: mockState.t1AxisFilter };
+    },
+    async set_t1_hysteresis(enterPx, exitPx) {
+      if (enterPx == null || exitPx == null) { mockState.t1Enter = mockState.t1Exit = null; }
+      else {
+        // The real backend REJECTS enter <= exit; a mock that accepted it would
+        // hide the error path the UI has to handle.
+        if (enterPx <= exitPx) throw new Error(`enter_px (${enterPx}) must exceed exit_px (${exitPx})`);
+        mockState.t1Enter = enterPx; mockState.t1Exit = exitPx;
+      }
+      return mockApi.get_t1_persistence();
+    },
+    async set_t1_axis_filter(mode) {
+      mockState.t1AxisFilter = mode;
+      return mockApi.get_t1_persistence();
+    },
+    async set_t1_persistence(value) {
+      mockState.t1PersistFrames = Math.max(0, value || 0);
+      return { value: mockState.t1PersistFrames };
     },
     async get_junction_min_px() {
       return { value: 21, auto: 21, is_override: false };
@@ -291,8 +342,10 @@
     },
     async suggest_match_candidates(frame, _cellIndex, _topK) {
       return { candidates: [
-        { track_id: 2, cell_index: `Cell${frame - 1}_2`, distance: 4.2 },
-        { track_id: 3, cell_index: `Cell${frame - 1}_3`, distance: 11.7 },
+        { track_id: 2, cell_index: `Cell${frame - 1}_2`, distance: 4.2,
+          status: "matched", current_cell: `Cell${frame}_7`, swap_gain: 12.5 },
+        { track_id: 3, cell_index: `Cell${frame - 1}_3`, distance: 11.7,
+          status: "unmatched", current_cell: null, swap_gain: null },
       ] };
     },
     async compute_propagation_stop_frame(frame, _oldId, _newId, _maxFramesAhead) {
@@ -319,6 +372,102 @@
     },
     async set_track_colors(_matchedColor, _unmatchedColor) {
       return null;
+    },
+    async set_dynamics_colors(_d, _x, _t) {
+      return null;
+    },
+    async get_dynamics_candidates(frame) {
+      // Mirrors the real shape, including an UNCONFIRMED candidate -- a mock
+      // that only ever returns a happy path has hidden real bugs before.
+      return {
+        divisions: [{ type: "division", frame, mother: 4, daughters: [11, 12],
+                      evidence: { area_ratio: 0.98, daughter_distances: [4.5, 5.1], daughters_adjacent: true } }],
+        delaminations: [{ type: "delamination", frame, track: 7,
+                          evidence: { area_slope_px_per_frame: -31.0, final_area: 90, final_area_vs_typical: 0.24 } }],
+        // Cell 3's exchange settles; cell 9's reverses next frame. Both are
+        // returned -- the transient one must render faded with a dashed axis,
+        // and a mock that only shows the settled case would hide that path.
+        t1: {
+          counts: { 3: { gained: 1, lost: 0 }, 9: { gained: 1, lost: 0 } },
+          counts_persistent: mockState.t1PersistFrames > 0
+            ? { 3: { gained: 1, lost: 0 } }
+            : { 3: { gained: 1, lost: 0 }, 9: { gained: 1, lost: 0 } },
+          axes: [
+            { center: [20, 20], phi: 0.4, type: "gain", persistent: true },
+            { center: [40, 30], phi: 1.2, type: "loss", persistent: mockState.t1PersistFrames === 0 },
+          ],
+          gained: 2, lost: 1,
+          gained_persistent: mockState.t1PersistFrames > 0 ? 1 : 2,
+          lost_persistent: 1,
+          gained_unjudgeable: mockState.t1PersistFrames > 1 ? 1 : 0,
+          lost_unjudgeable: 0,
+          persist_frames: mockState.t1PersistFrames,
+        },
+        confirmed: [], rejected: [], frame,
+      };
+    },
+    async get_t1_events(frame, _direction) {
+      return (await mockApi.get_dynamics_candidates(frame)).t1;
+    },
+    async get_registration_status() {
+      return { register: true, applied: mockState.registerReference, median_drift_px: 6.97,
+               median_cell_radius_px: 13.0, ratio: 0.536, threshold: 0.2,
+               enabled: mockState.registerReference };
+    },
+    async set_register_reference(enabled) {
+      mockState.registerReference = !!enabled;
+      return mockApi.get_registration_status();
+    },
+    async get_environment_thresholds() {
+      return { dead_band: mockState.deadBand, repair_threshold: mockState.repairThreshold };
+    },
+    async set_environment_thresholds(deadBand, repairThreshold) {
+      if (deadBand !== null && deadBand !== undefined && !Number.isNaN(deadBand)) mockState.deadBand = deadBand;
+      if (repairThreshold !== null && repairThreshold !== undefined && !Number.isNaN(repairThreshold)) {
+        mockState.repairThreshold = repairThreshold;
+      }
+      return mockApi.get_environment_thresholds();
+    },
+    async get_environment_repair_candidates(_frame, _direction) {
+      return { candidates: [{ label: 3, score: 0.33 }, { label: 9, score: 0.5 }],
+               threshold: mockState.repairThreshold, flagged_total: 4, n: 40 };
+    },
+    async get_link_agreement(frame) {
+      // The mock must be able to produce the SILENT-FAILURE paths too, or it
+      // hides exactly the class of bug this fix addresses. Frame 19 is the last
+      // frame in `frameNumbers`, so it has no successor.
+      if (frame >= 19) {
+        return { states: {}, detail: {}, counts: {}, reason: "last_frame",
+                 message: `Frame ${frame} is the last frame - there is no next frame to compare `
+                          + `against, so no link can be judged here.` };
+      }
+      // Deliberately includes the unjudgeable and broken states: a mock that
+      // only ever returns agrees/disagrees would hide the very case the
+      // overlay exists to render honestly.
+      // Both IoUs travel with each verdict; the disagreeing cell is a NEAR-TIE
+      // (0.301 vs 0.231), which is what the real data mostly contains. A mock
+      // showing a decisive disagreement would misrepresent the common case.
+      return {
+        states: { 1: "agrees", 2: "agrees", 3: "disagrees", 4: "unjudgeable", 5: "broken" },
+        detail: {
+          1: { state: "agrees", reference_iou: 0.72, tracker_iou: 0.72 },
+          2: { state: "agrees", reference_iou: 0.66, tracker_iou: 0.66 },
+          3: { state: "disagrees", reference_iou: 0.301, tracker_iou: 0.231 },
+          4: { state: "unjudgeable", reference_iou: 0.12, tracker_iou: 0.09 },
+          5: { state: "broken", reference_iou: 0.55, tracker_iou: null },
+        },
+        counts: { agrees: 2, disagrees: 1, unjudgeable: 1, broken: 1 },
+        registered: mockState.registerReference,
+      };
+    },
+    async set_agreement_colors(_a, _d, _u, _b) {
+      return null;
+    },
+    async set_event_decision(key, decision) {
+      return { confirmed: decision === "confirm" ? [key] : [], rejected: decision === "reject" ? [key] : [] };
+    },
+    async save_lineage() {
+      return { path: "/mock/cell_lineage.xlsx", tracks: 414, divisions: 0, delaminations: 1 };
     },
     async set_lifecycle_colors(_lostColor, _newColor, _bothColor) {
       return null;

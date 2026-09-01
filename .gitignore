@@ -6,12 +6,14 @@
 *.code-workspace
 bibliography/
 figures/
-人机协同点击测试指南.md
+rounds/
+docs/
 
 # Claude
 .claude/
 CLAUDE.md
 CLAUDE.local.md
+人机协同点击测试指南.md
 
 # Python
 __pycache__/

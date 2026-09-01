@@ -113,7 +113,8 @@ def _lut_256(name: str) -> np.ndarray:
     return (np.array([cmap(i / 255.0)[:3] for i in range(256)]) * 255).round().astype(np.uint8)
 
 
-def continuous_lut_colors(values: dict, lut_name: str = "viridis") -> dict:
+def continuous_lut_colors(values: dict, lut_name: str = "viridis",
+                          dead_band: Optional[float] = None) -> dict:
     """Map `{key: score}` to `{key: (r, g, b)}` through `lut_name`, with a
     **fixed 0->1 range**.
 
@@ -127,7 +128,23 @@ def continuous_lut_colors(values: dict, lut_name: str = "viridis") -> dict:
     lut = _lut_256(lut_name)
     colors = {}
     for key, value in values.items():
-        index = int(round(min(1.0, max(0.0, float(value))) * 255))
+        score = float(value)
+        if dead_band is not None and score >= dead_band:
+            # Above the dead band the cell is CLEAN and is not tinted at all,
+            # so the base image shows through. Tissue Analyzer's rule
+            # (`take_decision`, sensitivity 0.75) is to ignore a cell entirely
+            # when both directions score >= 0.75, with the comment that it "has
+            # most likely changed one or two neighbors, no reason to worry" --
+            # 0.75 is exactly the value at which losing a single neighbour never
+            # flags (0.750/0.800/0.833/0.857/0.875 for 4-8 neighbours).
+            #
+            # Without it, a continuous LUT darkens anything below 1.0: measured
+            # on `embryos_GBE_GAP43`, 64.8% of cell-frames render as "somewhat
+            # dark" against 22.5% under TA's rule, because 42.2% sit in
+            # [0.75, 1.0) -- a band TA classes as clean. That band was the whole
+            # of the reported over-sensitivity.
+            continue
+        index = int(round(min(1.0, max(0.0, score)) * 255))
         colors[key] = tuple(int(c) for c in lut[index])
     return colors
 
@@ -273,9 +290,15 @@ def render_tracking_overlay(
     label_font_size: int = 10,
     environment_scores: Optional[dict] = None,
     environment_lut: str = "viridis",
+    environment_dead_band: Optional[float] = None,
     lifecycle_states: Optional[dict] = None,
     lifecycle_colors: Optional[dict] = None,
     tint_other_cells: bool = False,
+    dynamics_states: Optional[dict] = None,
+    dynamics_colors: Optional[dict] = None,
+    nematic_axes: Optional[list] = None,
+    agreement_states: Optional[dict] = None,
+    agreement_colors: Optional[dict] = None,
 ) -> Image.Image:
     """Tint each cell by whether it's matched (present in `tracking_data`'s
     `Frame{frame_number}` column) or unmatched, generalizing v1's
@@ -340,7 +363,22 @@ def render_tracking_overlay(
 
     environment_rgb: dict = {}
     if track_color_mode == "environment":
-        environment_rgb = continuous_lut_colors(environment_scores or {}, environment_lut)
+        environment_rgb = continuous_lut_colors(
+            environment_scores or {}, environment_lut, dead_band=environment_dead_band)
+
+    dynamics_rgb: dict = {}
+    if track_color_mode == "dynamics":
+        dynamics_rgb = {
+            state: _hex_to_rgb(hex_color)
+            for state, hex_color in (dynamics_colors or {}).items()
+        }
+
+    agreement_rgb: dict = {}
+    if track_color_mode == "agreement":
+        agreement_rgb = {
+            state: _hex_to_rgb(hex_color)
+            for state, hex_color in (agreement_colors or {}).items()
+        }
 
     lifecycle_rgb: dict = {}
     if track_color_mode == "lifecycle":
@@ -362,6 +400,34 @@ def render_tracking_overlay(
             # deliberately NOT colored as if they scored 0.
             if cell_id in environment_rgb:
                 img[outlines == cell_id] = environment_rgb[cell_id]
+        elif track_color_mode == "dynamics":
+            # `{raw_label: {"event": "division"|"delamination"|"t1",
+            #               "confirmed": bool}}`. A confirmed event is painted
+            # solid; an unconfirmed CANDIDATE is dimmed towards the base image,
+            # so the two are never mistaken for each other -- the whole point
+            # of the curation workflow is that the detector proposes and a
+            # human decides.
+            entry = (dynamics_states or {}).get(cell_id)
+            if entry is not None and entry.get("event") in dynamics_rgb:
+                colour = np.array(dynamics_rgb[entry["event"]], dtype=float)
+                if not entry.get("confirmed"):
+                    region = img[outlines == cell_id].astype(float)
+                    colour = 0.45 * colour + 0.55 * region.mean(axis=0)
+                img[outlines == cell_id] = colour.round().astype(np.uint8)
+            elif tint_other_cells:
+                img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)
+        elif track_color_mode == "agreement":
+            # `{raw_label: "agrees"|"disagrees"|"unjudgeable"|"broken"}` from
+            # `tracking_benchmark.classify_links`. THREE meaningful states, and
+            # the unjudgeable one must be visible: on `embryos_GBE_GAP43` about
+            # a quarter of cells cannot be judged by the overlap reference at
+            # all, and painting them like agreeing cells would claim a verdict
+            # that was never reached.
+            state = (agreement_states or {}).get(cell_id)
+            if state is not None and state in agreement_rgb:
+                img[outlines == cell_id] = agreement_rgb[state]
+            elif tint_other_cells:
+                img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)
         elif track_color_mode == "lifecycle":
             state = (lifecycle_states or {}).get(cell_index)
             if state is not None and state in lifecycle_rgb:
@@ -379,8 +445,34 @@ def render_tracking_overlay(
             labels.append((cx, cy, str(track_id) if is_matched else str(cell_id)))
 
     pil_img = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil_img) if (label_cells or nematic_axes) else None
+
+    if nematic_axes:
+        # T1 orientation, drawn as a headless axis (both directions from the
+        # centre) because a nematic has no arrow -- see
+        # `topology.detect_t1_transitions`.
+        #
+        # An axis whose exchange has not SETTLED (`persistent` False, from
+        # `topology.annotate_persistence`) is drawn thin and dashed rather than
+        # solid, the axis-level counterpart of dimming an unconfirmed cell
+        # above. On `embryos_GBE_GAP43` 21% of raw events reverse within one
+        # frame, so this is the difference between a rearrangement and a
+        # flicker -- and the two must not look alike.
+        for axis in nematic_axes:
+            cx, cy = axis["center"]
+            half = axis.get("length", 12) / 2.0
+            dx, dy = half * np.cos(axis["phi"]), half * np.sin(axis["phi"])
+            colour = axis.get("color", "#ffffff")
+            if axis.get("persistent", True):
+                draw.line([(cx - dx, cy - dy), (cx + dx, cy + dy)], fill=colour, width=2)
+                continue
+            for start, end in ((-1.0, -0.45), (-0.15, 0.15), (0.45, 1.0)):
+                draw.line(
+                    [(cx + start * dx, cy + start * dy), (cx + end * dx, cy + end * dy)],
+                    fill=colour, width=1,
+                )
+
     if label_cells:
-        draw = ImageDraw.Draw(pil_img)
         font = ImageFont.load_default(size=label_font_size)
         for cx, cy, text in labels:
             draw.text((cx, cy), text, fill="white", font=font)

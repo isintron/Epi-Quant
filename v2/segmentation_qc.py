@@ -96,6 +96,28 @@ QC_METRIC_DISPLAY = {
 _HEXAGONAL_NEIGHBORS = 6
 
 
+def split_junction_scores(scores: Dict[tuple, float]) -> tuple:
+    """Split `junction_contrast`'s output into `(cell_cell, free_edge)`.
+
+    The two are NOT comparable and must never share a colour scale or a flag
+    threshold. A cell-cell junction has a cell on both sides, so a dark border
+    means a boundary drawn where no membrane exists -- a segmentation error.
+    A free edge only means "the mask stops here", and whether that is a real
+    tissue margin or simply where the segmentation was cropped is not
+    decidable from the mask.
+
+    Measured on `AS_dorsal view_E-cad`, where the segmented amnioserosa is a
+    sub-region of a larger epithelium: free edges score a median 0.036 against
+    0.523 for cell-cell junctions, and 16 of 44 fall at or below 0 -- correctly,
+    since they sit on dark cytoplasm mid-tissue, but they are ROI boundaries
+    rather than mistakes. Pooling them would have flooded the flag count with
+    non-errors and dragged the fitted colour window down onto them.
+    """
+    cell_cell = {k: v for k, v in scores.items() if k[0] != 0}
+    free_edge = {k: v for k, v in scores.items() if k[0] == 0}
+    return cell_cell, free_edge
+
+
 def fit_display_window(metric: str, scores: Dict[int, float]) -> dict:
     """Adapt `metric`'s LUT window to the scores actually seen in a project,
     falling back to `QC_METRIC_DISPLAY` when there's nothing to fit.
@@ -227,6 +249,25 @@ def _bridge_gaps(fill_labels: np.ndarray, max_gap_px: int) -> np.ndarray:
     if not background.any() or max_gap_px <= 0:
         return fill_labels
     distance, (nearest_y, nearest_x) = ndimage.distance_transform_edt(background, return_indices=True)
+
+    # Only bridge background components that are a GAP -- every pixel within
+    # `max_gap_px` of a cell -- never ones that are open space.
+    #
+    # A plain distance test is not enough, because the outer rim of open
+    # background is thin too: it just has cells on one side. On
+    # `embryos_GBE_GAP43` that fabricated junctions along the image frame,
+    # where cells clipped by the field of view were each grown into the
+    # exterior strip until they met, producing long straight "interfaces"
+    # following the frame edge that no membrane corresponds to. Whole-component
+    # thickness separates the two cleanly: real inter-cell gaps there and on
+    # `pupae_E-cad`/`AS_dorsal view_E-cad` are components of 1-4 px, while the
+    # tissue exterior is a single component 21-477 px thick.
+    components, count = ndimage.label(background)
+    if count:
+        thickness = ndimage.maximum(distance, components, index=np.arange(1, count + 1))
+        bridgeable = np.concatenate([[False], np.asarray(thickness) <= max_gap_px])
+        background = background & bridgeable[components]
+
     within_reach = background & (distance <= max_gap_px)
     bridged = fill_labels.copy()
     bridged[within_reach] = fill_labels[nearest_y[within_reach], nearest_x[within_reach]]
@@ -251,14 +292,40 @@ def _interface_pixels(fill_labels: np.ndarray) -> Dict[tuple, np.ndarray]:
     ):
         left, right = fill_labels[first], fill_labels[second]
         touching = (left != right) & (left > 0) & (right > 0)
-        if not touching.any():
-            continue
-        a = left[touching].astype(np.int64)
-        b = right[touching].astype(np.int64)
-        key = np.minimum(a, b) * stride + np.maximum(a, b)
-        # Both sides of the border belong to the band.
-        keys.append(np.concatenate([key, key]))
-        indices.append(np.concatenate([flat_index[first][touching], flat_index[second][touching]]))
+        if touching.any():
+            a = left[touching].astype(np.int64)
+            b = right[touching].astype(np.int64)
+            key = np.minimum(a, b) * stride + np.maximum(a, b)
+            # Both sides of the border belong to the band.
+            keys.append(np.concatenate([key, key]))
+            indices.append(np.concatenate([flat_index[first][touching], flat_index[second][touching]]))
+
+        # Free edges: a cell pixel whose neighbour is background. These are the
+        # tissue's outer rim, which has no second cell and so produced no pair
+        # at all -- the whole outer perimeter was silently absent from the
+        # junction overlay, indistinguishable from "no edge here". On
+        # `AS_dorsal view_E-cad` that is 60% of cells losing a median 18.6% of
+        # their perimeter, and 2 cells rendering completely blank.
+        #
+        # Keyed `(0, label)`: `0 * stride + label` is always < `stride` while a
+        # real pair's key is >= `stride`, so the two can never collide and
+        # `pair[0] == 0` identifies a free edge downstream.
+        for side, other in ((first, second), (second, first)):
+            cell_side = fill_labels[side]
+            free = (cell_side > 0) & (fill_labels[other] == 0)
+            if not free.any():
+                continue
+            # BOTH sides, exactly as for a cell-cell border. Taking only the
+            # cell-side pixel would put the band one pixel inside the mask
+            # rather than straddling the membrane, and the outer membrane sits
+            # partly outside the mask edge. Measured on `AS_dorsal`, the
+            # one-sided band scored free edges at a median contrast of 0.043
+            # against 0.528 for cell-cell junctions -- not a real difference in
+            # the tissue, just the band sampling cytoplasm instead of membrane,
+            # which would have made 9 of 30 outer edges trip the "<= 0" rule.
+            key = cell_side[free].astype(np.int64)
+            keys.append(np.concatenate([key, key]))
+            indices.append(np.concatenate([flat_index[side][free], flat_index[other][free]]))
 
     if not keys:
         return {}
@@ -357,10 +424,22 @@ def junction_contrast(
 
     scores = {}
     for (a, b), pixels in _interface_pixels(_bridge_gaps(fill_labels, max_gap_px)).items():
-        if pixels.size < min_interface_px or a not in interiors or b not in interiors:
+        if pixels.size < min_interface_px:
+            continue
+        if a == 0:
+            # Free edge: the tissue's outer rim, with no second cell. Same
+            # formula, but referenced against the one cell's own cytoplasm.
+            # Physically the same question -- the outer membrane is real and
+            # should be brighter than the cell behind it -- so a mask that
+            # leaked out into background still scores low and is flagged.
+            if b not in interiors:
+                continue
+            interior = interiors[b]
+        elif a in interiors and b in interiors:
+            interior = (interiors[a] + interiors[b]) / 2.0
+        else:
             continue
         border = float(np.median(flat_image[pixels]))
-        interior = (interiors[a] + interiors[b]) / 2.0
         total = border + interior
         if total <= 0:
             continue
@@ -406,7 +485,11 @@ def worst_junction_per_cell(
     """
     worst: Dict[int, float] = {}
     for (a, b), value in junction_contrast(raw_image, fill_labels, min_interface_px, max_gap_px).items():
-        for label in (a, b):
+        # `a == 0` marks a free edge, which belongs to `b` alone -- 0 is not a
+        # cell and must never be scored. Including free edges here is the point:
+        # a border cell whose only bad edge is its outer one would otherwise
+        # score clean.
+        for label in ((b,) if a == 0 else (a, b)):
             if label not in worst or value < worst[label]:
                 worst[label] = value
     return worst

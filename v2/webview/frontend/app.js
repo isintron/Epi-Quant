@@ -259,7 +259,11 @@ function handleStartFresh() {
 async function handleStartExtraction() {
   const excludeEdge = document.getElementById("exclude-edge-cells").checked;
   const maskType = document.getElementById("mask-type-select").value;
-  const bgRatio = parseFloat(document.getElementById("background-area-ratio-input").value) || 10.0;
+  // A typed 0 means "disable the filter", so it must reach Python as null.
+  // `parseFloat(...) || 10.0` turned 0 into 10 (0 is falsy in JS), leaving no
+  // way to switch the background-component filter off from the UI at all.
+  const bgRaw = parseFloat(document.getElementById("background-area-ratio-input").value);
+  const bgRatio = Number.isFinite(bgRaw) ? (bgRaw > 0 ? bgRaw : null) : 10.0;
 
   document.getElementById("start-extraction-btn").disabled = true;
   document.getElementById("extract-progress-bar").style.display = "block";
@@ -438,6 +442,22 @@ function syncExtractQcPanels() {
 
 // The metric help lives in a popover rather than inline prose: it now covers
 // five metrics and was pushing the preview off screen.
+// Open/close a `?` popover: toggles on its own button, closes on the X, on
+// Escape, and on any click outside itself. Only one popover is open at a time.
+function wirePopover(buttonId, closeId, popoverId) {
+  const popover = document.getElementById(popoverId);
+  document.getElementById(buttonId).addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = popover.style.display !== "none";
+    document.querySelectorAll(".popover").forEach((p) => { p.style.display = "none"; });
+    popover.style.display = open ? "none" : "block";
+  });
+  document.getElementById(closeId).addEventListener("click", () => { popover.style.display = "none"; });
+  popover.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => { popover.style.display = "none"; });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") popover.style.display = "none"; });
+}
+
 function setQcHelpVisible(visible) {
   document.getElementById("qc-help-popover").style.display = visible ? "block" : "none";
 }
@@ -985,7 +1005,30 @@ const TRACK_COLOR_MODE_PANELS = {
   identity: ["correct-track-identity-palette"],
   environment: ["correct-track-environment", "correct-track-environment-hint"],
   lifecycle: ["correct-track-lifecycle"],
+  agreement: ["correct-track-agreement"],
 };
+
+// Every control writes through the one API call and then re-reads what was
+// actually applied, so the three widgets can never drift apart -- the backend
+// derives `mode` from the weights rather than storing it separately.
+async function applyTrackingCost(mode, overlapWeight, motionCompensation, maxFrameGap) {
+  const applied = await window.EpiQuantAPI.set_tracking_cost(mode, overlapWeight, motionCompensation, maxFrameGap);
+  if (!applied) return;
+  syncTrackingCostControls(applied);
+}
+
+function syncTrackingCostControls(cost) {
+  const radio = document.querySelector(`input[name="track-cost-mode"][value="${cost.mode}"]`);
+  if (radio) radio.checked = true;
+  const weight = document.getElementById("overlap-weight-input");
+  weight.value = cost.overlap_weight;
+  // The weight is meaningless when the overlap term is switched off entirely.
+  weight.disabled = cost.mode === "centroid";
+  document.getElementById("motion-compensation-input").checked = !!cost.motion_compensation;
+  document.getElementById("gap-closing-input").checked = !!cost.max_frame_gap;
+  const drift = document.getElementById("drift-register-input");
+  if (drift) drift.checked = cost.drift_mode && cost.drift_mode !== "none";
+}
 
 function syncTrackColorModePanels() {
   const mode = getColorMode("correct-track");
@@ -1008,15 +1051,102 @@ async function refreshCorrectTrackImage() {
   const tintOthers = document.getElementById("lifecycle-tint-others-checkbox").checked;
   const img = await window.EpiQuantAPI.get_tracking_overlay(
     state.correctTrackFrame, getRenderMode("correct-track"), showLabels, getColorMode("correct-track"),
-    identityPalette, labelFontSize, environmentLut, environmentDirection, tintOthers
+    identityPalette, labelFontSize, environmentLut, environmentDirection, tintOthers,
+    document.getElementById("dynamics-axes-checkbox").checked
   );
   setPreviewImage("correct-track-overlay-img", img);
+  await refreshAgreementCounts();
+  await refreshRegistrationStatus();
+}
+
+// The counts are always shown alongside the overlay, including how many cells
+// could NOT be judged -- an overlay that silently omits them would read as if
+// every cell had been checked.
+async function refreshAgreementCounts() {
+  const readout = document.getElementById("agreement-counts");
+  if (getColorMode("correct-track") !== "agreement") {
+    readout.textContent = "";
+    return;
+  }
+  const result = await window.EpiQuantAPI.get_link_agreement(state.correctTrackFrame);
+  if (!result) {
+    readout.textContent = "";
+    return;
+  }
+  // A mode that cannot draw must say why. Previously every one of these paths
+  // rendered nothing and looked exactly like the mode being off.
+  if (result.reason) {
+    setStatus("agreement-counts", result.message || `Nothing to show (${result.reason}).`, "error");
+    state.agreementDetail = {};
+    return;
+  }
+  const c = result.counts || {};
+  const total = Object.values(c).reduce((a, b) => a + b, 0) || 1;
+  const pct = (n) => `${n || 0} (${Math.round((100 * (n || 0)) / total)}%)`;
+  // Naming the convention is not optional: the same tracking scores 4.9% or
+  // 14.0% depending only on whether the reference masks were registered.
+  const ref = result.registered ? "registered" : "unregistered";
+  readout.textContent =
+    `Against the highest-overlap successor (${ref} masks): agrees ${pct(c.agrees)}, ` +
+    `disagrees ${pct(c.disagrees)}, can't judge ${pct(c.unjudgeable)}, broken ${pct(c.broken)}.`;
+  state.agreementDetail = result.detail || {};
+}
+
+async function refreshRegistrationStatus() {
+  const el = document.getElementById("registration-status");
+  if (!el) return;
+  const r = await window.EpiQuantAPI.get_registration_status();
+  if (!r) { el.textContent = ""; return; }
+  el.textContent = r.register
+    ? `Tissue drift ${r.median_drift_px} px per frame against a ${r.median_cell_radius_px} px cell radius `
+      + `(ratio ${r.ratio}, threshold ${r.threshold}) — the agreement reference `
+      + `${r.applied ? "IS" : "would be"} computed on registered masks.`
+    : `Tissue drift ${r.median_drift_px} px per frame against a ${r.median_cell_radius_px} px cell radius `
+      + `(ratio ${r.ratio}, below the ${r.threshold} threshold) — no registration needed.`;
+}
+
+// Both totals, always. The persistence filter never hides an event, so the
+// user can see exactly how much of the raw count it accounts for.
+async function refreshT1Counts() {
+  const readout = document.getElementById("dynamics-t1-counts");
+  const modeEl = document.querySelector('input[name="trajectory-color-mode"]:checked');
+  if (!modeEl || modeEl.value !== "dynamics") {
+    readout.textContent = "";
+    return;
+  }
+  const events = await window.EpiQuantAPI.get_t1_events(state.trajectoryFrame, "next");
+  if (!events || events.error) {
+    readout.textContent = "";
+    return;
+  }
+  // Three states, always all three. An unjudgeable event is one there was not
+  // enough movie left to check -- folding it into either of the other two
+  // would claim a verdict that was never reached.
+  const hold = events.persist_frames;
+  if (hold > 0) {
+    readout.textContent =
+      `T1 this frame: raw ${events.gained} gained / ${events.lost} lost; ` +
+      `settled ${events.gained_persistent} / ${events.lost_persistent} after ${hold} frame(s); ` +
+      `can't judge ${events.gained_unjudgeable || 0} / ${events.lost_unjudgeable || 0}.`;
+  } else {
+    readout.textContent =
+      `T1 this frame: ${events.gained} gained / ${events.lost} lost (no persistence filter).`;
+  }
 }
 
 async function showCorrectTrackFrame(frame) {
+  // Every piece of panel state is cleared SYNCHRONOUSLY, before the await.
+  //
+  // It used to be cleared afterwards, which made the ordering a race: the
+  // "Use this" handler does `await refreshCorrectTrackImage(); showSuggestCheckButton(...)`,
+  // and if a frame change resolved its await in between, the reset landed on
+  // top of the freshly-shown panel and the Check-how-far button vanished.
+  // Reordering here is not cosmetic -- it removes the await from between the
+  // reset and any later show, so no other async caller can interleave.
+  // Same shape as the `_qc_scores` / `_qc_display` clobber from an earlier
+  // round: two paths writing one piece of state, ordering decided by timing.
   state.correctTrackFrame = frame;
   document.getElementById("correct-track-frame-label").textContent = frameLabel(frame);
-  await refreshCorrectTrackImage();
   document.getElementById("correct-track-selected-cell").textContent = "";
   document.getElementById("correct-track-reassign").style.display = "none";
   document.getElementById("correct-track-suggest").style.display = "none";
@@ -1025,6 +1155,7 @@ async function showCorrectTrackFrame(frame) {
   resetSuggestCheckButton();
   state.selectedTrackCell = null;
   resetTrackSwapSelection();
+  await refreshCorrectTrackImage();
 }
 
 function resetSmartStopPanel() {
@@ -1110,9 +1241,21 @@ async function handleCorrectTrackImageClick(event) {
   }
   state.selectedTrackCell = result;
   const isMatched = result.track_id !== null && result.track_id !== undefined;
-  document.getElementById("correct-track-selected-cell").textContent = isMatched
+  // In agreement mode, show BOTH overlaps for the clicked cell. "0.301 vs
+  // 0.231" reads as the near-tie it is; a red cell alone does not, and 65% of
+  // flagged disagreements differ by less than 0.15 IoU.
+  let agreementNote = "";
+  const detail = (state.agreementDetail || {})[result.cell_id];
+  if (getColorMode("correct-track") === "agreement" && detail) {
+    const label = { agrees: "agrees with", disagrees: "disagrees with",
+                    unjudgeable: "can't be judged by", broken: "no link;" }[detail.state] || detail.state;
+    const tracker = detail.tracker_iou === null || detail.tracker_iou === undefined
+      ? "no successor" : `this tracking's pick ${detail.tracker_iou}`;
+    agreementNote = ` — ${label} the overlap reference (reference ${detail.reference_iou} vs ${tracker}).`;
+  }
+  document.getElementById("correct-track-selected-cell").textContent = (isMatched
     ? `${result.cell_index}: currently track #${result.track_id}.`
-    : `${result.cell_index}: unmatched (raw cell id ${result.cell_id}).`;
+    : `${result.cell_index}: unmatched (raw cell id ${result.cell_id}).`) + agreementNote;
   document.getElementById("correct-track-reassign").style.display = "flex";
   document.getElementById("new-track-id-input").value = "";
   document.getElementById("propagate-correction-checkbox").checked = false;
@@ -1207,7 +1350,7 @@ async function handleSuggestMatch() {
   }
   const candidates = (result && result.candidates) || [];
   if (candidates.length === 0) {
-    list.textContent = "No orphaned tracks found in the previous frame.";
+    list.textContent = "No candidate tracks found in the previous frame.";
     return;
   }
   const selectedCell = state.selectedTrackCell;
@@ -1215,7 +1358,19 @@ async function handleSuggestMatch() {
 
   candidates.forEach((candidate) => {
     const item = document.createElement("li");
-    item.textContent = `Track #${candidate.track_id} (last seen ${candidate.cell_index}, ${candidate.distance.toFixed(1)}px away) `;
+    // A positive swap gain means these two tracks look exchanged: each cell
+    // sits nearer the OTHER track's previous position. That is the dominant
+    // error in a densely tracked movie, where nothing is ever orphaned.
+    const swap = candidate.swap_gain;
+    const held = candidate.current_cell
+      ? `now holds ${candidate.current_cell}`
+      : "unmatched here";
+    const flag = swap && swap > 0
+      ? ` \u26a0 looks swapped \u2014 exchanging saves ${swap.toFixed(1)}px`
+      : "";
+    item.textContent =
+      `Track #${candidate.track_id} (last seen ${candidate.cell_index}, ${candidate.distance.toFixed(1)}px away, ${held})${flag} `;
+    if (swap && swap > 0) item.style.fontWeight = "600";
     const useBtn = document.createElement("button");
     useBtn.className = "secondary-btn";
     useBtn.textContent = "Use this";
@@ -1400,7 +1555,14 @@ function handleNextTrack() {
 async function showTrajectoryFrame(frame) {
   state.trajectoryFrame = frame;
   document.getElementById("trajectory-frame-label").textContent = `Frame ${frame}`;
-  const img = await window.EpiQuantAPI.get_trajectory_overlay(state.currentTrackNumber, frame, getRenderMode("trajectory"));
+  const modeEl = document.querySelector('input[name="trajectory-color-mode"]:checked');
+  const colorMode = modeEl ? modeEl.value : "highlight";
+  document.getElementById("correct-track-dynamics").style.display = colorMode === "dynamics" ? "flex" : "none";
+  const img = await window.EpiQuantAPI.get_trajectory_overlay(
+    state.currentTrackNumber, frame, getRenderMode("trajectory"), colorMode,
+    document.getElementById("dynamics-axes-checkbox").checked
+  );
+  await refreshT1Counts();
   if (img) {
     setPreviewImage("trajectory-overlay-img", img);
     setStatus("trajectory-status", "");
@@ -1626,14 +1788,28 @@ function init() {
     if (applied) e.target.value = applied.value;
     await refreshExtractImage();
   });
-  document.getElementById("qc-help-btn").addEventListener("click", (e) => {
-    e.stopPropagation();
-    setQcHelpVisible(!qcHelpVisible());
+  wirePopover("qc-help-btn", "qc-help-close", "qc-help-popover");
+  wirePopover("overlap-help-btn", "overlap-help-close", "overlap-help-popover");
+  document.getElementById("overlap-weight-input").addEventListener("change", async (e) => {
+    await applyTrackingCost(null, parseFloat(e.target.value), null);
   });
-  document.getElementById("qc-help-close").addEventListener("click", () => setQcHelpVisible(false));
-  document.getElementById("qc-help-popover").addEventListener("click", (e) => e.stopPropagation());
-  document.addEventListener("click", () => { if (qcHelpVisible()) setQcHelpVisible(false); });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") setQcHelpVisible(false); });
+  document.querySelectorAll('input[name="track-cost-mode"]').forEach((el) => {
+    el.addEventListener("change", async (ev) => {
+      await applyTrackingCost(ev.target.value, null, null);
+    });
+  });
+  document.getElementById("motion-compensation-input").addEventListener("change", async (e) => {
+    await applyTrackingCost(null, null, e.target.checked, null);
+  });
+  document.getElementById("gap-closing-input").addEventListener("change", async (e) => {
+    await applyTrackingCost(null, null, null, e.target.checked ? 1 : 0);
+  });
+  document.getElementById("drift-register-input").addEventListener("change", async (e) => {
+    const applied = await window.EpiQuantAPI.set_tracking_cost(
+      null, null, null, null, e.target.checked ? "mask" : "none");
+    if (applied) syncTrackingCostControls(applied);
+    await refreshRegistrationStatus();
+  });
   document.getElementById("copy-view-btn").addEventListener("click", handleCopyView);
   ["extract-show-outline", "extract-outline-color-input", "extract-show-labels", "extract-label-size-input"]
     .forEach((id) => document.getElementById(id).addEventListener("change", refreshExtractImage));
@@ -1732,6 +1908,49 @@ function init() {
     el.addEventListener("change", refreshCorrectTrackImage);
   });
   document.getElementById("lifecycle-tint-others-checkbox").addEventListener("change", refreshCorrectTrackImage);
+  document.getElementById("dynamics-axes-checkbox").addEventListener("change",
+    () => showTrajectoryFrame(state.trajectoryFrame));
+  document.getElementById("t1-axis-filter-select").addEventListener("change", async (e) => {
+    await window.EpiQuantAPI.set_t1_axis_filter(e.target.value);
+    await showTrajectoryFrame(state.trajectoryFrame);
+  });
+  ["t1-enter-input", "t1-exit-input"].forEach((id) => {
+    document.getElementById(id).addEventListener("change", async () => {
+      const enter = parseFloat(document.getElementById("t1-enter-input").value);
+      const exit = parseFloat(document.getElementById("t1-exit-input").value);
+      const both = Number.isFinite(enter) && Number.isFinite(exit);
+      try {
+        await window.EpiQuantAPI.set_t1_hysteresis(both ? enter : null, both ? exit : null);
+        setStatus("dynamics-t1-counts", "", "");
+      } catch (err) {
+        // enter <= exit is rejected by the backend; say so rather than
+        // silently leaving the old band in place.
+        setStatus("dynamics-t1-counts", String(err && err.message ? err.message : err), "error");
+        return;
+      }
+      await showTrajectoryFrame(state.trajectoryFrame);
+    });
+  });
+  document.getElementById("t1-persist-input").addEventListener("change", async (e) => {
+    const applied = await window.EpiQuantAPI.set_t1_persistence(parseInt(e.target.value, 10));
+    if (applied) e.target.value = applied.value;
+    await showTrajectoryFrame(state.trajectoryFrame);
+  });
+  wirePopover("dynamics-help-btn", "dynamics-help-close", "dynamics-help-popover");
+  ["dynamics-division-color-input", "dynamics-delamination-color-input", "dynamics-t1-color-input"]
+    .forEach((id) => document.getElementById(id).addEventListener("change", async () => {
+      await window.EpiQuantAPI.set_dynamics_colors(
+        document.getElementById("dynamics-division-color-input").value,
+        document.getElementById("dynamics-delamination-color-input").value,
+        document.getElementById("dynamics-t1-color-input").value);
+      await showTrajectoryFrame(state.trajectoryFrame);
+    }));
+  document.getElementById("save-lineage-btn").addEventListener("click", async () => {
+    const r = await window.EpiQuantAPI.save_lineage();
+    setStatus("trajectory-status", r && r.path
+      ? `Lineage sheet saved: ${r.tracks} tracks, ${r.divisions} divisions, ${r.delaminations} delaminations.`
+      : `Could not save: ${(r && r.error) || "unknown error"}`, r && r.path ? "success" : "error");
+  });
   ["lifecycle-lost-color-input", "lifecycle-new-color-input", "lifecycle-both-color-input"].forEach((id) => {
     document.getElementById(id).addEventListener("change", async () => {
       await window.EpiQuantAPI.set_lifecycle_colors(
@@ -1770,6 +1989,38 @@ function init() {
   wireZoom("trajectory", "trajectory-overlay-img");
   wireFrameWheel("trajectory", "trajectory-overlay-img");
   wireRenderMode("trajectory", () => showTrajectoryFrame(state.trajectoryFrame));
+  document.querySelectorAll('input[name="trajectory-color-mode"]').forEach((el) => {
+    el.addEventListener("change", () => showTrajectoryFrame(state.trajectoryFrame));
+  });
+  wirePopover("agreement-help-btn", "agreement-help-close", "agreement-help-popover");
+  document.getElementById("agreement-register-input").addEventListener("change", async (e) => {
+    await window.EpiQuantAPI.set_register_reference(e.target.checked);
+    await refreshRegistrationStatus();
+    await refreshCorrectTrackImage();
+  });
+  ["environment-deadband-input", "environment-repair-input"].forEach((id) => {
+    document.getElementById(id).addEventListener("change", async () => {
+      const applied = await window.EpiQuantAPI.set_environment_thresholds(
+        parseFloat(document.getElementById("environment-deadband-input").value),
+        parseFloat(document.getElementById("environment-repair-input").value));
+      if (applied) {
+        document.getElementById("environment-deadband-input").value = applied.dead_band;
+        document.getElementById("environment-repair-input").value = applied.repair_threshold;
+      }
+      await refreshCorrectTrackImage();
+    });
+  });
+  ["agrees", "disagrees", "unjudgeable", "broken"].forEach((state_) => {
+    const el = document.getElementById(`agreement-${state_}-color-input`);
+    if (el) el.addEventListener("change", async () => {
+      await window.EpiQuantAPI.set_agreement_colors(
+        document.getElementById("agreement-agrees-color-input").value,
+        document.getElementById("agreement-disagrees-color-input").value,
+        document.getElementById("agreement-unjudgeable-color-input").value,
+        document.getElementById("agreement-broken-color-input").value);
+      await refreshCorrectTrackImage();
+    });
+  });
   document.getElementById("trajectory-overlay-img").addEventListener("click", handleTrajectoryImageClick);
 
   // Global callbacks pushed from Python via window.evaluate_js
@@ -1782,6 +2033,25 @@ function init() {
   window.onRetrackDone = onRetrackDone;
   window.onRetrackError = onRetrackError;
   window.onTrackError = onTrackError;
+
+  // Seed the tracking-cost and T1-persistence widgets from the backend rather
+  // than trusting the markup's defaults, so the app never shows a setting it
+  // is not actually using.
+  window.EpiQuantAPI.get_tracking_cost().then((cost) => {
+    if (cost) syncTrackingCostControls(cost);
+  });
+  window.EpiQuantAPI.get_t1_persistence().then((p) => {
+    if (!p) return;
+    document.getElementById("t1-persist-input").value = p.value;
+    if (p.enter_px != null) document.getElementById("t1-enter-input").value = p.enter_px;
+    if (p.exit_px != null) document.getElementById("t1-exit-input").value = p.exit_px;
+    if (p.axis_filter) document.getElementById("t1-axis-filter-select").value = p.axis_filter;
+  });
+  window.EpiQuantAPI.get_environment_thresholds().then((t) => {
+    if (!t) return;
+    document.getElementById("environment-deadband-input").value = t.dead_band;
+    document.getElementById("environment-repair-input").value = t.repair_threshold;
+  });
 }
 
 document.addEventListener("DOMContentLoaded", init);

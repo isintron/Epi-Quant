@@ -291,40 +291,72 @@ def _resolve_skeleton_classes(class_a: np.ndarray, class_b: np.ndarray) -> tuple
     return class_a, class_b
 
 
+# A median needs enough components to mean anything; below this the filter
+# stands down rather than guessing what "typical" is.
+_MIN_COMPONENTS_FOR_MEDIAN = 5
+
+
 def _drop_oversized_components(labeled: np.ndarray, background_area_ratio: float) -> np.ndarray:
     """Relabel to background (0) any connected component whose area exceeds
-    `background_area_ratio` times the MAXIMUM component area.
+    `background_area_ratio` times the MEDIAN component area.
 
-    Connected-component labeling of a skeleton's complement (or of a raw
-    binary mask) doesn't know which components are real cells and which are
-    unsegmented "outside the tissue" background -- if the boundary network
-    doesn't fully enclose the image, everything outside the tissue can merge
-    into one giant blob that dwarfs typical cells. Filtering by a large
-    multiple of the maximum observed cell area is a conservative test that
-    compares each component against the largest detected cell (instead of the
-    median), which may be preferred in datasets where cell sizes vary widely.
-    Note: when an unsegmented background region itself becomes the largest
-    component, this max-based test will be less aggressive than a median-based
-    test and may fail to remove that background; choose `background_area_ratio`
-    accordingly.
+    Connected-component labeling of a skeleton's complement doesn't know which
+    components are real cells and which are unsegmented "outside the tissue"
+    background -- if the boundary network doesn't fully enclose the image,
+    everything outside the tissue merges into one giant blob that dwarfs
+    typical cells.
+
+    **This used to compare against the MAXIMUM component area, which made it
+    unsatisfiable.** The runaway background component IS the maximum, so
+    `areas > ratio * max_area` can never hold for any `ratio >= 1`, and the
+    function changed nothing at the default of 10.0 -- measured on all 31
+    frames of `test_data/embryos_GBE_GAP43`: zero pixels altered. The median
+    is what the caller-facing docstring in `load_tiff_mask` always promised,
+    and it separates cleanly here: that dataset's background component runs
+    78-101x the median cell area in every frame, so a default of 10 catches it
+    with a wide margin on both sides.
+
+    The consequences of leaving it in were not cosmetic. The giant label
+    survived into `masks`, so it was rendered, measured into
+    `Cells_info.xlsx` as a ~79x-median "cell", fed to the neighbour graph --
+    and, worst, to tracking, where its 426px extent made the displacement gate
+    vacuous and its circumscribed radius set the global matching sentinel.
+    Removing it cut mis-tracked links on that dataset from 23.6% to 1.6%.
     """
     areas = np.bincount(labeled.ravel())
     areas[0] = 0
     nonzero_areas = areas[areas > 0]
-    if len(nonzero_areas) == 0:
+    if len(nonzero_areas) < _MIN_COMPONENTS_FOR_MEDIAN:
         return labeled
 
-    max_area = np.max(nonzero_areas)
-    oversized_labels = np.nonzero(areas > background_area_ratio * max_area)[0]
+    median_area = float(np.median(nonzero_areas))
+    if median_area <= 0:
+        return labeled
+
+    oversized_labels = np.nonzero(areas > background_area_ratio * median_area)[0]
     if len(oversized_labels) == 0:
         return labeled
 
+    logger.info(
+        "Dropped %d oversized component(s) as unsegmented background "
+        "(area > %.1fx the median cell area of %.0f px): sizes %s",
+        len(oversized_labels), background_area_ratio, median_area,
+        sorted(int(areas[l]) for l in oversized_labels),
+    )
     result = labeled.copy()
     result[np.isin(labeled, oversized_labels)] = 0
     return result
 
 
-def _close_label_gaps(labeled: np.ndarray, fillable: np.ndarray) -> np.ndarray:
+# A drawn cell boundary is 1-3 px wide, so every one of its pixels lies within
+# a couple of pixels of a cell. Anything further away is not a separator
+# between two cells -- see `_close_label_gaps`.
+_MAX_GAP_FILL_PX = 3
+
+
+def _close_label_gaps(
+    labeled: np.ndarray, fillable: np.ndarray, max_distance_px: int = _MAX_GAP_FILL_PX,
+) -> np.ndarray:
     """Assign every `fillable` pixel to the nearest labeled cell, so cells
     that a drawn boundary line separated end up directly adjacent (Cellpose's
     convention, where the border between two cells is just a label change).
@@ -335,14 +367,43 @@ def _close_label_gaps(labeled: np.ndarray, fillable: np.ndarray) -> np.ndarray:
     `expand_labels` would be the obvious tool, but scikit-image is not
     installed and is referenced nowhere in this repo -- scipy already is.)
 
-    `fillable` should be only the pixels known to be a separator; passing the
-    whole background would flood genuinely unsegmented regions into cells.
+    `fillable` should be only the pixels known to be a separator, and even
+    then only those actually lying BETWEEN cells -- `max_distance_px` enforces
+    that second half.
+
+    Without the distance bound this silently teleports far-away separator
+    pixels onto whichever cell happens to be nearest. Measured on
+    `test_data/embryos_GBE_GAP43`, whose TIFF masks carry a closed line around
+    the entire image perimeter: after `_drop_oversized_components`
+    correctly deletes the unsegmented band inside that line, all 1,468
+    perimeter pixels (exactly `2*(H+W)`) were handed to peripheral cells a
+    median of 17 px away. That gave 1,303 cells a second, disconnected
+    fragment sitting on row 0 -- and since `is_edge_cell` is bounding-box
+    based, one such pixel condemned the whole cell, so `exclude_edge_cells`
+    then dropped 17.5% of every frame before tracking ever saw them.
+
+    A real drawn boundary is 1-3 px wide, so each of its pixels is within a
+    couple of pixels of the cell it belongs to; the default bound closes
+    genuine gaps while leaving an orphaned perimeter line where it is.
+
+    **That perimeter line is a property of the TIFF input path, not of anyone's
+    curation.** Round 7 attributed it to hand-correction; checked across this
+    project's datasets, both TIFF-mask datasets have a complete image border
+    (`embryos_GBE_GAP43` 1,468 px = 2(300+434); `Demo_Seg_QC` 836 px =
+    2(209+209)) and none of the three native-Cellpose `.npy` datasets has one
+    at all. A skeleton/outline TIFF writes the image edge as part of the
+    boundary network, so the line arrives with the file. `_handCorrection` in
+    those filenames is the exporting tool's naming convention and is NOT
+    evidence that a human edited anything.
     """
     if not fillable.any():
         return labeled
-    _distance, (nearest_y, nearest_x) = ndimage_distance_transform_edt(
+    distance, (nearest_y, nearest_x) = ndimage_distance_transform_edt(
         labeled == 0, return_indices=True,
     )
+    fillable = fillable & (distance <= max_distance_px)
+    if not fillable.any():
+        return labeled
     closed = labeled.copy()
     closed[fillable] = labeled[nearest_y[fillable], nearest_x[fillable]]
     return closed
@@ -472,8 +533,8 @@ def load_tiff_mask(
     - `'binary_mask'`: force treating a 2-valued file as a direct
       foreground-is-cells mask (no boundary lines to remove).
 
-    `background_area_ratio` (default 10, `None` to disable) discards
-    connected components more than that many times larger than the median
+    `background_area_ratio` (default 10, `None` or 0 to disable) discards
+    connected components more than that many times larger than the MEDIAN
     component -- catches unsegmented background regions outside the tissue
     that connected-component labeling would otherwise mistake for one giant
     cell. Only applies to `'skeleton'`/`'binary_mask'`/2-value-`'auto'`
@@ -1018,8 +1079,24 @@ def extract_cell_info(
             # defined in.
             positions = (local[0] + y0, local[1] + x0)
 
-            if exclude_edge_cells and is_edge_cell(positions, height, width, margin=3):
-                continue
+            if exclude_edge_cells:
+                # Tested on the FILLED mask, not on `positions` (which come
+                # from `outlines`). `thin_label_outlines` marks a pixel only
+                # where a 4-neighbour INSIDE the array carries a different
+                # label, so a cell running to the image border has no ring
+                # pixel along that border and its ring can sit many pixels
+                # inside the frame -- on `embryos_GBE_GAP43` the runaway
+                # background component's ring stopped 4-19 px short of every
+                # edge, so a `margin=3` test missed it in 21 of 31 frames.
+                # The filled mask has no such blind spot.
+                edge_source = fill_labels if fill_labels is not None else outlines
+                edge_positions = np.where(edge_source[y0:y1, x0:x1] == cell_id)
+                if edge_positions[0].size == 0:
+                    edge_positions = local
+                if is_edge_cell(
+                    (edge_positions[0] + y0, edge_positions[1] + x0), height, width, margin=3,
+                ):
+                    continue
 
             if tracking_only:
                 # Only the four columns `cell_tracking.build_cost_matrix`
@@ -1028,8 +1105,14 @@ def extract_cell_info(
                 # nonzero entries in DEFAULT_TRACKING_WEIGHTS). Everything
                 # else is left NaN -- the column set and its order are
                 # unchanged, since downstream code maps columns positionally.
-                cy = int(np.mean(positions[0]))
-                cx = int(np.mean(positions[1]))
+                # Float, not int: truncating quantises the very quantity the
+                # tracking cost compares. On `embryos_GBE_GAP43` the median
+                # margin between a cell's true continuation and its nearest
+                # impostor is 5.4 px, and ~20% of cells have a runner-up within
+                # 2 px -- against which a 1 px truncation bias is not noise you
+                # can ignore.
+                cy = float(np.mean(positions[0]))
+                cx = float(np.mean(positions[1]))
                 ap = np.max(positions[1]) - np.min(positions[1])
                 dv = np.max(positions[0]) - np.min(positions[0])
                 cell_info = [
@@ -1103,8 +1186,9 @@ def extract_cell_info(
                 ratio_long_and_short_axes = -1
                 cell_ellipse_angle = -1
 
-            cy = int(np.mean(positions[0]))
-            cx = int(np.mean(positions[1]))
+            # Float, not int -- see the note on the tracking-only path above.
+            cy = float(np.mean(positions[0]))
+            cx = float(np.mean(positions[1]))
 
             ap = np.max(positions[1]) - np.min(positions[1])
             dv = np.max(positions[0]) - np.min(positions[0])

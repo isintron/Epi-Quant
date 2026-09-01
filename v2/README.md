@@ -1000,6 +1000,10 @@ dropdown) is completely untouched.
 | `trajectory_visualization.py`         | Module 5 — trajectory replay + displacement field (`gui_plot_track.py`, `gui_cell_direction.py`) + lifetime-map scaffold                                                        |
 | `rendering.py`                        | Overlay compositing for the webview UI (see below) — cluster/tracking/trajectory tinting, click-to-cell pixel lookup, PNG encoding                                                  |
 | `adjacency.py`                        | Same-frame cell-adjacency graph via mask-dilation overlap — gap-tolerant, used by the tracking-correction termination check. Cannot separate edge-sharing from corner-touching; `tissue_features.build_interface_graph` does that |
+| `segmentation_qc.py`                  | No-reference segmentation QC scores for the Extract overlay — per-junction / per-cell contrast, morphology, neighbour count, measurement failures (new, see "Round 5" and its follow-ups)  |
+| `tracking_benchmark.py`               | Tracking evaluation harness: the judges and their biases, the diagnostics, CTC ground-truth ingest (new, see "Round 10" -- **read its module docstring before quoting any tracking number**) |
+| `topology.py`                         | T1 transitions / neighbour exchanges with nematic orientation, ported from TissueMiner (new, see "Round 7"), plus `annotate_persistence` for flicker (Round 9)                            |
+| `lineage.py`                          | Division + delamination **candidates** and the per-track lineage sheet; reuses `topology.py` for rearrangement (new, see "Round 8")                                                      |
 | `webview/`                            | The pywebview desktop UI itself (see "pywebview UI" section below)                                                                                                                   |
 | `gap_analysis/`                       | Stub modules for manuscript analyses with no v1 implementation (see below)                                                                                                           |
 
@@ -1395,6 +1399,1346 @@ is correctly a no-op. Then, breaking 30 `Frame10` claims deliberately (20
 nulled, 10 swapped) and re-tracking `[9,11]` **repaired all 30 exactly**,
 with zero residual difference from the original table.
 
+### Round 12: close Round 11, fix what shipping revealed (2026-09-01)
+
+#### A. Registration now reaches the tracker
+
+Round 11's headline result was **unreachable from the product**: `drift_mode`
+existed only on the benchmark's `track_in_memory`, not on `track_cells`, so the
+setting that scores best could not be produced by the pipeline users run. Now
+threaded through `track_cells`, `track_all_populations`, `retrack_frame_range`,
+`webview/api.py` and the Track tab, **default `"none"`**.
+
+Verified from the product path, not the harness:
+
+| `drift_mode` | iou unreg | iou reg | fwd-bwd | margin | tracks |
+|---|---|---|---|---|---|
+| `none` (default) | 4.89% | 14.01% | 1.98% | 11.38 | 414 |
+| `centroid` | 8.08% | 1.76% | 1.12% | 21.63 | 473 |
+| `mask` (TA-style) | 9.43% | **0.35%** | **0.20%** | **31.93** | 488 |
+
+`none` is byte-identical to the stored tables on `AS_dorsal` and GBE, and
+`mask` reproduces 0.35 / 0.20 / 31.93 exactly. **The decision is left separate**
+-- this is the table, not a default change.
+
+*Incidental:* `centroid` produces **473** tracks, which is exactly the count of
+the stale GBE table that caused Round 11's false regression. That out-of-band
+run had drift compensation on.
+
+#### B. Two silent failures found by shipping
+
+**B1 -- the link-agreement overlay drew nothing and said nothing.** Three paths
+returned `{}` with no explanation (last frame, no npy folder, unreadable mask),
+and the render branch draws `{}` as *nothing*, which looks exactly like the mode
+being off. Every empty return now carries a `reason` and a message, rendered in
+the counts line. **Fixing the silence first was the right order**: whether
+anything further was broken became a glance instead of a hunt, and nothing
+further was.
+
+**B2 -- "Check how far this holds" vanished after applying a suggestion.**
+`showCorrectTrackFrame` cleared the panel *after* `await refreshCorrectTrackImage()`,
+so a frame change resolving mid-flight landed its reset on top of the
+freshly-shown panel. Fixed by clearing all panel state **synchronously, before
+the await**, which removes the await from between any reset and any later show
+-- not by reordering the two statements at the call site, which would not stop
+the next async caller. Same shape as the `_qc_scores`/`_qc_display` clobber:
+two paths writing one piece of state, ordering decided by timing. A smoke test
+now reproduces the exact race and asserts the panel survives.
+
+#### C. §8 closed -- and it is none of the three suspects
+
+All five variants -- shipped, `four_quadrant`, alternative-cost-as-cutoff, the
+per-cell extent gate removed, and all three together -- produce **byte-identical
+links**. So the LapTrack disagreement is not any of them.
+
+Over the 2,059 cells both tools linked on eight frame pairs, scored by our own
+cost: ours totals **1.98% less**, cheaper on **63** of the 69 differing cells,
+LapTrack cheaper on 5, with no exact ties. LapTrack also makes 9 links we do
+not. **It localises to the no-link / alternative-cost structure**: the two are
+solving slightly different problems, not the same problem differently, which is
+why neither dominates.
+
+**The † figures, re-measured, marks removed:** sentinel 32.0 on GBE and 85.0 on
+`AS_dorsal` at `overlap_weight=0` (constant across frame pairs, as claimed), so
+the additive `+1.0` is **+3.1%** there and **+1.2%** here -- the scale-freeness
+argument holds. At weight 1 the sentinel becomes per-frame-pair, 64.8-93.2. The
+two unmatched paths are both real and unequal: **142 sentinel-filtered against
+29 columns never emitted** (the plan said 139/82; the split depends on per-frame
+cell counts, which the regenerated extraction changed).
+
+#### D. T1: the adjacency, not the criterion
+
+**D1** -- `build_neighbor_graph(..., return_weights=True)` returns
+`{cell: {neighbour: contact_strength}}`. Identical topology, symmetric
+strengths, isolated cells kept; asserted in the self-test.
+
+**D2 -- a Schmitt trigger, not a threshold.** `contacts_in_track_space` gains
+`enter_px`/`exit_px`: present above `enter_px`, absent below `exit_px`, and the
+previous frame's verdict held in between. Measured, with a hard-threshold
+control:
+
+| setting | gained | lost | 1-frame reversal |
+|---|---|---|---|
+| **hysteresis off (current)** | **1,505** | **1,545** | 21.0% |
+| hysteresis 25 / 15 | 1,229 | 978 | **14.8%** |
+| hysteresis 20 / 10 | 1,189 | 1,123 | 14.4% |
+| hysteresis 40 / 20 | 356 | 148 | 13.1% |
+| **HARD threshold at 20 (control)** | 1,827 | 1,902 | **31.7%** |
+| HARD threshold at 25 (control) | 1,895 | 1,787 | 33.4% |
+
+Off reproduces 1,505 / 1,545 exactly. **The control is the point**: a hard
+cutoff of similar magnitude *raises* reversal to 31.7%, reproducing Round 9's
+1,832 / 31.6% from a different code path, while hysteresis lowers it to 14.8%.
+The two thresholds are doing the work, not the threshold. Default off.
+
+*On the reversal denominator:* 21.0% here is gains+losses pooled; Round 9's
+"27%" was gains only, `(1505-1102)/1505 = 26.8%`. Both correct, different
+denominators -- stated because this project has lost a number to exactly that
+before.
+
+**D3** -- `topology.validate_rosette_quartet`, napariCellFlow's four-cell check
+(`edge_analysis.py:183`), added as a **named alternative** beside the ported
+TissueMiner criterion, which is untouched. It annotates `rosette: True/False`
+and drops nothing. Its `min_edge_length` / `min_overlap_pixels` filters are
+deliberately NOT adopted -- those are the hard cutoffs D2 exists to avoid.
+
+#### E. Accept-and-revert (E1 only)
+
+`score_propagation_stop_frames` runs TA's `optimize_score` loop as a **line
+search** over candidate stop frames. Two constraints, both places this project
+has been burned:
+
+- **The score is not the quantity that produced the candidate.** Smart-stop
+  decides by neighbour settlement, so it is scored by `iou_agreement` on
+  registered masks instead -- self-confirming otherwise, like the IoU
+  circularity and the residual selection bias.
+- **Reverting is snapshot-and-restore, not an inverse.**
+  `merge_tracks_from_frame` can trigger `_evict_future_if_colliding`, which has
+  no clean inverse. Every trial runs on a deep copy. **Asserted: the live table
+  is byte-identical after scoring** -- that is the whole safety property.
+
+Verified on GBE. Honest caveat: on the arbitrary merge tested, all three
+candidates scored identically (2.155%), so the line search ran correctly but
+found a flat region. It has not yet been shown to discriminate on a real swap.
+
+#### F. Transient T1 axes -- three-way, defaulting to all
+
+`all` / `settled + can't judge` / `settled only`, because
+`annotate_persistence` produces three states and a checkbox would silently fold
+`unjudgeable` into one of the other two. **Defaults to showing everything**: a
+filter whose removals cannot be seen cannot be judged too aggressive.
+
+#### G. Reconciliations
+
+**G1 -- resolved, and it exposes a number I got wrong.** With the correct
+population (both prev and next present, which is what TA's rule needs), the
+figures reproduce the plan **exactly**: n = 6,593, 64.8% below 1.0, 22.5% below
+0.75, 42.2% in [0.75, 1.0). Round 11 reported 5.4% below 0.75 -- that was
+measured against the **stale drift-compensated table**, whose coherently
+shifted identities score better on neighbour Dice by construction. The stale
+baseline produced a second wrong number, not just a false regression.
+
+| definition | n | < 1.0 | < 0.75 | [0.75, 1.0) |
+|---|---|---|---|---|
+| **both directions present (TA's rule)** | **6,593** | **64.8%** | **22.5%** | **42.2%** |
+| any direction available | 7,421 | 62.4% | 21.2% | 41.2% |
+
+**G2 -- both candidate explanations disproved, gap unexplained.** The drift
+estimate's provenance is not it: mask-derived and `Cells_info`-derived drifts
+differ by 0.089 px median and give 0.709 vs 0.711. Integer rounding is not it
+either: a half-pixel change in the applied shift moves median best IoU by
+0.007, not 0.04. **The measured value stays 0.377 -> 0.709 and the plan's
+0.417 -> 0.752 remains unaccounted for** -- recorded rather than reconciled by
+assumption, the same treatment 0.9094 got.
+
+**G3 -- the stale baseline is gone and the lesson is recorded.** GBE's derived
+outputs were deleted out-of-band; they have been **regenerated by the pipeline**
+(extraction 7,439 cells over 30 frames, matching the previous extraction
+exactly; tracking 414 tracks). **A baseline must be pipeline-produced. A
+hand-rerun table is not a baseline** -- it cost a false regression in Round 11
+and a wrong dead-band number in the same round.
+
+#### Not done
+
+- **§E2**, per-move acceptance for `find_confirmed_identity_moves`. E1 was the
+  designated starting point and is complete; E2 is untouched rather than
+  half-built.
+- **§11** (ground-truth capture UI) remains deferred by decision. The API
+  methods exist; the frontend still has zero references, deliberately.
+
+### Round 11: the reference was wrong, and the metrics that can prove it (2026-09-01)
+
+Round 10 built the judge. Reading Tissue Analyzer's source then showed **the
+judge itself was corrupted by tissue drift**. Everything below was verified
+in-repo before executing, and `v2/tracking_benchmark.py`'s self-test now
+asserts it.
+
+**Two reference documents in `v2/docs/` are authoritative** --
+`judge-calibration.md` and `unsupervised-metrics.md`. When a number here
+changes, change it there in the same commit. They exist because the 0.9094
+figure lost its provenance once and cost a round to recover.
+
+#### Tissue Analyzer registers before matching
+
+`match_by_max_overlap(..., pre_register=True)` -- default True -- calls
+`_pre_reg` then `apply_translation` on the PREVIOUS frame's whole label image
+before any overlap matching, in every branch
+(`EPySeg/epyseg/ta/tracking/last_tracking_based_on_matching_or_on_translation_from_mermaid_warp.py:44`).
+Read from source and confirmed. Its matching loop is then greedy
+maximum-overlap propagation over regions sorted by area -- no global
+assignment, no centroid at all.
+
+#### What registration does to the correspondence problem -- no tracker involved
+
+| property of the data | unregistered | registered |
+|---|---|---|
+| median best IoU | **0.377** | **0.709** |
+| median top-second margin | 0.224 | 0.661 |
+| cells with best IoU > 0.5 | 18.2% | 81.7% |
+| judgeable at IoU > 0.3 | 5,483 | 6,818 |
+
+**The unregistered reference has a median self-overlap of 0.377 against its own
+0.3 judgeability threshold.** It is operating at the edge of its validity, and
+it names a different successor for a substantial minority of cells once
+registered. No tracker appears anywhere in that table, which is what makes it
+the load-bearing measurement.
+
+#### Scoring the same three settings reverses the ranking
+
+| tracking setting | iou, unregistered | iou, registered | fwd-bwd ↓ | margin ↑ |
+|---|---|---|---|---|
+| no compensation (shipped default) | **4.89%** | **14.01%** | 1.98% | 11.38 |
+| centroid shift only (Round 10) | 8.08% | 1.76% | 1.12% | 21.63 |
+| TA-style: whole mask registered | 9.43% | **0.35%** | **0.20%** | **31.93** |
+
+Forward-backward consistency and the assignment margin have **no registration
+convention of their own**, so they cannot be biased toward either side. Four
+independent lines favour registration; the one that disagrees is the one shown
+above to be at its own validity limit.
+
+**The same tracking scores 4.89% or 14.01% on nothing but the convention of the
+reference.** `iou_agreement` therefore always reports which convention it used,
+and the UI names it in the readout.
+
+**None of this is an accuracy.** What is established is narrower and sufficient:
+the reference must be computed on registered masks, and **the Round 9/10
+conclusion that motion compensation makes tracking worse is not supported by
+any measurement that can test it.** It remains default-off and *undecided*.
+
+#### The 2x2 -- and a prediction that did not hold
+
+| cost | unregistered | registered |
+|---|---|---|
+| hybrid | 4.89% | 0.35% |
+| IoU only | 5.02% | 0.37% |
+| centroid only | 5.53% | 0.38% |
+
+Round 9's unregistered ordering reproduces exactly (4.90 / 5.03 / 5.54 then).
+Registration collapses the spread from 0.64 pp to **0.03 pp** -- once
+registered, the choice of cost form barely matters. But the plan's specific
+hypothesis, that IoU is *disproportionately* handicapped because overlap
+saturates while centroid distance degrades continuously, is **not supported**:
+all three costs improve by the same factor (13.6-14.6x). What the reference-free
+metrics do show is that IoU-only is the least self-consistent cost either way
+(forward-backward 5.14% unregistered against centroid-only's 0.46%).
+
+#### `registration_decision` -- measured, not a default
+
+Registers when the median global drift exceeds a configurable fraction
+(default 0.2) of the median cell radius. On GBE that is 6.97 / 13.00 = **0.54
+-> register**; on a tissue with no bulk motion the ratio falls below threshold
+and registration would be an identity operation anyway. That rule answers
+`AS_dorsal`, `pupae` and `cp_dataset` without anyone choosing per dataset. The
+Track tab shows the measured drift and the resulting decision, so the basis is
+visible rather than the behaviour changing silently.
+
+#### Two reference-free judges (§2)
+
+`forward_backward_consistency` solves each pair, then re-solves it transposed
+with the drift negated, and counts links where forward says a->b but backward
+does not say b->a. Not trivially satisfied: the displacement gate and the
+overlap term's `max(H,V)` bridge both come from the ROW cell, so transposing
+genuinely re-solves the problem.
+
+`assignment_margin` is the median (second-best - best) finite cost per assigned
+row. **Only comparable within a fixed cost scale** -- meaningless across
+`cost_form` settings, since the multiplicative form squares the distance.
+
+**Both share `environment_dice`'s blind spot**: a systematically wrong but
+self-consistent assignment satisfies them, exactly as a coherent identity
+permutation satisfies Dice. They are documented as such, because two metrics
+with the same blind spot are one metric.
+
+#### Vectorised `build_cost_matrix` (§7) -- the blocker removed
+
+It did one pandas `.loc` per candidate pair, ~62,500 for a 250x250 frame pair.
+That is why two Round 10 measurements ran past 40 minutes and were killed.
+Broadcasting gives the identical matrix:
+
+| dataset | identical? | vectorised | original loop |
+|---|---|---|---|
+| `AS_dorsal view_E-cad` | yes | 3.0 s | 39.6 s (13x) |
+| `embryos_GBE_GAP43` | yes | 8.4 s | 178.8 s (21x) |
+| `pupae_E-cad` | yes | 1.6 s | 32.0 s (20x) |
+
+`_build_cost_matrix_reference` keeps the original loop so the two can be
+asserted equal rather than believed equal. **Not bit-identical, and the
+self-test says why**: numpy's vectorised `sqrt` differs from scalar `sqrt` by
+up to one ULP (worst relative difference 2.6e-16). What is asserted instead is
+the NaN pattern exactly, the values to 1e-12, and -- the binding one -- that
+the resulting *assignment* is identical. Full-pipeline output is byte-identical
+on all three datasets.
+
+*A trap worth recording:* the first regression run compared against the stored
+GBE table and reported a failure. The stored table had been regenerated
+out-of-band (473 tracks, not the 414 the pipeline produces) so it was no longer
+a baseline. **Comparing against a stored artefact tests the artefact; comparing
+old code against new code on the same inputs tests the change.** The A/B above
+is the latter.
+
+#### `environment_dice`: Tissue Analyzer's dead band (§4)
+
+TA's `take_decision(sensitivity=0.75)` ignores a cell when BOTH directions
+score >= 0.75 -- worst-of-two, same combination rule as ours -- with the
+comment that such a cell "has most likely changed one or two neighbors, no
+reason to worry". 0.75 is exactly where losing a single neighbour never flags
+(0.750 / 0.800 / 0.833 / 0.857 / 0.875 for 4-8 neighbours). `optimize_score`
+then uses a **second, lower** threshold of 0.5 for repair, skipping perfect
+cells outright.
+
+Measured here (n = 6,455 cell-frames with both directions available):
+
+| rendering rule | darkened |
+|---|---|
+| continuous LUT, anything < 1.0 (previous) | 49.5% |
+| TA's rule, `min(prev, next) < 0.75` | 5.4% |
+| **cells sitting in [0.75, 1.0)** | **44.0%** |
+
+The band figure reproduces the plan's 42.2%; the absolute rates do not (the
+plan has 64.8% / 22.5%), so **our over-sensitivity is less severe than stated
+but has the same cause and the same fix**. Both tiers are now configurable in
+Correct Tracking, defaulting to 0.75 / 0.5.
+
+#### `iou_agreement`: margin and mutual tests (§5)
+
+`margin` requires the reference to beat its own runner-up by that much IoU;
+`mutual` requires the backward best to agree. Cells failing either become
+**unjudgeable, not correct** -- a tie the reference cannot resolve is not
+evidence the tracker was right. The overlay now shows **both** IoUs on click:
+`reference 0.301 vs this tracking's pick 0.231` reads as the near-tie it is,
+where a red cell alone does not.
+
+#### Also landed
+
+- **§6**: `cost_form`, `overlap_power`, `no_link_ratio` and `four_quadrant`
+  now reach `track_cells`, `track_all_populations`, `retrack_frame_range` and
+  `track_in_memory`. They existed but were unreachable, which made Round 10's
+  own "report its effect under both judges" unsatisfiable.
+- **§11**: `save_ground_truth_links` / `load_ground_truth_links` on the API.
+  The export seeds the CSV from the current tracking so a human corrects rather
+  than types. Ground truth is still the only judge that reports an accuracy.
+
+### Round 10: build the judge before touching the algorithm (2026-08-28)
+
+Round 9 concluded "nothing here fixes the swaps". That conclusion was reached
+with a judge that penalises the entire class of fix being tested, and with a
+diagnostic that was a filter artefact. **Both are corrected here, and the
+correction is the main deliverable** -- `v2/tracking_benchmark.py`, which is
+the first thing in this repo that reproduces any of these numbers. Everything
+before it came from throwaway scripts.
+
+#### Two corrections to Round 9
+
+**1. "The motion is jitter, not coherent" was wrong, and the evidence was an
+artefact of how it was measured.** Round 9 took each cell's best-IoU partner
+directly at each frame gap and found a flat 7.56 / 7.52 / 7.31 px. That
+selects against fast cells: a cell that moved far may not overlap its true
+successor at all, so its "best" partner becomes a slower neighbour sitting
+where it used to be, and the measured displacement is capped by construction.
+Measured by CHAINING mutual-best-IoU links instead, unfiltered, with centroids
+taken from the masks (independent of both `Cells_info` and the tracking table):
+
+| frame gap | measured | if fully coherent | if pure jitter |
+|---|---|---|---|
+| 1 | 7.56 px | 7.56 | 7.56 |
+| 2 | **14.10 px** | 15.12 | 10.69 |
+| 3 | **20.82 px** | 22.69 | 13.10 |
+
+The motion is coherent, and it is mostly one rigid translation: lag-1
+displacement autocorrelation +0.457 (x) / +0.314 (y), 88.5% of consecutive
+steps point the same way, and removing a whole-field drift of (0.36, 6.66)
+px/frame takes the median step from 7.57 px to **2.69 px**. The diagnostic
+takes its positions from the masks, so `Cells_info` cannot be a confound
+either way.†
+
+**2. The judge was not neutral about motion compensation.** Over 42,828 in-gate
+candidate pairs, Spearman(cost, IoU) is **-0.850** without prediction and
+**-0.709** with drift compensation. A judge built on best-IoU therefore
+penalises motion-predicting costs by construction, and cannot distinguish
+"moved links away from the truth" from "moved links away from the
+biggest-overlap cell".
+
+**The end-to-end result stands; what changes is what it means.** Motion
+compensation still doubles the wrong-link rate under that judge. Its status is
+now **undecided, not bad** -- which is why the code and its UI surface stay,
+default off, as the test case the harness exists to adjudicate once ground
+truth lands. See also §11 below on *why* a hard prediction can actively hurt.
+
+#### `v2/tracking_benchmark.py` -- the harness
+
+Three judges, and **each states its own bias in its own docstring, or it does
+not get added**:
+
+- `iou_agreement` -- agreement with each cell's best-IoU successor. Reproduces
+  **94.84% correct / 4.89% wrong / 0.27% broken at n=5,483 judged of 7,215**
+  cell-frames, i.e. **24.0% unjudgeable**, asserted in the self-test. Its bias
+  is the Spearman result above; its secondary bias is that the `IoU > 0.3`
+  filter selects slow cells, which is finding 1.
+- `environment_dice` -- mean neighbour-set Dice in track-ID space. Its bias is
+  severe and opposite: it is **invariant under a coherent permutation of
+  identities**, so shifting every identity one step the same way scores 1.0
+  while every link is wrong. It rewards exactly the systematic error drift
+  compensation can introduce. Never a sole judge, never an optimisation
+  objective.
+- `ground_truth` -- the only one that measures accuracy.
+
+**Use the reference judges as a pair.** Their failure modes are opposite, so
+only a change that loses on neither is credible.
+
+*Discrepancy recorded rather than tuned away:* the plan specified
+`environment_dice` = 0.9094 on GBE. Every definition tried gives **0.9015**
+(per-frame mean 0.8992, keeping untracked neighbours 0.8999, `dilation_px` 1
+and 3 give 0.9007 and 0.9025). The self-test asserts the measured 0.9015. A
+number whose definition cannot be recovered is not a number to fit code to --
+that is the whole subject of this round.
+
+The harness also ships the diagnostics that produced the findings, as
+first-class functions rather than scripts: `gap_growth` (chained, with both
+reference curves), `displacement_statistics` (autocorrelation and drift
+decomposition), `cost_judge_correlation` (**run this BEFORE trusting an
+`iou_agreement` comparison, not after**), and `track_in_memory`, which skips
+the per-pair Excel writes that dominate runtime.
+
+#### Ground truth (§2)
+
+`load_ctc_ground_truth` reads Cell Tracking Challenge `TRA` annotations
+(`man_track.txt` + `man_trackTTT.tif`). Validated on
+`test_data/CTC/DIC-C2DH-HeLa/01_GT` (84 frames, 1,082 links):
+
+- a tracking built from the ground truth itself scores **100.00%** -- if it did
+  not, the judge would be broken;
+- rotating one frame column drops it to 98.15%, so it detects corruption;
+- **our shipped cost scores 93.90% -- with 1,016 correct, 0 wrong and 66
+  missing.** On sparse well-separated cells our cost makes no wrong links at
+  all; every failure is a break.
+
+`environment_dice` returns `nan` there, correctly: CTC cells do not touch, so
+there are no neighbour sets. That is the judge declining to answer rather than
+inventing a score.
+
+**This validates the harness. It says nothing about GBE.** CTC has no
+membrane-labelled dense epithelial sheet and no coherent tissue flow -- exactly
+the conditions that make the GBE swaps hard. Never quote a CTC score as
+evidence about GBE. `load_link_csv`/`save_link_csv` take hand-labelled GBE
+links in the smallest possible format (`frame, cell_index_f, cell_index_f1`);
+deliberately no annotator, since the webview's two-frame view and
+click-to-select already produce them.
+
+#### The two judges rank drift compensation oppositely -- reproduced
+
+Run through the shipped code path (`predicted_centroids` = every centroid
+shifted by the measured global drift):
+
+| cost | `iou_agreement` wrong | `environment_dice` | tracks |
+|---|---|---|---|
+| centroid + overlap (shipped default) | **4.89%** | 0.9015 | 414 |
+| centroid only | 5.53% | 0.8969 | 414 |
+| global drift compensation | 8.16% | **0.9428** | 470 |
+
+**Drift compensation is worst under one judge and best under the other.** That
+is the structural opposition, not noise: `environment_dice` is invariant under
+a coherent permutation of identities, and a global drift shift is very close to
+exactly that permutation, so the judge rewards it for the property that makes
+it dangerous. `iou_agreement` penalises it for the property that might make it
+right. **Neither settles it. That is the whole argument for ground truth**, and
+for shipping nothing here as a default.
+
+*(A note on running this yourself: an early version of this comparison silently
+fell back to `centroid_weight=1.0` for the IoU-only row via a `cw or 1.0`, so
+it reported IoU-only as identical to the default. The measured IoU-only wrong
+rate is 5.03%. `0 or 1.0` is `1.0` in Python, and a weight of zero is a
+legitimate setting here.)*
+
+#### Gap closing (§3), as a second-stage LAP
+
+`close_track_gaps` joins a track that ends at frame `f` to one that begins at
+`f + 1 + g`. It is a **second assignment problem over track segments**, not a
+special case inside the frame-to-frame one -- the structure u-track (Jaqaman
+2008), TrackMate and LapTrack all share, and the same
+`linear_sum_assignment` with no ILP and no flow network. The overlap term is
+deliberately unused: the two cells are in non-adjacent frames, so their masks
+need not overlap and an IoU of 0 carries no information.
+
+`max_frame_gap=0` everywhere by default, so the merged table stays
+byte-identical -- verified against the stored tables on both `AS_dorsal`
+(181 x 26) and `embryos_GBE_GAP43` (414 x 32).
+
+Turned on at `max_frame_gap=1` on GBE:
+
+| | tracks | `iou_agreement` wrong | `environment_dice` |
+|---|---|---|---|
+| off | 414 | 4.89% | 0.9015 |
+| on (10 joins) | **404** | 4.89% | 0.9015 |
+
+**Neither judge moves at all, and that is a fact about the judges, not about
+gap closing.** Both score frame-to-frame links; gap closing adds no
+frame-to-frame link, it only joins two segment ends across a frame that has
+none. So the correct reading is "**both judges are structurally blind to this
+change**", not "the change is neutral". What it does move is the track count,
+by -2.4% here -- which is exactly the quantity the manuscript's cell-loss
+benchmark is built on. Judging gap closing needs `ground_truth`, which is
+another reason it ships off.
+
+#### `annotate_persistence` -- a real bug, exactly diagnosed (§4)
+
+`horizon = min(int(persist_frames), len(contacts_after))` silently degraded the
+requirement to whatever lookahead existed. At the end of the movie
+`contacts_after` is empty, the horizon becomes 0, `held >= 0` is always true,
+and **every event in those frame pairs was marked persistent
+unconditionally**. That was the entire discrepancy between Round 9's planned
+and delivered figures:
+
+| `persist_frames` | delivered | from frames with too little lookahead | excluding those |
+|---|---|---|---|
+| 1 | 1,102 / 1,264 | 55 / 39 | **1,047 / 1,225** |
+| 2 | 906 / 1,160 | 100 / 86 | **806 / 1,074** |
+
+The bias is not neutral: the unjudgeable frames all sit at the end of the
+movie, where germband extension is most active. It is now a **three-state**
+annotation -- `persistent` / `transient` / `unjudgeable` -- counted separately
+in `get_t1_events` and shown as all three in the dynamics readout. An observed
+reversal still decides even on a short lookahead; only "ran out of movie"
+yields `unjudgeable`.
+
+#### T1 criterion: what napariCellFlow does differently (§5)
+
+Read from source. napariCellFlow defines a contact by dilating masks and
+skeletonising the shared boundary, has a `min_edge_length` filter, has **no**
+persistence or flicker filter, and works on the adjacency graph with geometry
+used only for secondary validation -- so far, much like ours. The difference
+that matters is its **validation**: a T1 must involve **exactly four unique
+cells**, and the four connecting "ring" edges must exist in **both** frames.
+
+We count half-events per cell (TissueMiner's convention) and never check that a
+gain has a matching loss forming a canonical quartet. Measured on
+`embryos_GBE_GAP43`:
+
+| criterion | gains |
+|---|---|
+| ours (TissueMiner half-events) | 1,505 |
+| **satisfying napariCellFlow's quartet + intact ring** | **650 (43.2%)** |
+| rejected as not a canonical T1 | 855 (56.8%) |
+
+At frame 4, 6 of 10 gains pass. For comparison, the persistence filter removes
+27% of gains; the quartet condition removes 57%, and it does so **at detection
+time** rather than post hoc.
+
+**Recommendation: add it as a named alternative criterion, not a replacement,
+and do not enable it by default.** Two reasons for caution. It is stricter
+than the physics requires -- a real T1 where one of the four cells is untracked
+or where segmentation breaks the ring is rejected, so 56.8% is an upper bound
+on what is false, not an estimate of it. And it is a *different definition* of
+the event, not a filter on ours: `detect_t1_transitions` is the ported
+TissueMiner criterion and the module docstring draws a line around what is
+ported, so a geometric or quartet criterion belongs beside it with its own
+provenance note. The geometric definition in Phys. Rev. Research 6, 033176
+(2024) and Phys. Rev. E "Geometry of T1 transitions in epithelia" -- a bond
+shrinking to zero with a new bond opening perpendicular to it -- is the natural
+form for that alternative, and is complementary to the set difference because
+it can separate a real T1 from threshold noise at detection time.
+
+#### UI restructure (§6)
+
+**Cell dynamics moved from step 6 (Correct Tracking) to step 7 (Trajectory)**
+-- it is a result to look at, not a correction tool, and step 7 already has the
+playback and zoom that reading it needs.
+
+**Step 6 gained a link-agreement overlay** driven by
+`tracking_benchmark.classify_links`, with four states rendered distinctly:
+agrees / disagrees / **can't judge** / broken. The wording is a hard
+constraint, not a preference: it says *disagrees with an overlap reference*,
+never "error", the `?` popover carries the reference's measured bias, and the
+unjudgeable state is always visible because it is about a quarter of cells.
+An overlay that hid it would re-introduce precisely the agreement-vs-accuracy
+confusion this round exists to remove.
+
+#### LAP cost-structure alternatives (§7) -- all default-off
+
+- **`no_link_ratio`** on `_no_match_sentinel`: TrackMate's multiplicative
+  `C_alt = ratio * max(C)` (it uses 1.05) instead of our additive `max + 1`.
+  The additive constant is not scale-free -- the same `+1.0` is a much larger
+  relative nudge on a dataset whose costs are small than on one whose costs are
+  large, so one line of code means a different drop propensity per dataset.†
+  `None` reproduces today exactly.
+- **`cost_form="multiplicative"`**: TrackMate's `P = 1 + w*(1-IoU)^p`,
+  `cost = (d*P)^2`. Dimensionless, so it removes the `max(H, V)` bridge that
+  converts IoU into pixels -- which is why our additive form lets the total
+  exceed the displacement ceiling, and turns the sentinel from a movie-wide
+  constant at `overlap_weight=0` into a per-frame-pair quantity once the
+  overlap term is on.†
+- **`overlap_power`**: ultrack raises overlap weights to a power to favour
+  fewer, better-overlapping matches. Default 1 is linear, i.e. unchanged.
+- **`four_quadrant`** in `match_frames`: TrackMate's `(n+m) x (n+m)` block
+  matrix. Our rectangular form produces **two different unmatched paths** that
+  are not treated alike: a row matched to a sentinel column (filtered
+  afterwards, and it leaves a record) and, when `m > n`, a column never emitted
+  at all -- no cost, no record.† Only one of the two is visible. Asserted to
+  reproduce the rectangular links exactly when off.
+
+
+#### Cross-check against LapTrack (§9)
+
+LapTrack 0.17.0, installed in a throwaway venv rather than the project
+environment. Compared **link for link** on the centroid-only cost, which is the
+one cost both tools express identically, so a disagreement localises a bug in
+our implementation rather than a difference of method.
+
+| | links | identical to ours |
+|---|---|---|
+| ours (centroid only) | 7,007 | -- |
+| LapTrack, `euclidean`, cutoff = our ceiling | 7,067 | **6,383 (91.09%)** |
+
+**The most useful line: `cells only we linked = 0`.** Every link we make,
+LapTrack also makes; it makes 60 more. So our solver is not dropping links a
+reference implementation keeps -- it is more conservative, which is the
+sentinel acting as a ceiling (see `_no_match_sentinel`). The remaining 624
+cells (8.91%) are linked by both but to a different target.
+
+*A methodological note worth keeping.* The first run of this comparison
+reported only 83.37% agreement, because it used LapTrack's `sqeuclidean`
+metric against our plain Euclidean distance. **Minimising the sum of `d^2` is
+not the same assignment problem as minimising the sum of `d`** -- the squared
+form penalises one long link more than several medium ones, so the optimum
+genuinely differs. That is a real 8-point difference produced entirely by a
+metric mismatch in the harness, not by either implementation, and it is the
+same class of error as everything else in this round: the comparison was not
+measuring what it claimed to.
+
+*Not completed:* a follow-up run intended to localise the remaining 8.91% to a
+single design choice (four-quadrant matrix / alternative-cost form / the
+per-cell extent gate) was abandoned after ~40 minutes -- neutralising the
+per-cell gate makes almost every in-ceiling pair finite, which blows up both
+the Python cost loop and the assignment. Redo it on a few frame pairs rather
+than the whole movie. The three candidate causes are all now switchable
+(`four_quadrant`, `no_link_ratio`, and the gate), so it is a short job.
+
+LapTrack's own paper demonstrates **drift-compensated tracking** as a worked
+example. That matters here: it means our measured failure of drift
+compensation on GBE is a question about our data or our judge, not evidence
+that the technique does not work.
+
+#### Design notes (no code this round)
+
+**Two-step LAP, and why it replaces the min-cost-flow plan (§8).** u-track
+(Jaqaman 2008), TrackMate and LapTrack all use the same two-stage structure:
+step 1 is the frame-to-frame LAP we already have, producing tracklets; step 2
+runs a SECOND LAP over track *segments* to close gaps and to split and merge.
+It is the same `linear_sum_assignment` -- no ILP, no flow network -- which
+makes it a much cheaper route to multi-frame consistency than the sliding-window
+min-cost flow scoped earlier, and it is the field standard. `close_track_gaps`
+is step 2's gap-closing channel; its splitting channel is the natural interface
+to `lineage.py`'s division detection. Implement the rest after ground truth
+exists, not before: step 2 has cutoffs that cannot be tuned without it.
+
+**Why a swap-gain penalty cannot be added to the cost.** Within a frame pair
+the linear assignment already minimises total cost, so
+`c(i,j) + c(i',j') - c(i,j') - c(i',j)` is information the objective already
+has. Making it explicit turns the problem into a quadratic assignment problem,
+which is NP-hard, and `linear_sum_assignment` no longer applies.
+`suggest_match_candidates`' `swap_gain` is useful *only* because it reads frame
+`f-1` -- information from outside the pair. The linear way to use `f-1` is
+motion compensation; the non-degenerate way is multi-frame optimisation.
+
+**Multi-frame option, scoped not built.** Sliding-window min-cost flow:
+trajectory cost is additive over edges, so it stays polynomial and exact, and
+it expresses gap closing, appearance and disappearance natively. A second-order
+expansion (node = one link, edge = two consecutive links) expresses velocity
+smoothness and remains a flow problem. Graph size on GBE is around 7,400 nodes
+and 43,000 edges first-order (this round measured 42,828 in-gate candidate
+pairs, which is the same quantity), and roughly an order of magnitude more
+second-order -- seconds to solve either way. **Compute is not the constraint;
+ground truth is.** It is also MORE
+prone to the coherent-mislabelling failure that neither current judge can
+catch, which is a reason to have the judge first. Reference implementation:
+ultrack (global ILP over segmentation hypotheses and links).
+
+**Temporal-consistency segmentation: hypothesis selection, not propagation
+(§10).** An earlier suggestion in this project was seeded/propagated
+segmentation, where the previous frame constrains the current one. ultrack
+shows the better form: keep a HIERARCHY of segmentation hypotheses per frame
+and let the tracker select among them under flow-conservation constraints,
+rather than committing to one segmentation propagated forward. Propagation
+locks errors in along the time axis and is direction-dependent; hypothesis
+selection is neither. Recorded, not implemented -- the hierarchy machinery
+(ultrametric contour maps, watershed-by-area dendrograms) is out of proportion
+to this project.
+
+**Prediction with uncertainty -- the principled form of motion compensation
+(§11).** btrack initiates a probabilistic model per tracklet and predicts
+future states *and the error in those states*, then assembles tracklets by
+multiple-hypothesis testing under integer programming. This is the mechanistic
+explanation of why our motion compensation hurt: **a linear assignment treats
+the prediction as CERTAIN**, so prediction error becomes a hard displacement of
+the search centre. A wrong prediction does not merely fail to help -- it
+actively moves the search toward the wrong neighbour. A prediction carrying a
+covariance degrades gracefully to no-prediction when it is unreliable, which is
+exactly the behaviour our version lacks. Not implemented this round: a Kalman
+filter has parameters that cannot be tuned without ground truth.
+
+**How the field does it, and what was deliberately not borrowed.** Tissue
+Analyzer / EPySeg `match_by_max_overlap` (greedy overlap propagation of the
+previous frame's identities, whole-list re-tracking only -- worse than our
+`retrack_frame_range`); TissueMiner (no tracking of its own; aggregates so
+flicker cancels); napariCellFlow (overlap ratio + max displacement + gap
+closing, plus the T1 quartet condition above); EmbedTrack / Trackastra (learned
+motion field / multi-frame attention); ultrack (global ILP).
+
+#### Corrections to earlier rounds
+
+**Round 7 mis-attributed the perimeter line.** It said the closed line around
+the whole image perimeter on `embryos_GBE_GAP43` came from the user's
+hand-corrections. The user states this dataset was never hand-corrected, and
+1,468 = 2 x (300 + 434) is exactly the image perimeter. Checked across the
+project's datasets, first frame of each:
+
+| dataset | input format | image border drawn |
+|---|---|---|
+| `embryos_GBE_GAP43` | TIFF | **100%** (1,468 px = 2(H+W)) |
+| `Demo_Seg_QC` | TIFF | **100%** (836 px = 2(H+W)) |
+| `AS_dorsal view_E-cad` | Cellpose `.npy` | 0% |
+| `pupae_E-cad` | Cellpose `.npy` | 0% |
+| `cp_dataset_puzzle-like_cells` | Cellpose `.npy` | 0% |
+
+**The border tracks the input format, not the curation.** Both TIFF-mask
+datasets have a complete perimeter line; none of the three native-Cellpose
+datasets has one. It is a property of how a skeleton/outline TIFF is written --
+the image edge is drawn as part of the boundary network -- so it arrives with
+the file and is not evidence that anyone edited anything. `_handCorrection` in
+those filenames is a naming convention from the exporting tool, not a record of
+curation. The `_close_label_gaps` 3 px bound stays: it was a real bug either
+way, and it is what stopped those border pixels being teleported inward.
+
+**Round 9's "median displacement does not grow with frame gap ... signature of
+non-persistent motion" is withdrawn.** See finding 1 above. The flat curve was
+a filter artefact. The end-to-end measurement it was used to explain still
+stands; the explanation does not.
+
+#### † Figures carried from the Round 10 plan, not re-measured here
+
+The claims marked † above come from the review that prompted this round and
+were **not independently re-measured**, because the run that would have done it
+is slow enough to be its own task: `build_cost_matrix` does one pandas `.loc`
+lookup per candidate pair, so a single 250 x 250 frame pair costs ~62,500 of
+them, and re-deriving the sentinel magnitudes and the two unmatched-path counts
+across the movie ran past 40 minutes without finishing.
+
+They are stated qualitatively above rather than numerically, and nothing in the
+code depends on them: `no_link_ratio` and `four_quadrant` both default to
+today's behaviour and are asserted inert. Re-measure on a handful of frame
+pairs before quoting any of them as a number -- the same rule this round exists
+to enforce applies to the plan's numbers too.
+
+*(That `.loc`-per-pair cost is also why `track_in_memory` exists and why the
+LapTrack localisation was abandoned. It is a real optimisation target, but
+touching the cost loop is not a change to make while its output is the
+regression baseline.)*
+
+#### Standing constraint
+
+**No accuracy figure for swaps, T1 or cell loss may be quoted from any judge
+other than `ground_truth`.** Everywhere else, say "agreement", name the
+reference, and state its bias. The generalised version of this is now rule 5 in
+`CLAUDE.md`.
+
+
+### Round 9: tracking cost function + stabilized T1 (2026-08-26)
+
+Two reports from real use on `embryos_GBE_GAP43`: cell IDs swap often, and T1
+detection misfires often. The user asked for a mask-IoU-only cost function and
+a user-definable cost, and whether TissueMiner has a stabilized-T1 optimization.
+
+**Measurement came first, and it moved the design twice.**
+
+#### The swaps are real; IoU is not the fix
+
+Of cells with an unambiguous successor (best mask IoU > 0.3, n = 5,483):
+**94.8% continue correctly, 4.89% are linked to the wrong cell, 0.27% break**.
+So this is mis-assignment, not ID churn. At 4.9% per step over 29 steps, ~77%
+of tracks hit at least one swap.
+
+Three suspects were tested and **ruled out**:
+
+- *The displacement gate* kills **0%** of correct pairs (median displacement
+  7.9 px, cell extent 23 px, ceiling 31 px).
+- *Too little overlap weight* -- sweeping 0 -> 50 barely moves held-out area
+  continuity (links with a >50% area jump: 5.4% -> 4.9%). Area is a weak
+  arbiter for swaps between neighbours, which have similar areas, so this was
+  suggestive rather than decisive on its own.
+- *A longer baseline favouring the mask* -- **the opposite**. Over a 2-frame
+  gap, recovering the chained 1-frame consensus gives centroid-only 32.1% and
+  IoU-only 30.9%; chaining two 1-frame best-IoU steps disagrees with a direct
+  2-frame best-IoU match 67% of the time. IoU degrades at least as fast as the
+  centroid here, so the premise behind the IoU-only request does not hold on
+  this data.
+
+#### ⚠️ Motion compensation was built, measured, and DEFAULTS OFF -- it makes this worse
+
+A residual analysis said the cost's real flaw was assuming cells do not move:
+predicting each cell from its own previous displacement dropped the median
+residual from 7.9 px to 2.3 px (frame-wide median: 4.0 px), against a 26 px
+neighbour spacing. It was built on that basis. **Measured end to end against
+agreement with each cell's best-IoU successor, it roughly doubles the swap
+rate:**
+
+| setting | swap rate | track breaks | tracks |
+|---|---|---|---|
+| **hybrid, no prediction (shipped default)** | **4.89%** | 0.27% | 414 |
+| motion compensation on | 9.52% | 0.53% | 482 |
+| constant velocity, damped 0.5 | 7.38% | -- | -- |
+| prediction in the cost only, gate on the actual position | 9.68% | -- | -- |
+| IoU-only + motion compensation | 6.01% | -- | -- |
+
+It is monotonic in how much prediction is applied, and moving the gate with
+the prediction is *not* the cause (that variant is marginally the worst).
+
+> **Superseded by Round 10.** The reasoning in this subsection about jitter
+> versus coherent motion is WRONG -- the flat gap curve it rests on is a filter
+> artefact, and the motion on this dataset is coherent. The end-to-end
+> measurement (motion compensation doubles the wrong-link rate under
+> `iou_agreement`) still stands, but that judge is now known to be biased
+> against exactly this change. Read Round 10 before acting on any of it.
+
+**Why the residual analysis was wrong, because this is the reusable lesson.**
+Those residuals were measured only over cells that were *already tracked
+correctly across three frames* -- the subset where prediction was not needed.
+Cells whose motion was large or irregular are exactly the ones that got
+swapped, so they either broke the chain or contributed a wrongly-small
+displacement. The evidence against the idea was already in hand and was
+misread: **the median displacement does not grow with frame gap** (7.9 / 8.2 /
+8.0 px at gaps 1, 2, 3) while the tissue drifts only 2.63 px/frame. A constant
+median across gaps is the signature of *non-persistent* motion -- jitter around
+a slowly-moving mean -- and extrapolating the last step in that regime adds
+noise (variance 6*sigma^2 against 2*sigma^2) rather than removing it. Growing
+displacement would have meant coherent motion; it doesn't.
+
+*(Round 10: that last paragraph is exactly backwards. Measured by chaining
+mutual-best-IoU links instead of re-matching at each gap, displacement grows
+7.56 / 14.10 / 20.82 px -- 93% of fully coherent. The flat curve came from the
+`IoU > 0.3` selection keeping only slow cells at large gaps. The correct
+mechanistic explanation for why the prediction hurt is in Round 10 §11: a
+linear assignment treats the prediction as certain, so its error displaces the
+search centre instead of degrading gracefully.)*
+
+The code is kept because it is the correct model for a movie with genuine
+coherent drift (a translating tissue, stage drift), which this one is not.
+`predict_centroids` supplies `build_cost_matrix`'s `predicted_centroids`, which
+**replaces** each frame-1 cell's centroid rather than adjusting each comparison,
+so the plausibility gates move with the prediction too. Default **off** in
+`track_cells` *and* in the webview. If a future session wants it gone, nothing
+depends on it.
+
+#### So what does fix the swaps? Nothing here does
+
+Every cost the new controls can express, scored the same way:
+
+| cost function | swap rate |
+|---|---|
+| **centroid + mask overlap (shipped default)** | **4.90%** |
+| hybrid, overlap weight 10 | 4.92% |
+| mask overlap (IoU) only | 5.03% |
+| centroid only | 5.54% |
+| IoU-only + motion compensation | 6.01% |
+| hybrid + motion compensation | 9.57% |
+
+**The shipped default already wins.** Note the metric is agreement with each
+cell's best-IoU successor, which is *biased in IoU-only's favour* -- and
+IoU-only still loses to the hybrid. That makes the conclusion stronger, not
+weaker. What the ordering does show is that the mask carries real information:
+centroid-only is the worst of the three non-predictive costs, so the overlap
+term added in Round 6 is earning its place. It is just already being used.
+
+The swaps are not caused by the cost function's *form*. They come from ~8 px of
+per-frame centroid jitter against a 26 px neighbour spacing -- an ambiguity no
+reweighting of these terms resolves. Anything that genuinely helps will have to
+add information these terms do not carry: more of the movie at once
+(multi-frame or global assignment), or a better-conditioned centroid. Worth
+saying plainly rather than shipping a knob and implying it is a fix.
+
+*(These come from an in-memory harness that skips the per-pair Excel writes;
+it reproduces the full `track_cells` run's baseline to within 0.01 pp --
+4.90% against 4.89% -- and is ~40x faster, which is what made a six-way
+comparison affordable.)*
+
+`centroid_weight` was added alongside `overlap_weight` as requested;
+`centroid_weight=0` IS the IoU-only mode, with no separate code path. **Neither gate is scaled by it**
+-- they are a plausibility filter, not part of the cost (the separation
+`_no_match_sentinel` already describes), which is what stops a distant cell
+winning on a sliver of overlap. Both weights zero is rejected rather than
+silently returning an all-zero matrix.
+
+**Also fixed: `retrack_frame_range` was solving a different cost.** It called
+`build_cost_matrix(cells_a, cells_b, feature_columns, weights)` with no
+overlap term and no displacement ceiling, so a local re-track could "repair" a
+link into something the full run would never have chosen. It now takes the same
+`npy_folder`/weights/motion settings, threaded from the same API state.
+
+#### TissueMiner has no stabilized T1 -- and does not need one
+
+Read from `/Users/a72670/tissue_miner`: `topology/CountT1.R` is a raw
+time-shifted set difference whose only filters are the margin cell
+(`cell_id != 10000`), presence in both frames, and the division relabel.
+`triangles/CategorizeTriangles.R`'s "filter by connectivity" is a validity
+check for that relabel, not stabilization. Nothing in the C++ parser either --
+no minimum bond length, no four-fold-vertex handling, no cooldown.
+
+**Why they get away with it:** their outputs are ROI *rates* and *nematic
+averages* (`mqf_cg_roi_rate_T1`, `mqf_fg_unit_nematics_T1`), in which a gain
+and its immediate reversal cancel. Epi-Quant draws individual events on
+individual frames, which is exactly where a flicker stops cancelling and starts
+looking like a finding. Structurally the same situation as Round 8's
+delamination: a term TissueMiner does not need because of how it reports.
+
+`topology.annotate_persistence` marks each event `persistent` /
+`persisted_frames` and **never drops one**. Measured through the API on
+`embryos_GBE_GAP43` (1,505 raw gains / 1,545 raw losses):
+
+| `T1 must hold` | settled gains | settled losses |
+|---|---|---|
+| 0 (TissueMiner's own behaviour) | 1,505 | 1,545 |
+| 1 further frame | 1,102 | 1,264 |
+| 2 further frames | 906 | 1,160 |
+
+So **27% of gains and 18% of losses reverse within one frame**. At frame 4, 19
+of 35 T1 cells are transient. A horizon that runs past the end of the movie is
+*shortened*, not failed -- the end of a movie is not evidence that an exchange
+reversed. (An earlier standalone script instead skipped those frames entirely,
+which is why it reported 1,047/1,225; the API's convention is the deliberate
+one.)
+
+**The adjacency definition is NOT the cause.** Six variants tested --
+`adjacency.build_neighbor_graph` at `dilation_px` 1 and 2, and
+`tissue_features.build_interface_graph` at `min_interface_px` 2/5/10/20.
+Gains stay in the 1,468-1,505 band and the reversion rate in 21-24%. A *large*
+interface threshold makes it **worse** (20 px -> 1,832 gains, 31.6%
+reversion), because a hard length cutoff turns a smoothly shrinking bond into
+threshold-crossing flicker. Do not try to fix this by thresholding interface
+length.
+
+**The two issues are coupled.** A swap between adjacent cells rewrites both
+neighbour sets at once: cells with >= 3 simultaneous neighbour changes carry a
+13-16% swap rate against a 3.7% baseline (~4x enrichment), and 29% of changed
+cells are in that bucket.
+
+#### Rendering and UI
+
+Unsettled T1 cells are dimmed toward the base image and their nematic axis is
+drawn **thin and dashed** instead of solid -- the axis-level counterpart of
+Round 8's faded-candidate treatment, reusing the same `confirmed` flag through
+`_dynamics_states`. The Track tab gained a cost-mode radio group, a weight cap
+raised 5 -> 50, and a `Motion compensation` checkbox; the dynamics panel gained
+`T1 must hold [N] frame(s)` and a readout showing **both** totals, so the
+filter's effect is always visible rather than silently applied.
+
+`motion_compensation` defaults **off** in `cell_tracking.track_cells` and **on**
+in the webview. That divergence is deliberate: the function default keeps the
+published baseline reachable and lets the self-tests pin it, while the app
+default is the setting that tracks better.
+
+#### Regression
+
+With default parameters the new `build_cost_matrix` is **bit-identical** to the
+pre-change formula (max |new - old| = 0 over four frame pairs on both
+`AS_dorsal` and `embryos_GBE_GAP43`), and `track_cells` reproduces the stored
+merged tables byte-for-byte on both.
+
+*Worth knowing for anyone writing a harness against this:* the first attempt
+reported `AS_dorsal` as differing, purely because it passed
+`masks/npy_converted` -- a folder that only exists for TIFF-derived projects.
+`_FrameLabelLoader` is falsy for a missing folder, so the overlap term switched
+off **silently** and the run was centroid-only. Native-Cellpose projects keep
+their `.npy` files directly in `masks/`. A silent fallback is the right runtime
+behaviour but a trap in a benchmark; check `bool(_FrameLabelLoader(folder))`
+before trusting a comparison.
+
+**On the manuscript's cell-loss benchmark:** because motion compensation now
+defaults off everywhere and the cost is bit-identical at defaults, this round
+does **not** add a fourth invalidation -- the three from
+`_merge_tracking_pairs`, Round 6's overlap term and Round 7's
+`_close_label_gaps` bound still stand and are still outstanding. Switching
+motion compensation on, or changing cost mode, would add one.
+
+No accuracy figure for swaps or T1 should be quoted from this round -- there is
+no ground truth for either here. The swap rates above are agreement with a
+best-IoU successor, which is a *comparison between settings*, not an accuracy.
+
+### Round 8: cell dynamics + lineage sheet (2026-08-26)
+
+Driven by a reviewer point: Epi-Quant claims broad applicability but was never
+demonstrated on tissues with **dividing** or **intercalating** cells, with the
+reviewer offering germband extension as an example and the alternative of
+acknowledging the limitation. `test_data/embryos_GBE_GAP43` *is* germband
+extension, so the demonstration was available.
+
+**`v2/lineage.py` (new)** — division and delamination detection plus the
+per-track lineage sheet. Rearrangement reuses `topology.py` unchanged.
+Everything produces **candidates with their evidence, never verdicts**, and the
+lineage sheet is built only from events a human confirms. Two findings forced
+that framing:
+
+*Division has no reference implementation to port.* TissueMiner does not infer
+divisions — Tissue Analyzer paints daughters into `dividing_cells.tif` and
+`DeformingTissue.cpp:228` merely tests `pv == Pixel::DividingCellValue`.
+Without TA it reports **zero** divisions, every `lineage_group` becomes a
+singleton and every `generation` 0. Only the mother→daughter *pairing*
+(nearest-centroid within a cluster) is inference, and that is what is ported.
+
+*Delamination cannot be told from a tracking break by overlap.* TissueMiner's
+`Apoptosis` is a residual bucket — whatever survives "stayed" and "moved out of
+mask" (`DeformingTissue.cpp:516-522`). Both a delaminating cell and a broken
+track end with the cell's territory absorbed by neighbours. **The measurements
+that settled the design:**
+
+| rule | candidates on `embryos_GBE_GAP43` |
+|---|---|
+| TissueMiner's bare residual bucket (interior + unexplained) | **208** |
+| + area must have been shrinking | 100 |
+| + cell must also END small (< 50% of median area) | **1** |
+
+The middle row is why the second term exists. Those 100 had a median final area
+of **400 px against a population median of 380** — 99% ended at more than half
+the typical cell size, i.e. they vanished at full size. That is a broken track,
+not a cell leaving the epithelium. Margin cells are excluded *before* any of
+this, matching TissueMiner's ordering, since that ordering decides what gets
+called a delamination at all.
+
+**What the GBE dataset actually shows: 0 divisions, 1 delamination candidate,
+and abundant intercalation** (10 gained / 8 lost contacts and 35 cells involved
+at frame 4). That is the biologically expected answer — germband extension
+extends by intercalation, not division — and it is also why the earlier signals
+were misleading: cell count falls 21.6% while median area *rises* 11%, which is
+tissue leaving the field of view, and 308 of 414 tracks end in the interior,
+overwhelmingly from tracking breaks rather than biology.
+
+**The lineage sheet** (`cell_track_output/cell_lineage.xlsx`) uses TissueMiner's
+`cell_histories` shape (`CreateDbFromParser.R:513-532`): `track_id`,
+`first_frame`, `last_frame`, `mother_track_id`, `left`/`right_daughter_track_id`,
+`appears_by`, `disappears_by`, `lineage_group`, `generation`. Vocabulary mirrors
+their `gainDict`/`lossDict`, with one **deliberate divergence**: their loss code
+5 maps to the literal `"SegErrAppearance"` — the same string as gain code 4 — so
+appearance and disappearance errors are indistinguishable in their output. That
+is a bug; we use `SegErrDisappearance`. `lineage_group` is weakly-connected
+components over the mother→daughter edges and `generation` the depth from the
+root, as in `RevealLineage.R` — implemented with union-find, since the edge set
+is a forest and no graph library is needed.
+
+`last_frame` reads the last **non-NaN** claim, not the last column:
+`_merge_tracking_pairs` emits `range(start, start + count + 1)`, so 30 frames of
+pairs yield a `Frame31` that can never hold anything.
+
+**Visualisation** — a new `"dynamics"` colour mode in Correct Tracking, with
+division / delamination / T1 in separate colours and the T1 orientation axes
+drawn on top (blue = bond gained, orange = lost). **Confirmed events render
+solid; unconfirmed candidates are blended toward the base image**, so the two
+can never be mistaken — the whole point of a curation workflow is that the
+detector proposes and a human decides. This also finally gives `topology.py`'s
+T1 backend a UI; it had none.
+
+Note `get_tracking_overlay` is called **positionally** from `app.js`, so the new
+`show_nematic_axes` parameter is appended last and the JS call updated in step.
+
+**No accuracy is claimed and none should be quoted.** There is no ground truth
+for these events in this project, which is exactly why the curation framing
+exists. Everything above is a count of candidates.
+
+### Round 7: the perimeter-line cascade, propagation depth, T1 transitions (2026-08-25)
+
+**1. The "unmatched ring" was never a tracking failure.** Those cells were
+never *extracted*. The cascade, traced end to end on `embryos_GBE_GAP43`:
+
+the hand-corrections draw a closed line around the **entire image perimeter**
+(exactly `2*(H+W) = 1,468` px) → `_drop_oversized_components` correctly deletes
+the unsegmented band inside it → `_close_label_gaps` then handed **every**
+skeleton pixel to its nearest surviving label, teleporting those 1,468
+perimeter pixels a **median 17 px inward** → 1,303 cells acquired a second,
+disconnected fragment on row 0 → `is_edge_cell` is bounding-box based, so one
+such pixel condemned the whole cell → `exclude_edge_cells` dropped **1,304 of
+7,444 labels (17.5%)** → and `render_tracking_overlay` iterates the *mask*, so
+a never-extracted cell was painted in `unmatched_color`, identical to a real
+tracking failure.
+
+That last step is why it stayed hidden: the overlay could not distinguish
+"never extracted" from "failed to match".
+
+`_close_label_gaps` was violating its own documented precondition
+(`data_input.py`: "*`fillable` should be only the pixels known to be a
+separator*"). It now bounds the fill to `_MAX_GAP_FILL_PX = 3` — a drawn
+boundary is 1-3 px wide, so its pixels are always within a couple of pixels of
+the cell they belong to, while an orphaned perimeter line 17 px away is left
+alone. Measured after the fix, frame 1: **edge cells 44 → 0**,
+**multi-component cells 44 → 0**; `Cells_info` with `exclude_edge_cells` on:
+**6,140 → 7,439**; the blue ring in the tracking overlay: **gone**, one
+genuinely unmatched cell left (0.4%). `Demo_Seg_QC` is unaffected —
+background still closes to 0.00% and frame 2 still isolates exactly its one
+known false junction.
+
+**2. Junction-contrast rendering — two defects.**
+
+*(a) Per-frame state was clobbered.* `_qc_scores` stashed the frame's
+free-edge ids on `self`, then `_qc_display` scored *other* sample frames to fit
+its colour window and overwrote them. Junction ids are per-frame sequential,
+so the render classified junctions with a different frame's id set: **28 of
+427 misclassified on `AS_dorsal`**, 11 of 653 on `embryos`. Only bit on a cold
+cache, hence the intermittency. `_free_edge_ids(frame)` is now a pure
+per-frame lookup — mismatches **0**.
+
+*(b) The dark ring was the free-edge rim.* Free edges median +0.161 vs +0.213
+for cell-cell — comparable — but **18% score ≤ 0** and render at the bottom of
+the LUT, and since the rim is one thin continuous line it reads as a solid
+dark band. They are ROI boundaries, not errors. `show_free_edges` now defaults
+**off**, with a toggle; when off they are dropped before the window fit too,
+so they cannot drag the cell-cell scale.
+
+**3. Propagation stopped after one frame — and it was not `max_frames_ahead`**
+(that is 20 at every layer). Both features only ever considered **unclaimed**
+cells, and on a dense movie everything is claimed:
+
+- `find_confirmed_identity_moves` returned `no_unmatched_continuation` on
+  iteration 1. `restrict_to_unmatched` now defaults **False**; `from_track_id`
+  already records who loses each cell and `apply_confirmed_identity_moves`
+  already evicts their future, so displacement is reported, never silent.
+- `find_propagation_stop_frame` skipped claimed neighbours *before the loop*,
+  so it returned `stop_frame == frame_number` — a literally one-frame merge.
+  Claimed neighbours are now tracked, and a neighbour is dropped only once it
+  is claimed by the **same** track as before (`_claim_owners_at_frame`), i.e.
+  when it has genuinely settled rather than merely being claimed.
+
+Measured on `embryos` with a deliberately swapped track: **20 moves spanning
+frames 4-23, every displacement named**, against **0 moves /
+`no_unmatched_continuation`** on the old default.
+
+**The dev mock had been hiding this**: it hardcoded `stop_frame: frame+2` and
+always "settled", so dev-mode click-through structurally could not reproduce
+the bug.
+
+**4. T1 transitions / neighbour exchanges — `v2/topology.py` (new).**
+
+Ported from TissueMiner (`topology/CountT1.R`, nematic in
+`commons/BaseQueryFunctions.R:414-420`), **BSD-3-Clause**, © 2015 Scientific
+Computing Facility @ MPI-CBG — permissive, no copyleft. The notice is carried
+in the module docstring and in `third_party/tissue_miner_LICENSE` as the
+licence requires. Etournay et al. 2016 (eLife 5:e14334) is cited as the
+authors request.
+
+What is ported is the *criterion*, not the plumbing: TissueMiner derives its
+neighbour list from a half-edge table in a SQLite database built by its own
+C++ parser, whereas `adjacency.build_neighbor_graph` plus the tracking table
+already give us neighbour sets with persistent ids. A contact present at `t`
+but not `t+1` is a loss; the reverse is a gain; **both cells must be present in
+both frames**, TissueMiner's own filter for appearance/disappearance
+artefacts.
+
+**The sign flip on gains is the load-bearing part of the orientation.** The
+nematic is built from the two centroids (`Qxx = (dx²−dy²)/2`, `Qxy = dx·dy`,
+normalised) and then negated for a gain, rotating its axis 90° so it lies
+along the newly formed bond. Without it the two halves of one T1 point across
+each other and cancel when averaged; with it they reinforce, which is what
+makes a regional mean meaningful — and that mean is the measurement that
+matters for convergent extension. The self-test asserts exactly this: the
+gain and loss nematics of a synthetic four-cell T1 have a dot product of
+**+1.00**.
+
+Not ported: TissueMiner collapses a division by relabelling both daughters
+with the mother's id, which needs a lineage table Epi-Quant does not produce.
+Documented consequence — a division whose daughters both persist can still
+register as a T1. Like TissueMiner, this counts **half-events per cell**, not
+four-cell quartets.
+
+On `AS_dorsal` frames 1→2: 7 gained, 8 lost, 17 cells involved, nematic order
+0.363.
+
+**⚠️ Tracking numbers change again for `embryos_GBE_GAP43`** now that 17.5%
+more cells are extracted (tracks went 370 → 414 in testing). Any benchmark on
+that dataset predating this needs re-running.
+
+*Also noted, not fixed:* **Epi-Quant has no licence file at all** — no
+`LICENSE`, no statement anywhere. By default that means all rights reserved.
+It does not block the BSD import (BSD imposes nothing on the receiving
+project), but it is worth settling separately.
+
+### Round 6 follow-up: frame-edge junctions, swap-aware suggest-match, exposed overlap weight (2026-08-23)
+
+**1. Fabricated junctions along the image frame.** On `embryos_GBE_GAP43` the
+junction overlay drew straight lines hugging the image border. They were real
+cell–cell junctions in the data — but fabricated by `_bridge_gaps`. Cells
+clipped by the field of view were each grown up to 3 px into the exterior
+strip left behind after the background component was removed, met in the
+middle of it, and produced interfaces no membrane corresponds to.
+
+A distance test alone can't catch this, because the outer rim is thin too — it
+just has cells on one side. **Whole-component thickness separates them
+cleanly:** real inter-cell gaps are background components 1–4 px across
+(median 1 px on `pupae_E-cad` and `AS_dorsal`), while the tissue exterior is a
+single component 21–477 px thick. `_bridge_gaps` now bridges only components
+whose every pixel is within `max_gap_px` of a cell. Frame-hugging junctions:
+`pupae` and `AS_dorsal` go to **0**; on `embryos` bridging is now correctly
+disabled entirely (0 of 1 components qualify) and only genuinely-clipped
+adjacent cells remain. `pupae` still gets its 1,870 junctions, so bridging
+still does its job where it should.
+
+**2. `suggest_match` generalised to swaps.** It ranked only *orphaned* tracks
+— ones that lost their claim at this frame. That assumes the error is a
+missing link, which is wrong for a densely tracked movie: in germband
+extension nearly every cell stays matched and the dominant failure is two
+neighbouring tracks **exchanging identities**. Both are matched, so neither is
+orphaned, and the search returned nothing for the one error that actually
+happens there.
+
+Candidates now include matched tracks and each reports `status`,
+`current_cell`, and `swap_gain`:
+
+```
+keep = d(s, S_prev) + d(c, C_prev)
+swap = d(s, C_prev) + d(c, S_prev)
+swap_gain = keep - swap
+```
+
+Positive means each cell sits nearer the OTHER track's previous position, i.e.
+they look exchanged. Likely swaps outrank mere proximity in the list and are
+flagged in the UI. `include_matched=False` keeps the old orphan-only
+behaviour. This is exactly the error TA calls out — "cell swapping errors
+where two adjacent cells exchange their identities… this cell swap generates a
+(darkening) strong environmental change".
+
+**3. `overlap_weight` is no longer hardcoded.** Exposed as a Track-step
+control with a `?` popover explaining the cost formula and that 0 reproduces
+the centroid-only baseline. The popover wiring was refactored into a reusable
+`wirePopover()` rather than duplicated.
+
+**Environment score vs EPySeg/TA — checked, and they agree.** Our
+`adjacency.environment_scores` uses the same Dice/Sørensen formula as
+EPySeg's `pairwise_score` (`tracking_error_detector_and_fixer.py:632`):
+`2·|A∩B| / (|A|+|B|)`. The only differences are the documented handling of
+genuinely untracked cells, which EPySeg does not have (it mints an identity
+for every cell). What TA does better is *presentation*: it prints the
+comparison against the previous frame AND the next frame as two panels
+(Fig. 3g/h) and tells the reader to scrutinise any cell dark in either. We had
+both directions but only one at a time, so a new **"vs both (worst)"** option
+takes the per-cell minimum — the same reading rule in a single view. The
+individual directions stay, since they are what tells you *which* side the
+change happened on.
+
+**T1 detection — nothing to port, contrary to the premise.** Searched for it
+and it does not exist: zero matches for `T1`, `transition` or `rearrang` in
+the whole `epyseg/ta/` tree, and zero in the TA monograph. "Neighbor
+exchanges" appears once in the monograph's abstract, as biology, not as a
+tool feature. TA's answer to neighbour change *is* the environment score. A T1
+detector would therefore be new work rather than a port — feasible, since
+`build_neighbor_graph` plus the track-id translation already give the neighbour
+sets it needs, but it should be scoped as its own feature.
+
+### Round 6: background artefact, free-edge junctions, overlap-aware tracking (2026-08-22)
+
+Three reported issues; investigation found **the third was largely caused by
+the second**.
+
+**1. The background became a giant "cell" — and it was poisoning tracking.**
+The GBE skeletons don't enclose the tissue, so everything outside it formed
+one connected component and took label 1: present in **31/31 frames** of
+`embryos_GBE_GAP43`, covering 22.5–29.6% of the image, always 78–101× the
+median cell area. Both guards failed:
+
+- `_drop_oversized_components` tested `areas > ratio * MAX_area`. The giant
+  *is* the max, so for any ratio ≥ 1 the test is unsatisfiable — **0 pixels
+  changed in all 31 frames** at the default 10.0. `load_tiff_mask`'s docstring
+  said "median", which the code never implemented. Now median-based, as
+  documented.
+- `exclude_edge_cells` evaluated `is_edge_cell` on `outlines`, but
+  `thin_label_outlines` cannot place a ring pixel in row/column 0, so the
+  giant's ring sat 4–19 px inside the frame and failed `margin=3` in **21 of
+  31 frames**. The test now runs on the filled mask.
+
+The consequences reached far past the spreadsheet. The giant's 426 px extent
+made its displacement gate vacuous, so it competed for every cell, and its
+circumscribed radius set the global matching sentinel to 262 px instead of 21.
+
+| | correct | **wrong** | missing |
+|---|---|---|---|
+| before | 75.9% | **23.6%** | 0.5% |
+| after (no algorithm change) | 96.4% | **1.6%** | 2.0% |
+
+Largest component per frame is now 0.6% of the image, max/median 2.0.
+The frontend's `parseFloat(...) || 10.0` also turned a typed `0` into `10`, so
+the filter could never be disabled from the UI; blank/0 now means disabled.
+
+**2. Free edges — the tissue's outer rim.** `_interface_pixels` required both
+sides of an adjacency to be a real label, so a cell-vs-background edge never
+became a pair and rendered as bare image, indistinguishable from "no edge
+here". On `AS_dorsal view_E-cad` that was 60% of cells losing a median 18.6%
+of their perimeter, with 2 of 145 cells entirely blank. Free edges are now
+emitted keyed `(0, label)` and scored against that one cell's own interior.
+
+**They are kept on a separate scale, and never flagged.** Measured, they score
+a median 0.036 against 0.523 for cell–cell junctions, with 16 of 44 at or
+below 0. Looking at them settled why: on that dataset the rim traces *where
+Cellpose stopped*, mid-epithelium — the tissue visibly continues past it, and
+the worst free edges sit on dark cytoplasm. The metric is right, but that is
+an ROI boundary, not a mistake, and nothing in the mask can distinguish the
+two. So `split_junction_scores` separates the classes, each gets its own
+fitted colour window, and free edges are counted but excluded from the flag
+count — otherwise 919 non-errors would have buried the 7 real ones on
+`AS_dorsal`. (A first attempt at a symmetric two-sided band made this *worse*,
+16/44 vs 9/30: the band geometry was never the cause.)
+
+**3. Tracking.** The cost was confirmed **purely centroid** — every weight
+except Center X/Y is 0 and zero-weight columns are skipped. But centroid was
+not the problem: nearest-centroid agrees with mask-overlap ground truth
+**97.8%** of the time, and displacement is only 0.46× the inter-cell spacing.
+After the background fix, three changes:
+
+- **Centroids are no longer `int()`-truncated.** That quantised the very
+  signal being compared, against a median tie-margin of 5.4 px with ~20% of
+  cells having a runner-up within 2 px. Only Center X/Y move, by <1 px.
+- **The displacement ceiling is now explicit.** The old sentinel was doing two
+  jobs: fill value *and*, because the solver prefers a dummy over anything
+  dearer, a maximum-acceptable-cost ceiling. That ceiling turned out to be
+  load-bearing — making the sentinel merely "larger than everything", which
+  looked like the obvious fix, took wrong links from 3.7% to **20.0%**. It is
+  now `max_centroid_distance`, applied to the centroid term alone.
+- **An optional mask-overlap term**, `mask_overlap_fractions` + a new
+  `overlaps` argument:
+  `cost = centroid distance + overlap_weight * (1 - IoU) * max(H, W)`.
+  Kept in pixel units so the gate and sentinel keep their meaning; a perfect
+  overlap adds nothing, no overlap adds one cell diameter. Separating the
+  ceiling from the sentinel is what makes this possible at all — with the
+  penalty subject to a displacement ceiling, 19.4% of genuine links were lost
+  to dummy assignments.
+
+Measured on `embryos_GBE_GAP43`, wrong links 3.7% → **2.7%**.
+`overlap_weight=0` reproduces the centroid-only cost exactly, so the
+previously-published baseline stays reproducible for comparison.
+
+**⚠️ Benchmark integrity.** The 97.8% / 96.4% / 3.7% figures use *mask
+overlap* as ground truth, which is legitimate while the cost is centroid-only.
+**Once IoU is in the cost that comparison is circular** and the 2.7% must not
+be reported as validation. A new baseline needs ground truth from
+hand-corrected tracks. This is why the overlap weight was not tuned against
+this number.
+
+*Known and deliberately not changed:* `list_segmentation_files` filters
+`frame_number >= 1`, so `...mCh0000_handCorrection.npy` is dropped and this
+dataset extracts 30 of its 31 frames. Changing the filter risks renumbering
+other datasets.
+
 ### Round 5 follow-up 4: QC help popover, clipboard export, tunable junction length (2026-08-14)
 
 **Minimum junction length is now derived, not hardcoded.** `MIN_INTERFACE_PX
@@ -1665,23 +3009,38 @@ computes all centroids in one `bincount` pass instead of the per-cell
 
 ## pywebview UI (`v2/webview/`) — handoff notes
 
-**Status (updated 2026-08-16). All work through Round 5 follow-up 4 is
-COMMITTED and the working tree is clean** (`c3d231c` is the latest; `a0cd93e`
-and `c9850da` precede it). **The user considers the tracking-correction work
-feature-complete as of this point** — Rounds 1–5 covered swap safety,
-suggest-match, smart-stop propagate, collision guards, restricted pairing,
-the TA environment score, the track-lifecycle view, trajectory click-to-jump,
-and bounded local re-tracking. Treat further tracking features as a new
-request, not as continuing an in-progress arc; the natural remaining work is
-the verification debt below, not more functionality.
+**Status (updated 2026-08-28). Rounds 6 through 10 are UNCOMMITTED.** The
+last commit is `0dd0961` (shape/tissue descriptors). The working tree carries
+ten modified files — `README.md`, `cell_tracking.py`, `data_input.py`,
+`manual_correction_tracking.py`, `rendering.py`, `segmentation_qc.py`,
+`webview/api.py` and all three `webview/frontend/` files — plus three new
+paths: **`v2/lineage.py`**, **`v2/topology.py`** and **`third_party/`** (the
+TissueMiner licence copy). Everything in the Round 6, 7 and 8 sections above
+exists only in the working tree, as do Rounds 9 and 10 -- which add
+**`v2/tracking_benchmark.py`** as a fourth new file. Commit before starting
+anything new; note
+`third_party/` is untracked and easy to miss, and dropping it would break a
+licence obligation, not just a file reference.
+
+Rounds 1–5 (tracking correction) were declared feature-complete by the user
+and committed through `c3d231c`. Each round since reopened the file for a
+different reason: **Rounds 6, 7 and 9 were bug reports from real use**, not
+new features, **Round 8 answers a reviewer comment**, and **Round 10 came from
+an outside review of Round 9's own reasoning** -- which found a biased judge
+and a filter artefact, and was right about both. So "treat a further
+tracking *feature* as a new request" still holds — but every round since that
+declaration has been driven by something found while actually running the app,
+which is the pattern to expect.
 
 Read the round sections in this order — note they are **not** in one
 consistent direction: "Extended session changelog" (the original round) is
-oldest, then "Round 2" → "Round 5" ascend, and then the four **"Round 5
-follow-up"** sections are ordered newest-first (follow-up 4 appears before
-follow-up 3, and so on). The follow-ups are where the segmentation-QC metrics
-actually took their current shape, so a reader who stops at "Round 5" will
-have an out-of-date picture of `segmentation_qc.py`.
+oldest, then "Round 2" → "Round 5" ascend, and then **everything from Round 8
+down runs newest-first**: Round 10 → Round 9 → Round 8 → Round 7 → Round 6 follow-up → Round 6 →
+Round 5 follow-ups 4, 3, 2, 1. Two consequences: the Round 5 follow-ups are
+where the segmentation-QC metrics took their current shape, so a reader who
+stops at "Round 5" has an out-of-date picture of `segmentation_qc.py`; and
+Round 7 sits *below* Round 8 despite being read first in most investigations,
+because it holds the `data_input.py` cascade that changed extraction counts.
 
 **The native-window click-through is DONE (2026-08-17) and was clean.** The
 user ran `python v2/webview/app.py` against real `test_data/` and exercised
@@ -1765,7 +3124,13 @@ Extract/Track run with live progress, the QC overlay and its `?` popover and
    "Tracking correctness" entry in the changelog below. Not a UI task, which
    is why the click-through did not touch it, and not optional busywork: the
    previously-reported ~10%/~60% comparison was measured against the buggy
-   merge algorithm.
+   merge algorithm. **This has now been invalidated three separate times** —
+   by the `_merge_tracking_pairs` fix, by Round 6's overlap term in the cost
+   matrix, and by Round 7's `_close_label_gaps` bound (which raised extracted
+   cells on `embryos_GBE_GAP43` by 17.5% and took tracks 370 → 414). Round 9
+   does NOT add a fourth: its cost is bit-identical at defaults and motion
+   compensation ships off. Anything quoting that percentage must be re-run against the
+   current pipeline before submission.
 2. **The local re-track panel against a genuinely hand-corrected project** —
    masks actually corrected in Cellpose/Fiji, reloaded, then re-tracked. The
    real-data verification used already-clean masks plus a Python-simulated
@@ -1778,6 +3143,50 @@ Extract/Track run with live progress, the QC overlay and its `?` popover and
    verified at the Python level (a 40x25 PNG round-tripped off the pasteboard
    at the exact pixel value). If clipboard copy ever misbehaves on another
    machine or OS version, this is the first place to look.
+
+4. **Nothing from Rounds 6, 7 or 8 has been through the native window.** The
+   2026-08-17 click-through predates all three. Everything since was verified
+   through backend Python calls plus the dev-mode mock. That matters most for
+   Round 8's Correct-Tracking additions — the `dynamics` colour mode, the
+   confirm/reject candidate controls, and `Save lineage sheet` — which are
+   new UI surfaces, not adjustments to tested ones.
+5. **Division detection has never seen a real division.** `embryos_GBE_GAP43`
+   yields **zero** division candidates, which is biologically right for
+   germband extension but means the mother→daughter pairing path is covered
+   only by `lineage.py`'s synthetic self-test. A dataset with real divisions
+   would be the first genuine exercise of it.
+6. **The single delamination candidate has not been eyeballed against the raw
+   movie.** It survived both evidence terms, which is the strongest statement
+   available — but "survived the filter" is not "is a delamination", and with
+   n=1 a human look is cheap.
+7. **Round 7's propagation fix was measured on a deliberately swapped track**
+   (20 moves spanning frames 4–23), not on a correction a user actually made
+   in the window. The old behaviour it replaced — one-frame propagation — was
+   reported from real use, so the fix deserves the same setting.
+
+8. **The Round 9/10 UI has never run in the real window** — the cost-mode
+   radios, the raised weight cap, the motion-compensation and gap-closing
+   checkboxes, the relocated cell-dynamics controls in step 7, and the
+   link-agreement overlay in step 6 were all exercised only through the dev
+   mock and backend calls.
+10. **No hand-labelled GBE ground truth exists yet.** `load_link_csv` accepts
+   it and `ground_truth` will judge it, but until some exists the GBE swap
+   question stays formally undecided — CTC validates the harness, not the
+   biology (see Round 10 §2).
+9. **The T1 persistence horizon has no principled default.** It ships at 1
+   frame because that is where the measured flicker lives, not because 1 is
+   correct for every movie — a slower tissue may need more, and a genuinely
+   reversible T1 is indistinguishable from noise at any setting. Both totals
+   are always shown for exactly this reason.
+
+**A note on what counts as verification here.** Two separate rounds were
+saved by the user reporting the same symptom *twice* after a claimed fix
+(Round 7's junction rendering, "依然存在"), which is what forced generating and
+actually looking at images rather than trusting a code path. And the dev mock
+has now structurally hidden a bug twice — it hardcoded `stop_frame: frame + 2`
+and an always-"settled" response, so dev-mode click-through *could not*
+reproduce the propagation failure. Keep the mock honest to the real response
+shape, and treat "the self-test passes" as necessary, not sufficient.
 
 ### Extended session changelog (2026-08-08) — found via real usage, not code review
 

@@ -271,6 +271,21 @@ def _evict_future_if_colliding(
     }
 
 
+def _claim_owners_at_frame(tracking_data: pd.DataFrame, frame_number: int) -> dict:
+    """`{cell_index: track_id}` for every cell claimed at `frame_number`.
+
+    The set-returning `_claimed_cells_at_frame` answers "is this claimed?",
+    which is not enough to tell a settled neighbour from a churning one --
+    for that you need to know WHICH track holds it, and whether that changed.
+    """
+    column_name = f"Frame{frame_number}"
+    if column_name not in tracking_data.columns:
+        return {}
+    id_col = tracking_data.columns[0]
+    pairs = tracking_data[[id_col, column_name]].dropna(subset=[column_name])
+    return {row[column_name]: int(row[id_col]) for _, row in pairs.iterrows()}
+
+
 def _claimed_cells_at_frame(tracking_data: pd.DataFrame, frame_number: int) -> set:
     """Cell strings claimed by some track at `Frame{frame_number}` -- the
     same matched/unmatched notion `rendering.render_tracking_overlay` and
@@ -433,13 +448,20 @@ def find_propagation_stop_frame(
 
     graph = adjacency.build_neighbor_graph(fill_labels, dilation_px=dilation_px)
     neighbor_labels = graph.get(_raw_cell_id(corrected_cell), set())
-    claimed = _claimed_cells_at_frame(tracking_data, frame_number)
+    claimed = _claim_owners_at_frame(tracking_data, frame_number)
+    previous_owner = dict(claimed)
 
     unsettled = {}  # cell_index -> (x, y, radius)
     for label in neighbor_labels:
         neighbor_index = f"Cell{frame_number}_{label}"
-        if neighbor_index in claimed:
-            continue
+        # Claimed neighbours are tracked too. Skipping them made this whole
+        # function vacuous on a densely-tracked movie: in germband extension
+        # nearly every cell is claimed every frame, so `unsettled` came out
+        # empty and the pre-loop return below fired with
+        # `stop_frame == frame_number` -- a literally one-frame merge, before
+        # the forward loop ever ran. Whether a neighbour is claimed says
+        # nothing about whether the CORRECTION has settled; that is decided in
+        # the loop, by watching the neighbourhood stop changing.
         if neighbor_index in cells_info_indexed.index:
             row = cells_info_indexed.loc[neighbor_index]
             position = (
@@ -468,12 +490,13 @@ def find_propagation_stop_frame(
         current_neighbor_indices = {
             f"Cell{f}_{label}" for label in graph.get(_raw_cell_id(corrected_cell), set())
         }
-        claimed = _claimed_cells_at_frame(tracking_data, f)
+        claimed = _claim_owners_at_frame(tracking_data, f)
         frame_cells = cells_info_indexed[cells_info_indexed.index.str.startswith(f"Cell{f}_")]
         frame_cells = frame_cells.drop(index=corrected_cell, errors="ignore")
 
         disappeared_this_frame = False
         still_unsettled = {}
+        next_owner: dict = {}
         for neighbor_index, (last_x, last_y, last_radius) in unsettled.items():
             if frame_cells.empty:
                 disappeared_this_frame = True
@@ -493,8 +516,8 @@ def find_propagation_stop_frame(
 
             if nearest_distance > gate:
                 disappeared_this_frame = True
-            elif nearest_index in claimed:
-                pass  # matched -- drop from unsettled
+            elif nearest_index in claimed and claimed.get(nearest_index) == previous_owner.get(neighbor_index):
+                pass  # claimed by the SAME track as before -- this neighbour has settled
             elif nearest_distance > 0.5 * last_radius and nearest_index in current_neighbor_indices:
                 disappeared_this_frame = True  # absorbed into an existing neighbor's territory
             else:
@@ -503,8 +526,10 @@ def find_propagation_stop_frame(
                     float(frame_cells.at[nearest_index, "Center Y Coordinate"]),
                     float(frame_cells.at[nearest_index, "Circumscribed Circle Radius"]),
                 )
+                next_owner[nearest_index] = claimed.get(nearest_index)
 
         unsettled = still_unsettled
+        previous_owner = next_owner
         if unsettled:
             trail[f] = sorted(unsettled)
         else:
@@ -639,7 +664,7 @@ def find_confirmed_identity_moves(
     track_id: int,
     max_frames_ahead: int = 20,
     drift_gate_multiplier: float = 1.5,
-    restrict_to_unmatched: bool = True,
+    restrict_to_unmatched: bool = False,
 ) -> dict:
     """Starting from `track_id`'s own (human-confirmed) cell at
     `frame_number` -- typically just attached via `suggest_match_candidates`
@@ -664,7 +689,7 @@ def find_confirmed_identity_moves(
     gated step at a time, it never re-runs Hungarian or guesses an initial
     match on its own.
 
-    **`restrict_to_unmatched` (default `True`) -- "restricted pairing".**
+    **`restrict_to_unmatched` (default `False`) -- "restricted pairing".**
     Candidates at each later frame are limited to cells no track currently
     claims, instead of every cell in the frame. This fixes a real drift bug
     found on `test_data/AS_dorsal view_E-cad`: a plain nearest-centroid pick
@@ -780,6 +805,15 @@ def find_confirmed_identity_moves(
         if claimed_by.get(overall_nearest) == int(track_id):
             return {"stop_frame": f, "reason": "settled", "moves": moves}
 
+        # `restrict_to_unmatched` defaults OFF. Restricting to unclaimed cells
+        # assumes the error is a missing link, which is wrong for a densely
+        # tracked movie: in germband extension nearly every cell is claimed
+        # every frame, `eligible` came out empty at the very first frame, and
+        # the walk returned `no_unmatched_continuation` with zero moves. The
+        # unrestricted walk follows the best continuation even when another
+        # track holds it -- `from_track_id` records who loses the cell and
+        # `apply_confirmed_identity_moves` evicts their future explicitly, so
+        # nothing is displaced silently.
         if restrict_to_unmatched:
             eligible = distances[[i for i in distances.index if i not in claimed_by]]
             if eligible.empty or float(eligible.min()) > gate:
@@ -891,6 +925,7 @@ def suggest_match_candidates(
     selected_cell_index: str,
     fill_labels_by_frame: Callable[[int], Optional[np.ndarray]],
     top_k: int = 3,
+    include_matched: bool = True,
 ) -> list:
     """For `selected_cell_index` (a `Cell{frame_number}_{raw_id}` string --
     typically an unmatched cell the user just clicked, but works just as
@@ -912,12 +947,40 @@ def suggest_match_candidates(
     track -- this function only ranks candidates, it never decides or
     writes anything itself).
 
-    Pure computation, no mutation. Deliberately just a nearest-neighbor
-    filter over already-known orphaned tracks, NOT a local Hungarian
-    re-match: a "local re-track" feature doing the latter was already
-    built, tested, and removed (see `v2/README.md`'s changelog) because
-    re-deriving a match from spatial proximity alone just reproduces
-    whatever wrong answer Hungarian already gave.
+    With `include_matched` (the default), tracks that DO still hold a cell
+    at `frame_number` are ranked too, and each candidate reports:
+
+    - `status`: `"unmatched"` (an orphaned track) or `"matched"`;
+    - `current_cell`: what a matched candidate currently claims here;
+    - `swap_gain`: for a matched candidate, how many pixels of total
+      displacement would be SAVED by exchanging the two tracks' claims at
+      this frame. Positive means the current pairing is the longer one, i.e.
+      the two look swapped.
+
+    Restricting to orphaned tracks -- the original behaviour, still available
+    as `include_matched=False` -- assumes the error is a missing link. That
+    holds when cells drop out, but not for a densely tracked movie: in
+    germband extension nearly every cell stays matched every frame and the
+    dominant failure is two neighbouring tracks EXCHANGING identities. Both
+    are matched, so neither is orphaned, and the orphan-only search returned
+    nothing at all for the one error that actually happens there.
+
+    `swap_gain` is what makes that case actionable. For selected cell `s`
+    (currently on track `S`) and candidate track `C` holding cell `c` here:
+
+        keep = d(s, S_prev) + d(c, C_prev)
+        swap = d(s, C_prev) + d(c, S_prev)
+        swap_gain = keep - swap
+
+    A genuine swap shows a large positive gain, because each cell is closer
+    to the OTHER track's previous position than to its own.
+
+    Pure computation, no mutation. Still a nearest-neighbour ranking rather
+    than a local Hungarian re-match: a "local re-track" feature doing the
+    latter was built, tested and removed (see `v2/README.md`'s changelog),
+    because re-deriving a match from spatial proximity alone just reproduces
+    whatever wrong answer Hungarian already gave. Ranking candidates for a
+    human to choose is a different thing from silently recomputing one.
 
     Falls back to computing a cell's centroid directly from
     `fill_labels_by_frame`'s mask (via `_centroid_and_radius_from_mask`)
@@ -968,19 +1031,55 @@ def suggest_match_candidates(
     id_col = tracking_data.columns[0]
     has_prev = tracking_data[prev_col].notna()
     lost_here = tracking_data[cur_col].isna() if cur_col in tracking_data.columns else True
-    orphaned = tracking_data[has_prev & lost_here]
+    considered = tracking_data[has_prev] if include_matched else tracking_data[has_prev & lost_here]
+
+    # Where the selected cell's OWN track sat in the previous frame -- the
+    # reference a swap is measured against.
+    own_prev_position = None
+    if cur_col in tracking_data.columns:
+        own_rows = tracking_data.index[tracking_data[cur_col] == selected_cell_index]
+        if len(own_rows):
+            own_prev = tracking_data.at[own_rows[0], prev_col]
+            if pd.notna(own_prev):
+                own_prev_position = _position(own_prev, prev_frame)
 
     candidates = []
-    for _, row in orphaned.iterrows():
+    for _, row in considered.iterrows():
         candidate_cell_index = row[prev_col]
         position = _position(candidate_cell_index, prev_frame)
         if position is None:
             continue
         cx, cy = position
         distance = float(np.hypot(cx - origin_x, cy - origin_y))
-        candidates.append({"track_id": int(row[id_col]), "cell_index": candidate_cell_index, "distance": distance})
 
-    candidates.sort(key=lambda c: c["distance"])
+        current_cell = row[cur_col] if cur_col in tracking_data.columns else None
+        current_cell = None if pd.isna(current_cell) else current_cell
+        if current_cell == selected_cell_index:
+            continue  # the selected cell's own track is not a candidate for itself
+
+        swap_gain = None
+        if current_cell is not None and own_prev_position is not None:
+            other_now = _position(current_cell, frame_number)
+            if other_now is not None:
+                keep = (np.hypot(origin_x - own_prev_position[0], origin_y - own_prev_position[1])
+                        + np.hypot(other_now[0] - cx, other_now[1] - cy))
+                swap = (distance
+                        + np.hypot(other_now[0] - own_prev_position[0], other_now[1] - own_prev_position[1]))
+                swap_gain = float(keep - swap)
+
+        candidates.append({
+            "track_id": int(row[id_col]),
+            "cell_index": candidate_cell_index,
+            "distance": distance,
+            "status": "unmatched" if current_cell is None else "matched",
+            "current_cell": current_cell,
+            "swap_gain": None if swap_gain is None else round(swap_gain, 2),
+        })
+
+    # A likely swap outranks mere proximity: a matched candidate whose exchange
+    # shortens total displacement is a concrete, checkable hypothesis, whereas
+    # a nearby track that is already correctly matched is just noise.
+    candidates.sort(key=lambda c: (-(c["swap_gain"] or 0.0), c["distance"]))
     return candidates[:top_k]
 
 
@@ -1085,8 +1184,45 @@ if __name__ == "__main__":
         suggest_cells_info, suggest_tracking, frame_number=2, selected_cell_index="Cell2_99",
         fill_labels_by_frame=lambda f: None,
     )
-    print("\nSuggested orphaned tracks for Cell2_99 at frame 2:", suggestions)
-    assert [s["track_id"] for s in suggestions] == [1, 3], suggestions
+    print("\nSuggested tracks for Cell2_99 at frame 2:", [(x["track_id"], x["status"]) for x in suggestions])
+    # Orphaned tracks still rank first by distance; the matched one is now
+    # offered too rather than being invisible.
+    assert [x["track_id"] for x in suggestions] == [1, 3, 2], suggestions
+    assert [x["status"] for x in suggestions] == ["unmatched", "unmatched", "matched"], suggestions
+    orphan_only = suggest_match_candidates(
+        suggest_cells_info, suggest_tracking, frame_number=2, selected_cell_index="Cell2_99",
+        fill_labels_by_frame=lambda f: None, include_matched=False,
+    )
+    assert [x["track_id"] for x in orphan_only] == [1, 3], orphan_only
+    print("  -> include_matched=False reproduces the orphan-only behaviour.")
+
+    # A genuine SWAP: two tracks that exchanged identities between frames.
+    # Every cell stays matched, so the orphan-only search finds nothing --
+    # this is the germband-extension failure mode.
+    swap_info = pd.DataFrame({
+        "Cell Index": ["Cell1_1", "Cell1_2", "Cell2_1", "Cell2_2"],
+        "Center X Coordinate": [0.0, 20.0, 1.0, 21.0],
+        "Center Y Coordinate": [0.0, 0.0, 0.0, 0.0],
+    })
+    swapped = pd.DataFrame({
+        "Index": [1, 2],
+        "Frame1": ["Cell1_1", "Cell1_2"],
+        "Frame2": ["Cell2_2", "Cell2_1"],   # crossed over
+    })
+    assert suggest_match_candidates(
+        swap_info, swapped, frame_number=2, selected_cell_index="Cell2_1",
+        fill_labels_by_frame=lambda f: None, include_matched=False,
+    ) == [], "orphan-only search cannot see a swap -- every cell is matched"
+
+    swap_hits = suggest_match_candidates(
+        swap_info, swapped, frame_number=2, selected_cell_index="Cell2_1",
+        fill_labels_by_frame=lambda f: None,
+    )
+    print("Swap detection for Cell2_1:", swap_hits)
+    assert swap_hits[0]["track_id"] == 1, swap_hits
+    assert swap_hits[0]["swap_gain"] > 0, "an exchanged pair must show a positive swap gain"
+    assert swap_hits[0]["current_cell"] == "Cell2_2", swap_hits
+    print("  -> the swapped partner is found and its gain is +%.1f px." % swap_hits[0]["swap_gain"])
     assert suggestions[0]["distance"] < suggestions[1]["distance"]
 
     empty_suggestions = suggest_match_candidates(
@@ -1243,7 +1379,29 @@ if __name__ == "__main__":
         frame_number=1, old_id=1, new_id=2,
     )
     print("\nfind_propagation_stop_frame (settled via match):", result)
-    assert result == {"stop_frame": 2, "reason": "settled", "unsettled_neighbors_by_frame": {}}, result
+    # The walk now RUNS -- it used to return before the loop because the only
+    # neighbour was already claimed. Here it walks to the end of the fixture.
+    assert result["stop_frame"] == 2, result
+    assert result["reason"] == "track_ended", result
+
+    # A dense frame: every cell claimed, which is the germband-extension case.
+    # This is the regression that matters -- the old code returned
+    # stop_frame == frame_number here, giving a one-frame merge.
+    dense_frames = {f: _grid_with_two_cells() for f in (1, 2, 3, 4)}
+    dense_cells_info = pd.DataFrame([
+        _cells_info_row(f"Cell{f}_{c}", 3 if c == 1 else 7, 3)
+        for f in (1, 2, 3, 4) for c in (1, 2)
+    ])
+    dense_tracking = pd.DataFrame({
+        "Index": [1, 2],
+        **{f"Frame{f}": [f"Cell{f}_1", f"Cell{f}_2"] for f in (1, 2, 3, 4)},
+    })
+    dense = find_propagation_stop_frame(
+        dense_tracking, dense_cells_info, lambda f: dense_frames.get(f),
+        frame_number=1, old_id=1, new_id=2,
+    )
+    print("find_propagation_stop_frame on a fully-claimed frame:", dense)
+    assert dense["stop_frame"] > 1, "must walk past the starting frame even when every cell is claimed"
 
     # -- neighbor_disappeared (vanishes entirely) --
     disappear_frames = {1: _grid_with_two_cells(), 2: _grid_with_two_cells(both_present=False)}
@@ -1320,13 +1478,27 @@ if __name__ == "__main__":
         "Frame4": [None, None, None, "Cell4_A"],
         "Frame5": ["Cell5_A", None, None, None],
     })
-    # Every continuation here is claimed by a wrong track, so this needs the
-    # restriction OFF -- with it on (the default) the walk must refuse to
-    # steal them and stop immediately instead.
+    # Every continuation here is claimed by a wrong track. This is the dense
+    # case: with the restriction ON the walk refuses to take them and stops
+    # dead, which is exactly the one-frame behaviour reported on germband
+    # data -- so the restriction is now OFF by default and the walk follows
+    # them, recording who loses each cell.
     restricted_plan = find_confirmed_identity_moves(
         churn_tracking, churn_cells_info, lambda f: None, frame_number=1, track_id=18,
+        restrict_to_unmatched=True,
     )
     assert restricted_plan["moves"] == [] and restricted_plan["reason"] == "no_unmatched_continuation", restricted_plan
+    print("Restricted walk stops dead on a fully-claimed frame (the reported symptom).")
+
+    default_plan = find_confirmed_identity_moves(
+        churn_tracking, churn_cells_info, lambda f: None, frame_number=1, track_id=18,
+    )
+    assert len(default_plan["moves"]) >= 3, default_plan
+    assert all(m["from_track_id"] is not None for m in default_plan["moves"]), (
+        "every displaced track must be named, so nothing is taken silently"
+    )
+    print("Default walk follows %d frames and names every displaced track."
+          % len(default_plan["moves"]))
     print("\nfind_confirmed_identity_moves (churn, restricted): correctly refused to steal claimed cells.")
 
     plan = find_confirmed_identity_moves(
@@ -1397,11 +1569,21 @@ if __name__ == "__main__":
     })
     drift_restricted = find_confirmed_identity_moves(
         drift_tracking, drift_cells_info, lambda f: None, frame_number=1, track_id=18, max_frames_ahead=1,
+        restrict_to_unmatched=True,
     )
     print("\nfind_confirmed_identity_moves (restricted, neighbour owned by track 5):", drift_restricted)
     assert [m["cell_index"] for m in drift_restricted["moves"]] == ["Cell2_true"], drift_restricted
     assert drift_restricted["moves"][0]["from_track_id"] is None
     assert drift_restricted["moves"][0]["distance"] == 3.0
+
+    # The default now prefers the genuinely nearest cell even though track 5
+    # holds it -- and says so via from_track_id.
+    drift_default = find_confirmed_identity_moves(
+        drift_tracking, drift_cells_info, lambda f: None, frame_number=1, track_id=18, max_frames_ahead=1,
+    )
+    assert drift_default["moves"][0]["cell_index"] == "Cell2_neighbor", drift_default
+    assert drift_default["moves"][0]["from_track_id"] == 5, drift_default
+    print("Default takes the nearer claimed cell and names track 5 as displaced.")
 
     drift_unrestricted = find_confirmed_identity_moves(
         drift_tracking, drift_cells_info, lambda f: None, frame_number=1, track_id=18, max_frames_ahead=1,

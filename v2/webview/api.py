@@ -55,6 +55,9 @@ import manual_correction_tracking
 import pca_kmeans
 import rendering
 import segmentation_qc
+import lineage
+import tracking_benchmark
+import topology
 import shape_features
 import tissue_features
 import trajectory_visualization
@@ -120,12 +123,102 @@ class EpiQuantAPI:
         # `get_junction_min_px`); an int is a user override.
         self._junction_min_px: Optional[int] = None
         self._junction_min_px_auto: Optional[int] = None
+        # Weight of the mask-overlap term in the tracking cost, in units of the
+        # cell's own diameter. 0 reproduces the centroid-only cost the
+        # manuscript's published baseline was measured with.
+        self.overlap_weight: float = cell_tracking.DEFAULT_OVERLAP_WEIGHT
+        # Weight of the centroid term. 0 with a non-zero overlap weight is the
+        # mask-overlap-only cost. See `set_tracking_cost` for what measurement
+        # says about picking between the three modes.
+        self.centroid_weight: float = 1.0
+        # Predict each cell forward from its own previous displacement instead
+        # of assuming it stays put. **Default OFF, because measurement says it
+        # makes tracking worse on `embryos_GBE_GAP43`**: the swap rate goes
+        # 4.89% -> 9.52% and tracks 414 -> 482. See `set_tracking_cost` for why
+        # the prediction backfires here. Kept because it is the right model for
+        # a movie with genuine coherent drift (stage drift, a translating
+        # tissue) -- which this one does not have.
+        self.motion_compensation: bool = False
+        # Colours for the link-agreement overlay. Four states, because
+        # "unjudgeable" must be VISIBLY distinct from "agrees" -- see
+        # `get_link_agreement`.
+        #
+        # Unjudgeable is a low-chroma violet, not grey. Grey was the obvious
+        # choice for "no verdict" and it was measured to fail: against this
+        # project's greyscale membrane images it renders at RGB (142,142,147)
+        # on a local median of (89,95,95), the same hue as the background, and
+        # all 15 unjudgeable cells in frame 4 of `embryos_GBE_GAP43` were
+        # impossible to pick out. Any saturated hue is legible over greyscale;
+        # violet also stays off the red/green good-bad axis, so it still reads
+        # as a category rather than a grade.
+        self.agreement_colors: dict = {
+            "agrees": "#4a90d9", "disagrees": "#ff3b30",
+            "unjudgeable": "#a06bd4", "broken": "#ffcc00",
+        }
+        # Frames a track may skip and still re-attach (second-stage LAP, see
+        # `cell_tracking.close_track_gaps`). 0 = off, which keeps tracking
+        # byte-identical to the published baseline. Turning it on changes track
+        # counts and therefore cell-loss %.
+        self.max_frame_gap: int = 0
+        # Environment-score dead band. At or above this the cell is drawn
+        # untinted rather than "slightly dark". Tissue Analyzer's own
+        # sensitivity (`take_decision`, 0.75); below it a second, lower tier
+        # (`optimize_score`, 0.5) is what TA considers for automatic repair.
+        # Without a dead band, 64.8% of cell-frames on `embryos_GBE_GAP43`
+        # render as somewhat dark against TA's 22.5%, because 42.2% sit in
+        # [0.75, 1.0) -- which TA classes as clean.
+        # Whether the link-agreement reference is computed on registered masks.
+        # On by default because the alternative is not neutral either -- an
+        # unregistered reference favours a tracker that does not register --
+        # and on this project's germband data the unregistered reference sits
+        # at a median self-overlap of 0.377 against its own 0.3 threshold.
+        # `registration_decision` still gates whether it applies at all.
+        self.register_reference: bool = True
+        # Registration applied to TRACKING (not just to the agreement
+        # reference). Default "none" so the published baseline stays
+        # byte-reproducible; "mask" is Tissue Analyzer's convention.
+        self.drift_mode: str = "none"
+        self._registration_cache: Optional[dict] = None
+        self.environment_dead_band: float = 0.75
+        self.environment_repair_threshold: float = 0.5
+        # Schmitt-trigger hysteresis on the adjacency underlying T1 detection.
+        # None = off, reproducing 1,505 gains / 1,545 losses on
+        # `embryos_GBE_GAP43`. At 25/15 that becomes 1,229 / 978 with the
+        # one-frame reversal rate falling 21.0% -> 14.8%; a HARD threshold of
+        # similar magnitude raises it to 31.7% instead, which is the control
+        # showing the hysteresis rather than the threshold is doing the work.
+        self.t1_enter_px: Optional[float] = None
+        self.t1_exit_px: Optional[float] = None
+        self._hysteresis_cache: dict = {}
+        # Which T1 axes to draw: "all" | "persistent" | "persistent_unjudgeable".
+        # Three-way rather than a checkbox because `annotate_persistence`
+        # produces three states, and a toggle would silently fold "unjudgeable"
+        # into one of the other two. Defaults to ALL: the standing position is
+        # "annotate, never drop", and a filter whose removals cannot be seen
+        # cannot be judged too aggressive.
+        self.t1_axis_filter: str = "all"
+        # Frames a neighbour exchange must hold before it counts as settled.
+        # 21% of raw events on `embryos_GBE_GAP43` reverse within one frame.
+        self.t1_persist_frames: int = 1
+        # Whether the tissue-rim ("free edge") junctions are drawn at all.
+        # Off by default: a rim edge only means the mask stops there, which may
+        # be a real tissue margin or just where segmentation was cropped, and
+        # ~18% of them score <= 0 on `embryos_GBE_GAP43` -- rendering as a
+        # solid dark ring that reads as a row of errors it isn't.
+        self.show_free_edges: bool = False
+        # Cell-dynamics curation: candidates are detected, but only events a
+        # human confirms reach the lineage sheet (see `lineage.py`).
+        self._confirmed_event_keys: set = set()
+        self._rejected_event_keys: set = set()
+        self._geometry_lookup: Optional[dict] = None
+        self._margin_cache: dict = {}
 
         self.matched_color = "#ffd633"
         self.unmatched_color = "#3388ff"
         self.highlight_color = "#ff3333"
         self.border_color = "#ff00ff"
         self.lifecycle_colors = {"lost": "#ff3b30", "new": "#34c759", "both": "#ffffff"}
+        self.dynamics_colors = {"division": "#34c759", "delamination": "#ff3b30", "t1": "#ffd633"}
 
     def set_window(self, window) -> None:
         self.window = window
@@ -213,6 +306,8 @@ class EpiQuantAPI:
         self._neighbor_graph_cache.clear()  # graphs belong to the old project's masks
         self._raw_image_cache.clear()
         self._qc_display_cache.clear()
+        self._margin_cache.clear()
+        self._geometry_lookup = None
         self._junction_min_px = None
         self._junction_min_px_auto = None
         self.output_dirs = common.setup_output_dirs(output_base_dir)
@@ -232,6 +327,7 @@ class EpiQuantAPI:
         )
         classification_dir = self.output_dirs["cell_classification_output"]
         return {
+            "lineage": os.path.isfile(os.path.join(self.output_dirs["cell_track_output"], "cell_lineage.xlsx")),
             "extraction": os.path.isfile(cells_info_path),
             "classification": os.path.isfile(clustering_path),
             "tracking": os.path.isfile(tracking_path),
@@ -261,6 +357,7 @@ class EpiQuantAPI:
         self.npy_folder = data_input.prepare_segmentation_folder(self.mask_folder, image_folder=self.image_folder)
         path = os.path.join(self.output_dirs["cell_classification_output"], "Cells_info.xlsx")
         self.cells_info = pd.read_excel(path, sheet_name="Cell")
+        self._geometry_lookup = None
         return {"frame_count": self.get_frame_count(), "cell_count": len(self.cells_info)}
 
     def load_existing_classification(self) -> dict:
@@ -321,6 +418,7 @@ class EpiQuantAPI:
                 progress_cb=self._progress_cb("extract"),
             )
             self.cells_info = cells_info.reset_index()
+            self._geometry_lookup = None  # rebuilt lazily from the new table
             self._notify("onExtractDone", {"frame_count": frame_count, "cell_count": len(self.cells_info)})
         except Exception as e:
             logger.exception("Extraction failed")
@@ -506,7 +604,10 @@ class EpiQuantAPI:
             min_px = self.get_junction_min_px()["value"]
             _painted, mapping = segmentation_qc.junction_label_array(fill_labels, min_interface_px=min_px)
             scored = segmentation_qc.junction_contrast(raw, fill_labels, min_interface_px=min_px)
-            return {jid: scored[pair] for jid, pair in mapping.items() if pair in scored}
+            return {
+                jid: scored[pair] for jid, pair in mapping.items()
+                if pair in scored and (self.show_free_edges or pair[0] != 0)
+            }
         if metric == "neighbor_count":
             return segmentation_qc.neighbor_count_deviation(
                 fill_labels, neighbor_graph=self._get_neighbor_graph(frame_number),
@@ -518,6 +619,51 @@ class EpiQuantAPI:
         if metric == "measurement_failures":
             return segmentation_qc.measurement_failures(self.cells_info, frame_number)
         return {}
+
+    def _free_edge_ids(self, frame_number: int) -> set:
+        """Junction ids at `frame_number` that are free edges (tissue rim).
+
+        Recomputed per call rather than cached on the instance. It used to be
+        stashed as `self._free_edge_ids` by `_qc_scores`, but `_qc_display`
+        scores OTHER sample frames to fit its colour window and overwrote it --
+        and junction ids are per-frame sequential, so the render then
+        classified this frame's junctions with a different frame's id set. That
+        misclassified 28 of 427 junctions on `AS_dorsal view_E-cad`, where the
+        two colour windows differ 1.6x. Only bit on a cold cache, which is why
+        it looked intermittent.
+        """
+        loaded = self._load_frame(frame_number)
+        if loaded is None:
+            return set()
+        _painted, mapping = segmentation_qc.junction_label_array(
+            loaded[0], min_interface_px=self.get_junction_min_px()["value"],
+        )
+        return {jid for jid, pair in mapping.items() if pair[0] == 0}
+
+    def _qc_display_scores(self, metric: str, frame_number: int, scores: dict) -> dict:
+        """Scores mapped into a common 0-1 display space.
+
+        `junction_contrast` carries two incomparable classes (see
+        `segmentation_qc.split_junction_scores`), so each is normalised through
+        its OWN fitted window before rendering. Sharing one window would let
+        the free edges -- which on an ROI-cropped dataset sit near 0 by
+        construction -- drag the cell-cell colours down with them. Every other
+        metric keeps its single window unchanged.
+        """
+        if metric != "junction_contrast":
+            window = self._qc_display(metric)
+            span = (window["vmax"] - window["vmin"]) or 1.0
+            return {k: (v - window["vmin"]) / span for k, v in scores.items()}
+
+        free_ids = self._free_edge_ids(frame_number)
+        pair_window = self._qc_display(metric)
+        free_window = self._qc_display("junction_contrast_free")
+        out = {}
+        for key, value in scores.items():
+            window = free_window if key in free_ids else pair_window
+            span = (window["vmax"] - window["vmin"]) or 1.0
+            out[key] = (value - window["vmin"]) / span
+        return out
 
     def _qc_render_labels(
         self, metric: str, fill_labels: np.ndarray, boundary_labels: np.ndarray, render_mode: str,
@@ -543,6 +689,420 @@ class EpiQuantAPI:
     # other frame to the top of the colormap. Three is enough to be
     # representative without paying for a whole 86-frame movie.
     _QC_FIT_FRAMES = 3
+
+    def get_show_free_edges(self) -> bool:
+        return bool(self.show_free_edges)
+
+    def set_show_free_edges(self, enabled: bool = False) -> bool:
+        """Show/hide the tissue-rim junctions. Clears the fitted colour
+        windows, which are fitted over whichever classes are displayed."""
+        self.show_free_edges = bool(enabled)
+        self._qc_display_cache.pop("junction_contrast", None)
+        self._qc_display_cache.pop("junction_contrast_free", None)
+        return self.show_free_edges
+
+    def _cell_geometry(self, cell_index: str) -> Optional[tuple]:
+        """`(x, y, area, radius)` for one `Cell{frame}_{label}` string, from
+        `cells_info`. The shape `lineage.py`'s detectors expect."""
+        if self.cells_info is None or not cell_index:
+            return None
+        if self._geometry_lookup is None:
+            info = self.cells_info.set_index("Cell Index")
+            self._geometry_lookup = {
+                idx: (
+                    float(row["Center X Coordinate"]), float(row["Center Y Coordinate"]),
+                    float(row["Cell Area"]), float(row["Circumscribed Circle Radius"]),
+                )
+                for idx, row in info.iterrows()
+            }
+        return self._geometry_lookup.get(cell_index)
+
+    def _margin_labels(self, frame_number: int) -> set:
+        """Labels touching the image border in `frame_number`, cached.
+
+        This is the margin test TissueMiner runs BEFORE its delamination
+        fallback, so what lands in it decides what gets called a delamination.
+        Evaluated on the FILLED mask, matching `data_input.is_edge_cell`'s
+        corrected convention -- the thin outline array cannot reach row 0 and
+        would report an empty margin.
+        """
+        if frame_number in self._margin_cache:
+            return self._margin_cache[frame_number]
+        loaded = self._load_frame(frame_number)
+        margin: set = set()
+        if loaded is not None:
+            fill = loaded[0]
+            for edge in (fill[0, :], fill[-1, :], fill[:, 0], fill[:, -1]):
+                margin.update(int(v) for v in np.unique(edge) if v)
+        self._margin_cache[frame_number] = margin
+        return margin
+
+    def _is_margin_cell(self, cell_index: str) -> bool:
+        match = re.match(r"Cell(\d+)_(\d+)$", str(cell_index))
+        if not match:
+            return False
+        return int(match.group(2)) in self._margin_labels(int(match.group(1)))
+
+    def get_dynamics_candidates(self, frame_number: Optional[int] = None) -> dict:
+        """Division / delamination / T1 candidates, with their evidence.
+
+        Candidates, not verdicts -- see `lineage.py`'s module docstring for why
+        neither detector can be trusted unattended. The frontend presents these
+        for confirmation; only confirmed events reach the lineage sheet.
+        """
+        if self.tracking_data is None or self.cells_info is None:
+            return {"error": "Extract and track the movie first."}
+
+        spans = lineage.track_spans(self.tracking_data)
+        if not spans:
+            return {"divisions": [], "delaminations": [], "t1": {}, "frame": frame_number}
+        last = max(s["last"] for s in spans.values())
+
+        divisions = lineage.division_candidates(
+            spans, self._cell_geometry, self._get_neighbor_graph, last_frame=last,
+        )
+        explained = {d["mother"] for d in divisions}
+        # The population median is what "shrunk away" is judged against -- a
+        # cell that vanishes at full size is a broken track, not a delamination.
+        typical_area = float(self.cells_info["Cell Area"].median())
+        delaminations = lineage.delamination_candidates(
+            spans, self._cell_geometry, self._is_margin_cell, last_frame=last, explained=explained,
+            typical_area=typical_area,
+        )
+        result = {
+            "divisions": divisions, "delaminations": delaminations,
+            "confirmed": sorted(self._confirmed_event_keys),
+            "rejected": sorted(self._rejected_event_keys),
+        }
+        if frame_number is not None:
+            result["divisions"] = [d for d in divisions if d["frame"] == frame_number]
+            result["delaminations"] = [d for d in delaminations if d["frame"] == frame_number]
+            result["t1"] = self.get_t1_events(frame_number)
+            result["frame"] = frame_number
+        return result
+
+    def set_event_decision(self, event_key: str, decision: str = "confirm") -> dict:
+        """Record a human decision on one candidate. `event_key` is
+        `"division:<mother>:<frame>"` or `"delamination:<track>:<frame>"`."""
+        self._confirmed_event_keys.discard(event_key)
+        self._rejected_event_keys.discard(event_key)
+        if decision == "confirm":
+            self._confirmed_event_keys.add(event_key)
+        elif decision == "reject":
+            self._rejected_event_keys.add(event_key)
+        return {
+            "confirmed": sorted(self._confirmed_event_keys),
+            "rejected": sorted(self._rejected_event_keys),
+        }
+
+    def _confirmed_events(self) -> list:
+        """The candidate objects the user has confirmed."""
+        found = self.get_dynamics_candidates()
+        if "error" in found:
+            return []
+        events = []
+        for d in found["divisions"]:
+            if f"division:{d['mother']}:{d['frame']}" in self._confirmed_event_keys:
+                events.append(d)
+        for d in found["delaminations"]:
+            if f"delamination:{d['track']}:{d['frame']}" in self._confirmed_event_keys:
+                events.append(d)
+        return events
+
+    def save_lineage(self) -> dict:
+        """Build the lineage sheet from CONFIRMED events and write it to
+        `cell_track_output/cell_lineage.xlsx`."""
+        if self.tracking_data is None:
+            return {"error": "No tracking data loaded."}
+        spans = lineage.track_spans(self.tracking_data)
+        margin_tracks = {
+            track for track, span in spans.items()
+            if self._is_margin_cell(span["cells"][span["first"]])
+            or self._is_margin_cell(span["cells"][span["last"]])
+        }
+        table = lineage.build_lineage_table(
+            self.tracking_data, confirmed=self._confirmed_events(), margin_tracks=margin_tracks,
+        )
+        path = os.path.join(self.output_dirs["cell_track_output"], "cell_lineage.xlsx")
+        table.to_excel(path, sheet_name="Lineage", index=False)
+        return {"path": path, "tracks": int(len(table)),
+                "divisions": int((table.disappears_by == "Division").sum()),
+                "delaminations": int((table.disappears_by == "Delamination").sum())}
+
+    def _t1_centroids(self, frame_number: int, label_to_track: dict) -> dict:
+        """`{track_id: (x, y)}` for one frame, for the T1 orientation nematic."""
+        if self.cells_info is None:
+            return {}
+        info = self.cells_info.set_index("Cell Index")
+        out = {}
+        for label, track in label_to_track.items():
+            if track is None:
+                continue
+            index = f"Cell{frame_number}_{label}"
+            if index in info.index:
+                out[track] = (
+                    float(info.at[index, "Center X Coordinate"]),
+                    float(info.at[index, "Center Y Coordinate"]),
+                )
+        return out
+
+    def _contacts_at(self, frame_number: int) -> Optional[set]:
+        """`topology.contacts_in_track_space` for one frame, or `None` if that
+        frame has no neighbour graph. Reuses the cached graph."""
+        graph = self._get_neighbor_graph(frame_number)
+        if not graph:
+            return None
+        if self.t1_enter_px is None:
+            return topology.contacts_in_track_space(graph, self._label_to_track(frame_number))
+        # Hysteresis needs the PREVIOUS frame's verdict, so the chain is walked
+        # from the first frame rather than evaluated pointwise. Without that the
+        # band has no state to hold and degenerates to a hard threshold at
+        # `enter_px` -- the exact thing it exists to avoid.
+        return self._hysteresis_contacts(frame_number)
+
+    def _hysteresis_contacts(self, frame_number: int) -> Optional[set]:
+        """Contacts at `frame_number` under the Schmitt trigger, resolved by
+        walking forward from the first frame. Cached per frame."""
+        if frame_number in self._hysteresis_cache:
+            return self._hysteresis_cache[frame_number]
+        frames = [f for f in self.get_frame_numbers() if f <= frame_number]
+        previous = None
+        for frame in frames:
+            if frame in self._hysteresis_cache:
+                previous = self._hysteresis_cache[frame]
+                continue
+            loaded = self._load_frame(frame)
+            if loaded is None:
+                self._hysteresis_cache[frame] = None
+                continue
+            weighted = adjacency.build_neighbor_graph(loaded[0], return_weights=True)
+            previous = topology.contacts_in_track_space(
+                weighted, self._label_to_track(frame), previous_contacts=previous,
+                enter_px=self.t1_enter_px, exit_px=self.t1_exit_px,
+            )
+            self._hysteresis_cache[frame] = previous
+        return self._hysteresis_cache.get(frame_number)
+
+    def get_t1_events(self, frame_number: int, direction: str = "next") -> dict:
+        """Neighbour exchanges (T1 transitions) between `frame_number` and the
+        adjacent frame. See `topology.detect_t1_transitions`.
+
+        Returns per-cell gained/lost counts keyed by RAW label (so the overlay
+        can paint them) plus the nematic axes for drawing. Every event is
+        additionally scored for **persistence** over `self.t1_persist_frames`
+        further frames (`topology.annotate_persistence`), giving a second set
+        of counts and a per-axis flag. Nothing is filtered out here -- the
+        caller renders settled events solid and transient ones faded, and both
+        totals are reported so the filter's effect stays visible.
+        """
+        if self.tracking_data is None:
+            return {"error": "Track the movie before looking for T1 transitions."}
+        other = frame_number + 1 if direction == "next" else frame_number - 1
+        graph_a, graph_b = self._get_neighbor_graph(frame_number), self._get_neighbor_graph(other)
+        if not graph_a or not graph_b:
+            return {"counts": {}, "counts_persistent": {}, "counts_unjudgeable": {}, "axes": [],
+                    "gained": 0, "lost": 0, "gained_persistent": 0, "lost_persistent": 0,
+                    "gained_unjudgeable": 0, "lost_unjudgeable": 0,
+                    "persist_frames": int(self.t1_persist_frames)}
+
+        l2t_a, l2t_b = self._label_to_track(frame_number), self._label_to_track(other)
+        # Always evaluate forward in time so a "gain" means a bond formed.
+        if direction == "next":
+            events = topology.detect_t1_transitions(
+                graph_a, graph_b, l2t_a, l2t_b, self._t1_centroids(frame_number, l2t_a),
+            )
+            earlier = frame_number
+        else:
+            events = topology.detect_t1_transitions(
+                graph_b, graph_a, l2t_b, l2t_a, self._t1_centroids(other, l2t_b),
+            )
+            earlier = other
+
+        # The events describe `earlier` -> `earlier + 1`, so persistence is
+        # judged on what happens from `earlier + 2` onward. A frame that does
+        # not exist simply shortens the horizon rather than failing the test:
+        # the end of the movie is not evidence that an exchange reversed.
+        # A missing frame ends the lookahead and the SHORT list is the signal:
+        # `annotate_persistence` reports those events as unjudgeable rather
+        # than silently passing them. Do not pad this list.
+        contacts_after = []
+        for offset in range(2, 2 + int(self.t1_persist_frames)):
+            contacts = self._contacts_at(earlier + offset)
+            if contacts is None:
+                break
+            contacts_after.append(contacts)
+        topology.annotate_persistence(events, contacts_after, self.t1_persist_frames)
+
+        track_to_label = {t: l for l, t in l2t_a.items() if t is not None}
+
+        def _counts(subset: dict) -> dict:
+            return {
+                int(track_to_label[track]): value
+                for track, value in topology.t1_counts_per_cell(subset).items()
+                if track in track_to_label
+            }
+
+        def _subset(state: str) -> dict:
+            return {key: [e for e in events[key] if e["state"] == state] for key in ("gained", "lost")}
+
+        settled, unjudgeable = _subset("persistent"), _subset("unjudgeable")
+        axes = [
+            {"center": e["center"], "phi": e["phi"], "type": e["type"],
+             "persistent": e["persistent"], "state": e["state"]}
+            for e in events["gained"] + events["lost"] if "phi" in e
+        ]
+        return {
+            "counts": _counts(events), "counts_persistent": _counts(settled),
+            "counts_unjudgeable": _counts(unjudgeable), "axes": axes,
+            "gained": len(events["gained"]), "lost": len(events["lost"]),
+            "gained_persistent": len(settled["gained"]), "lost_persistent": len(settled["lost"]),
+            "gained_unjudgeable": len(unjudgeable["gained"]), "lost_unjudgeable": len(unjudgeable["lost"]),
+            "persist_frames": int(self.t1_persist_frames),
+        }
+
+    # The three named modes the UI offers. `centroid_weight` and
+    # `overlap_weight` are what the cost actually reads; the mode is only a
+    # preset over the pair, so a custom weight stays expressible.
+    _COST_MODES = {
+        "hybrid": (1.0, None),      # None = keep the user's overlap weight
+        "centroid": (1.0, 0.0),
+        "overlap": (0.0, None),
+    }
+
+    def get_tracking_cost(self) -> dict:
+        """The tracking cost function's settings, plus their defaults.
+
+        `mode` is derived from the weights rather than stored, so it can never
+        disagree with them.
+        """
+        if self.centroid_weight == 0:
+            mode = "overlap"
+        elif self.overlap_weight == 0:
+            mode = "centroid"
+        else:
+            mode = "hybrid"
+        return {
+            "mode": mode,
+            "overlap_weight": float(self.overlap_weight),
+            "centroid_weight": float(self.centroid_weight),
+            "motion_compensation": bool(self.motion_compensation),
+            "max_frame_gap": int(self.max_frame_gap),
+            "drift_mode": str(self.drift_mode),
+            "default_overlap_weight": float(cell_tracking.DEFAULT_OVERLAP_WEIGHT),
+        }
+
+    def set_tracking_cost(
+        self, mode: str = None, overlap_weight: float = None, motion_compensation: bool = None,
+        max_frame_gap: int = None, drift_mode: str = None,
+    ) -> dict:
+        """Set the cost function. Any argument left `None` is unchanged.
+
+        **Measured on `embryos_GBE_GAP43`, against agreement with each cell's
+        best-IoU successor: nothing here reduces the 4.89% swap rate.**
+
+            centroid + overlap (shipped default)   4.90%
+            hybrid, overlap weight 10              4.92%
+            mask overlap (IoU) only                5.03%
+            centroid only                          5.54%
+            IoU-only + motion compensation         6.01%
+            hybrid + motion compensation           9.57%
+
+        The shipped default already wins, and the metric is biased in
+        IoU-only's favour (it scores agreement with the best-IoU successor)
+        yet IoU-only still loses -- so that ordering is not an artefact. The
+        mask does carry real information: centroid-only is the worst of the
+        three non-predictive costs, so Round 6's overlap term earns its place.
+        It is simply already being used.
+
+        Sweeping the overlap weight 0 -> 50 (effectively mask-only) barely
+        moves held-out area continuity, and over a 2-frame gap mask-only
+        scores 30.9% against centroid-only's 32.1%.
+
+        **Why motion compensation backfires**, which is worth recording
+        because the residual analysis predicted the opposite: per-frame
+        displacement here is mostly jitter, not coherent motion. The tissue
+        drifts 2.63 px/frame while individual cells move 7.9 px, and the
+        median displacement does NOT grow with frame gap (7.9 / 8.2 / 8.0 px
+        at gaps 1, 2, 3). A constant median across gaps is the signature of
+        non-persistent motion -- exactly the regime where extrapolating the
+        previous step adds noise (variance 6*sigma^2 against 2*sigma^2)
+        instead of removing it. The earlier "residual 7.9 -> 2.3 px" figure
+        was measured only over cells that were already tracked correctly,
+        which is the subset where the prediction was not needed.
+
+        So all four settings are offered because a dataset with different
+        statistics may behave differently -- not because any of them is known
+        to fix swaps here. The swaps come from ~8 px of centroid jitter
+        against a 26 px neighbour spacing, which no reweighting of these terms
+        resolves.
+        """
+        if overlap_weight is not None:
+            self.overlap_weight = max(0.0, float(overlap_weight))
+        if mode is not None:
+            if mode not in self._COST_MODES:
+                raise ValueError(f"Unknown cost mode {mode!r}; expected one of {sorted(self._COST_MODES)}.")
+            centroid, overlap = self._COST_MODES[mode]
+            self.centroid_weight = centroid
+            if overlap is not None:
+                self.overlap_weight = overlap
+            elif self.overlap_weight == 0:
+                # "hybrid"/"overlap" with the term switched off is the mode's
+                # own contradiction; restore the default rather than hand
+                # `build_cost_matrix` a cost with nothing in it.
+                self.overlap_weight = cell_tracking.DEFAULT_OVERLAP_WEIGHT
+        if motion_compensation is not None:
+            self.motion_compensation = bool(motion_compensation)
+        if max_frame_gap is not None:
+            self.max_frame_gap = max(0, int(max_frame_gap))
+        if drift_mode is not None:
+            if drift_mode not in ("none", "centroid", "mask"):
+                raise ValueError(f"drift_mode must be none/centroid/mask, got {drift_mode!r}")
+            self.drift_mode = drift_mode
+        return self.get_tracking_cost()
+
+    def get_t1_persistence(self) -> dict:
+        """How many frames a neighbour exchange must hold to count as settled,
+        plus the hysteresis band and the axis filter."""
+        return {
+            "value": int(self.t1_persist_frames),
+            "enter_px": self.t1_enter_px, "exit_px": self.t1_exit_px,
+            "axis_filter": self.t1_axis_filter,
+        }
+
+    def set_t1_hysteresis(self, enter_px: float = None, exit_px: float = None) -> dict:
+        """Set the Schmitt-trigger band on the adjacency, or clear it.
+
+        Both `None` turns it off. `enter_px` must exceed `exit_px` -- equal
+        values would BE a hard threshold, which Round 9 measured as making
+        flicker worse rather than better.
+        """
+        if enter_px is None or exit_px is None:
+            self.t1_enter_px = self.t1_exit_px = None
+        else:
+            enter_px, exit_px = float(enter_px), float(exit_px)
+            if enter_px <= exit_px:
+                raise ValueError(
+                    f"enter_px ({enter_px}) must exceed exit_px ({exit_px}); equal values are a hard "
+                    "threshold, which was measured to increase flicker."
+                )
+            self.t1_enter_px, self.t1_exit_px = enter_px, exit_px
+        self._neighbor_graph_cache.clear()
+        self._hysteresis_cache.clear()
+        return self.get_t1_persistence()
+
+    def set_t1_axis_filter(self, mode: str = "all") -> dict:
+        """Which T1 orientation axes to draw: all / persistent /
+        persistent_unjudgeable."""
+        if mode not in ("all", "persistent", "persistent_unjudgeable"):
+            raise ValueError(f"Unknown axis filter {mode!r}")
+        self.t1_axis_filter = mode
+        return self.get_t1_persistence()
+
+    def set_t1_persistence(self, value: int = None) -> dict:
+        """Set the T1 persistence horizon. 0 is TissueMiner's own unfiltered
+        behaviour -- every raw event counts."""
+        self.t1_persist_frames = max(0, int(value)) if value is not None else 0
+        return self.get_t1_persistence()
 
     def get_junction_min_px(self) -> dict:
         """`{"value": int, "auto": int, "is_override": bool}` -- the minimum
@@ -589,16 +1149,30 @@ class EpiQuantAPI:
         return frames[::step][: self._QC_FIT_FRAMES]
 
     def _qc_display(self, metric: str) -> dict:
-        """`metric`'s LUT window for this project, fitted once and cached."""
+        """`metric`'s LUT window for this project, fitted once and cached.
+
+        `"junction_contrast_free"` is a pseudo-metric: the free-edge half of
+        `junction_contrast`, fitted separately because the two classes are not
+        comparable (see `segmentation_qc.split_junction_scores`).
+        """
         if metric not in self._qc_display_cache:
+            free_only = metric == "junction_contrast_free"
+            source = "junction_contrast" if free_only else metric
             sampled = self._qc_fit_frames()
             pooled = {}
             for offset, frame in enumerate(sampled):
+                scores = self._qc_scores(frame, source)
+                if source == "junction_contrast":
+                    free_ids = self._free_edge_ids(frame)
+                    scores = {
+                        k: v for k, v in scores.items()
+                        if (k in free_ids) == free_only
+                    }
                 # Keys collide across frames (a label id is per-frame), so
                 # namespace them -- only the value distribution matters here.
-                for key, value in self._qc_scores(frame, metric).items():
+                for key, value in scores.items():
                     pooled[(offset, key)] = value
-            self._qc_display_cache[metric] = segmentation_qc.fit_display_window(metric, pooled)
+            self._qc_display_cache[metric] = segmentation_qc.fit_display_window(source, pooled)
         return self._qc_display_cache[metric]
 
     def copy_image_to_clipboard(self, data_uri: str) -> dict:
@@ -652,10 +1226,9 @@ class EpiQuantAPI:
             return None
         fill_labels, boundary_labels, base_image = loaded
         label_array = self._qc_render_labels(metric, fill_labels, boundary_labels, render_mode)
-        display = self._qc_display(metric)
+        scores = self._qc_display_scores(metric, frame_number, self._qc_scores(frame_number, metric))
         overlay = rendering.render_score_overlay(
-            label_array, base_image, self._qc_scores(frame_number, metric), lut,
-            vmin=display["vmin"], vmax=display["vmax"],
+            label_array, base_image, scores, lut, vmin=0.0, vmax=1.0,
         )
         return rendering.encode_png_base64(overlay)
 
@@ -680,10 +1253,9 @@ class EpiQuantAPI:
 
         if metric:
             label_array = self._qc_render_labels(metric, fill_labels, boundary_labels, render_mode)
-            display = self._qc_display(metric)
+            scores = self._qc_display_scores(metric, frame_number, self._qc_scores(frame_number, metric))
             image = rendering.render_score_overlay(
-                label_array, base_image, self._qc_scores(frame_number, metric), lut,
-                vmin=display["vmin"], vmax=display["vmax"],
+                label_array, base_image, scores, lut, vmin=0.0, vmax=1.0,
             )
             array = np.array(image)
         else:
@@ -702,12 +1274,30 @@ class EpiQuantAPI:
         """Per-frame `{frame, scored, flagged, min, median}` so the worst
         frames are findable without stepping through the whole movie. The
         flag threshold is the metric's own (see `QC_METRIC_DISPLAY`), since
-        the metrics don't share a scale."""
+        the metrics don't share a scale.
+
+        For `junction_contrast`, free edges are counted but never FLAGGED: a
+        dark free edge only means the mask stops there, which may be a real
+        tissue margin or simply where the segmentation was cropped, and that
+        is not decidable from the mask. Flagging them would bury the genuine
+        cell-cell errors this metric exists to surface -- on
+        `AS_dorsal view_E-cad` 16 of 44 free edges sit at or below 0 while not
+        one of its 284 cell-cell junctions does.
+        """
         flag_below = self._qc_display(metric)["flag_below"]
-        return [
-            {"frame": f, **segmentation_qc.summarize(self._qc_scores(f, metric), flag_below)}
-            for f in self.get_frame_numbers()
-        ]
+        rows = []
+        for f in self.get_frame_numbers():
+            scores = self._qc_scores(f, metric)
+            free_edges = 0
+            if metric == "junction_contrast":
+                free_ids = self._free_edge_ids(f)
+                free_edges = sum(1 for k in scores if k in free_ids)
+                scores = {k: v for k, v in scores.items() if k not in free_ids}
+            row = {"frame": f, **segmentation_qc.summarize(scores, flag_below)}
+            if metric == "junction_contrast":
+                row["free_edges"] = free_edges
+            rows.append(row)
+        return rows
 
     def get_qc_cell_at_pixel(self, frame_number: int, x: int, y: int) -> Optional[dict]:
         """Every metric's score for the clicked cell, so a flagged cell can be
@@ -1104,7 +1694,18 @@ class EpiQuantAPI:
             if mode == "single":
                 cells_info_for_tracking = self.cells_info.drop(columns=["leading_edge"], errors="ignore")
             result = cell_tracking.track_all_populations(
-                cells_info_for_tracking, self.output_dirs["cell_track_output"], progress_cb=self._progress_cb("track"),
+                cells_info_for_tracking, self.output_dirs["cell_track_output"],
+                progress_cb=self._progress_cb("track"),
+                # Gives the cost function the masks back, so it can add the
+                # mask-overlap term (see `cell_tracking.build_cost_matrix`).
+                npy_folder=self.npy_folder,
+                overlap_weight=self.overlap_weight,
+                centroid_weight=self.centroid_weight,
+                motion_compensation=self.motion_compensation,
+                max_frame_gap=self.max_frame_gap,
+                drift_mode=self.drift_mode,
+                drift_by_frame=(self._registration().get("drift_by_frame")
+                                if self.drift_mode != "none" else None),
             )
             self.tracking_data = result
             self.original_tracking_data = result.copy()
@@ -1172,6 +1773,12 @@ class EpiQuantAPI:
             cb(f"Re-tracking frames {start_frame}-{end_frame}...", 10)
             result = cell_tracking.retrack_frame_range(
                 self.cells_info.set_index("Cell Index"), self.tracking_data, start_frame, end_frame,
+                # Must be the same cost the full run used, or a "repair" can
+                # land on a link the full run would never have chosen.
+                npy_folder=self.npy_folder,
+                overlap_weight=self.overlap_weight,
+                centroid_weight=self.centroid_weight,
+                motion_compensation=self.motion_compensation,
             )
             self.tracking_data = result.pop("tracking_data")
             cb("Re-track complete.", 100)
@@ -1183,6 +1790,141 @@ class EpiQuantAPI:
     def set_track_colors(self, matched_color: str, unmatched_color: str) -> None:
         self.matched_color = matched_color
         self.unmatched_color = unmatched_color
+
+    def set_dynamics_colors(self, division: str, delamination: str, t1: str) -> None:
+        self.dynamics_colors = {"division": division, "delamination": delamination, "t1": t1}
+
+    def _dynamics_states(self, frame_number: int) -> dict:
+        """`{raw_label: {"event": ..., "confirmed": bool}}` for one frame.
+
+        Precedence division > delamination > T1: a dividing cell is also
+        rearranging its neighbours, and the rarer, more consequential event is
+        the one worth seeing.
+        """
+        found = self.get_dynamics_candidates(frame_number)
+        if "error" in found:
+            return {}
+        label_of = {t: l for l, t in self._label_to_track(frame_number).items() if t is not None}
+        states: dict = {}
+
+        # A T1 needs no human confirmation, but it does need to have settled:
+        # a cell whose exchange reverses next frame renders faded, the same
+        # treatment an unconfirmed division candidate gets.
+        t1 = found.get("t1", {})
+        settled_labels = {int(label) for label in t1.get("counts_persistent", {})}
+        for entry in t1.get("counts", {}):
+            states[int(entry)] = {"event": "t1", "confirmed": int(entry) in settled_labels}
+        for cand in found["delaminations"]:
+            label = label_of.get(cand["track"])
+            if label is not None:
+                states[int(label)] = {
+                    "event": "delamination",
+                    "confirmed": f"delamination:{cand['track']}:{cand['frame']}" in self._confirmed_event_keys,
+                }
+        for cand in found["divisions"]:
+            label = label_of.get(cand["mother"])
+            if label is not None:
+                states[int(label)] = {
+                    "event": "division",
+                    "confirmed": f"division:{cand['mother']}:{cand['frame']}" in self._confirmed_event_keys,
+                }
+        return states
+
+    def get_environment_thresholds(self) -> dict:
+        """The two environment-score tiers, and what each means."""
+        return {
+            "dead_band": float(self.environment_dead_band),
+            "repair_threshold": float(self.environment_repair_threshold),
+        }
+
+    def set_environment_thresholds(self, dead_band: float = None, repair_threshold: float = None) -> dict:
+        """Set the dead band (above it a cell is drawn clean) and the repair
+        tier (at or below it a cell is offered to the correction tools).
+
+        Two tiers rather than one because Tissue Analyzer uses two: 0.75 to
+        decide whether to FLAG (`take_decision`) and 0.5 to decide whether to
+        attempt a REPAIR (`optimize_score`). Collapsing them would either flag
+        too much or repair too eagerly.
+        """
+        if dead_band is not None:
+            self.environment_dead_band = min(1.0, max(0.0, float(dead_band)))
+        if repair_threshold is not None:
+            self.environment_repair_threshold = min(1.0, max(0.0, float(repair_threshold)))
+        return self.get_environment_thresholds()
+
+    def get_environment_repair_candidates(self, frame_number: int, direction: str = "prev") -> dict:
+        """Cells at or below the repair tier, worst first -- the second of
+        TA's two thresholds, wired to the existing correction tools.
+
+        Deliberately not every flagged cell: TA only attempts repair on cells
+        scoring <= 0.5 and skips perfect ones outright
+        (`optimize_score`: `if current_score >= 1.0: continue`).
+        """
+        scores = self._environment_scores(frame_number, direction)
+        if not scores:
+            return {"candidates": [], "threshold": float(self.environment_repair_threshold)}
+        worst = sorted(
+            ((int(label), float(value)) for label, value in scores.items()
+             if value <= self.environment_repair_threshold),
+            key=lambda pair: pair[1],
+        )
+        return {
+            "candidates": [{"label": label, "score": round(value, 3)} for label, value in worst],
+            "threshold": float(self.environment_repair_threshold),
+            "flagged_total": int(sum(1 for v in scores.values() if v < self.environment_dead_band)),
+            "n": len(scores),
+        }
+
+    def save_ground_truth_links(self, links: dict = None, path: str = None) -> dict:
+        """Write hand-labelled links to `cell_track_output/ground_truth_links.csv`.
+
+        `links` is `{frame: {label_in_frame: label_in_next_frame}}`; omitted, it
+        exports the CURRENT tracking as a starting point to correct, which is
+        far less work than typing a CSV from nothing.
+
+        This is the half of Round 10 that did not land: `load_link_csv` and
+        `save_link_csv` existed in the harness but were reachable from no UI, so
+        GBE ground truth could only be produced by hand-writing a file.
+        Ground truth remains the only judge that measures an accuracy.
+        """
+        if self.tracking_data is None:
+            return {"error": "Track the movie before exporting links."}
+        if path is None:
+            path = os.path.join(self.output_dirs["cell_track_output"], "ground_truth_links.csv")
+        if links is None:
+            links = {}
+            for frame in tracking_benchmark.frame_numbers(self.tracking_data)[:-1]:
+                here = self._label_to_track(frame)
+                there = {t: l for l, t in self._label_to_track(frame + 1).items()}
+                pairs = {label: there[track] for label, track in here.items() if track in there}
+                if pairs:
+                    links[frame] = pairs
+        tracking_benchmark.save_link_csv(links, path)
+        return {"path": path, "frames": len(links), "links": sum(len(v) for v in links.values())}
+
+    def load_ground_truth_links(self, path: str = None) -> dict:
+        """Load hand-labelled links and score the current tracking against them.
+
+        **This is the only judge in the app that reports an accuracy.** Every
+        other number is agreement with a reference that has its own bias.
+        """
+        if path is None:
+            path = os.path.join(self.output_dirs["cell_track_output"], "ground_truth_links.csv")
+        if not os.path.exists(path):
+            return {"error": f"No ground-truth file at {path}"}
+        links = tracking_benchmark.load_link_csv(path)
+        if self.tracking_data is None:
+            return {"error": "Track the movie before scoring against ground truth."}
+        result = tracking_benchmark.ground_truth(self.tracking_data, gt_links=links)
+        result["path"] = path
+        return result
+
+    def set_agreement_colors(self, agrees: str, disagrees: str, unjudgeable: str, broken: str) -> None:
+        """Colours for the link-agreement overlay's four states."""
+        self.agreement_colors = {
+            "agrees": agrees, "disagrees": disagrees,
+            "unjudgeable": unjudgeable, "broken": broken,
+        }
 
     def set_lifecycle_colors(self, lost_color: str, new_color: str, both_color: str) -> None:
         """Colors for the track-lifecycle overlay. Kept separate from
@@ -1221,8 +1963,32 @@ class EpiQuantAPI:
 
     def _environment_scores(self, frame_number: int, direction: str) -> dict:
         """Per-cell environment score for `frame_number` compared against the
-        previous or next frame (Tissue Analyzer's Fig. 3g/h respectively).
+        previous or next frame (Tissue Analyzer's Fig. 3g/h respectively), or
+        the worse of the two with `direction="both"`.
+
+        TA prints g and h as two panels side by side and tells the reader to
+        scrutinise any cell dark in EITHER (Aigouy & Prud'homme: "Any
+        dark-colored cell in g, h has undergone important environmental
+        changes"). A single-image UI can't show two panels at once, and making
+        the user toggle back and forth loses exactly the comparison the figure
+        is making -- so `"both"` takes the per-cell minimum, which is the same
+        reading rule in one view. Use the individual directions to tell WHICH
+        side a change happened on, which is what distinguishes a cell that
+        just appeared from one that is about to vanish.
+
         Empty dict if the compared frame doesn't exist."""
+        if direction == "both":
+            prev_scores = self._environment_scores(frame_number, "prev")
+            next_scores = self._environment_scores(frame_number, "next")
+            if not prev_scores:
+                return next_scores
+            if not next_scores:
+                return prev_scores
+            return {
+                label: min(value, next_scores.get(label, value))
+                for label, value in prev_scores.items()
+            }
+
         other_frame = frame_number - 1 if direction == "prev" else frame_number + 1
         graph_current = self._get_neighbor_graph(frame_number)
         graph_other = self._get_neighbor_graph(other_frame)
@@ -1238,6 +2004,7 @@ class EpiQuantAPI:
         track_color_mode: str = "uniform", identity_palette: str = "golden_angle",
         label_font_size: int = 10, environment_lut: str = "viridis",
         environment_direction: str = "prev", tint_other_cells: bool = False,
+        show_nematic_axes: bool = True,
     ) -> Optional[str]:
         if self.tracking_data is None:
             return None
@@ -1255,14 +2022,32 @@ class EpiQuantAPI:
             manual_correction_tracking.classify_track_lifecycle(self.tracking_data, frame_number)
             if track_color_mode == "lifecycle" else None
         )
+        dynamics_states = self._dynamics_states(frame_number) if track_color_mode == "dynamics" else None
+
+        agreement_states = None
+        if track_color_mode == "agreement":
+            agreement_states = self.get_link_agreement(frame_number).get("states")
+
+        nematic_axes = None
+        if track_color_mode == "dynamics" and show_nematic_axes:
+            events = self.get_t1_events(frame_number)
+            nematic_axes = [
+                {**axis, "length": 14,
+                 "color": "#66ccff" if axis["type"] == "gain" else "#ff9933"}
+                for axis in events.get("axes", [])
+            ]
 
         overlay = rendering.render_tracking_overlay(
             label_array, base_image, frame_number, self.tracking_data, self.matched_color, self.unmatched_color,
             label_cells=show_labels, track_color_mode=track_color_mode, identity_palette=identity_palette,
             label_font_size=label_font_size,
             environment_scores=environment_scores, environment_lut=environment_lut,
+            environment_dead_band=self.environment_dead_band,
             lifecycle_states=lifecycle_states, lifecycle_colors=self.lifecycle_colors,
             tint_other_cells=tint_other_cells,
+            dynamics_states=dynamics_states, dynamics_colors=self.dynamics_colors,
+            nematic_axes=nematic_axes,
+            agreement_states=agreement_states, agreement_colors=self.agreement_colors,
         )
         return rendering.encode_png_base64(overlay)
 
@@ -1317,6 +2102,81 @@ class EpiQuantAPI:
         except ValueError as e:
             return {"error": str(e)}
 
+    def score_propagation_stop_frames(
+        self, frame_number: int, old_id: int, new_id: int, end_frame: int, span: int = 3,
+    ) -> dict:
+        """Try candidate stop frames around `end_frame`, score each, keep the best.
+
+        Tissue Analyzer's `optimize_score` applies a candidate correction,
+        rescores, and reverts when the score did not improve
+        (`tracking_error_detector_and_fixer.py:1096`). Our smart-stop only ever
+        suggested. Because its output is a single scalar, acceptance testing
+        degenerates to a **line search**, which is the simplest place to add it.
+
+        Two constraints, both places this project has already been burned:
+
+        1. **The score must not be the quantity that produced the candidate.**
+           `find_propagation_stop_frame` decides by neighbour settlement, so
+           scoring by neighbour settlement would be self-confirming -- the same
+           failure as the IoU circularity and the residual selection bias. This
+           scores with `iou_agreement` on REGISTERED masks over the affected
+           frame range, which shares no information with the settlement rule.
+        2. **Reverting cannot be an inverse operation.**
+           `merge_tracks_from_frame` may trigger `_evict_future_if_colliding`,
+           relocating a third track's future onto a fresh id, and that has no
+           clean inverse. Every trial therefore runs against a deep copy and the
+           live table is never touched until the caller applies a choice.
+        """
+        if self.tracking_data is None:
+            return {"error": "No tracking data loaded."}
+        masks = {}
+        low = max(int(frame_number), 1)
+        high = int(end_frame) + int(span) + 1
+        for frame in self.get_frame_numbers():
+            if low <= frame <= high:
+                loaded = self._load_frame(frame)
+                if loaded is not None:
+                    masks[frame] = loaded[0]
+        if len(masks) < 2:
+            return {"error": "Not enough frames with masks to score this range."}
+        drift = self._registration().get("drift_by_frame") if self.register_reference else None
+
+        snapshot = self.tracking_data.copy(deep=True)
+        candidates, best = [], None
+        for candidate in range(max(int(frame_number) + 1, int(end_frame) - int(span)),
+                               int(end_frame) + int(span) + 1):
+            trial = snapshot.copy(deep=True)
+            try:
+                trial, _ = manual_correction_tracking.merge_tracks_from_frame(
+                    trial, int(frame_number), int(old_id), int(new_id), end_frame=candidate,
+                )
+            except ValueError:
+                continue
+            score = tracking_benchmark.iou_agreement(
+                trial, masks, register=bool(drift), drift_by_frame=drift,
+            )
+            entry = {"end_frame": candidate,
+                     "wrong_rate": round(float(score["wrong_rate"]), 3),
+                     "n_judged": int(score["n_judged"]),
+                     "suggested": candidate == int(end_frame)}
+            candidates.append(entry)
+            if best is None or entry["wrong_rate"] < best["wrong_rate"]:
+                best = entry
+
+        # The live table must be untouched by scoring. Asserted, not assumed:
+        # this is the whole safety property of an accept-and-revert loop.
+        assert self.tracking_data.astype(str).equals(snapshot.astype(str)), \
+            "scoring must not mutate the live tracking table"
+
+        return {
+            "candidates": candidates,
+            "best": best,
+            "suggested": int(end_frame),
+            "registered": bool(drift),
+            "note": ("Scored by disagreement with the overlap reference over the affected frames -- "
+                     "deliberately NOT by neighbour settlement, which is what chose the stop frame."),
+        }
+
     def apply_smart_stop_merge(self, frame_number: int, old_id: int, new_id: int, end_frame: int) -> dict:
         try:
             self.tracking_data, displaced = manual_correction_tracking.merge_tracks_from_frame(
@@ -1328,7 +2188,7 @@ class EpiQuantAPI:
 
     def compute_confirmed_identity_moves(
         self, frame_number: int, track_id: int, max_frames_ahead: int = 20,
-        restrict_to_unmatched: bool = True,
+        restrict_to_unmatched: bool = False,
     ) -> dict:
         """Diagnostic-only: plans (but does not apply) the position-based
         propagation used after a Suggest-match attach, in case the same
@@ -1428,23 +2288,149 @@ class EpiQuantAPI:
             return None
         return {"min_frame": min(frames), "max_frame": max(frames)}
 
-    def get_trajectory_overlay(self, track_number: int, frame_number: int, render_mode: str = "mask") -> Optional[str]:
+    def get_trajectory_overlay(
+        self, track_number: int, frame_number: int, render_mode: str = "mask",
+        color_mode: str = "highlight", show_nematic_axes: bool = True,
+    ) -> Optional[str]:
+        """Trajectory view. `color_mode="highlight"` is the original
+        single-track highlight; `"dynamics"` draws the cell-dynamics overlay.
+
+        **Cell dynamics lives here, not in Correct Tracking.** It is a result
+        to look at, not a correction tool -- and this step already has frame
+        playback and zoom, which is what reading division / delamination / T1
+        actually needs.
+        """
         if self.tracking_data is None:
             return None
+        loaded = self._load_frame(frame_number)
+        if loaded is None:
+            return None
+        fill_labels, boundary_labels, base_image = loaded
+        label_array = boundary_labels if render_mode == "outline" else fill_labels
+
+        if color_mode == "dynamics":
+            nematic_axes = None
+            if show_nematic_axes:
+                events = self.get_t1_events(frame_number)
+                keep = {"all": ("persistent", "transient", "unjudgeable"),
+                        "persistent": ("persistent",),
+                        "persistent_unjudgeable": ("persistent", "unjudgeable")}[self.t1_axis_filter]
+                nematic_axes = [
+                    {**axis, "length": 14,
+                     "color": "#66ccff" if axis["type"] == "gain" else "#ff9933"}
+                    for axis in events.get("axes", [])
+                    if axis.get("state", "persistent") in keep
+                ]
+            overlay = rendering.render_tracking_overlay(
+                label_array, base_image, frame_number, self.tracking_data,
+                self.matched_color, self.unmatched_color,
+                label_cells=False, track_color_mode="dynamics",
+                dynamics_states=self._dynamics_states(frame_number),
+                dynamics_colors=self.dynamics_colors, nematic_axes=nematic_axes,
+            )
+            return rendering.encode_png_base64(overlay)
+
         cell_ids = trajectory_visualization.get_track_cell_ids(self.tracking_data, int(track_number))
         target_prefix = f"Cell{frame_number}_"
         match = next((cid for cid in cell_ids if isinstance(cid, str) and cid.startswith(target_prefix)), None)
         if match is None:
             return None
         cell_id_num = int(match.split("_")[-1])
-
-        loaded = self._load_frame(frame_number)
-        if loaded is None:
-            return None
-        fill_labels, boundary_labels, base_image = loaded
-        label_array = boundary_labels if render_mode == "outline" else fill_labels
         overlay = rendering.render_cell_highlight(label_array, base_image, cell_id_num, self.highlight_color)
         return rendering.encode_png_base64(overlay)
+
+    def get_link_agreement(self, frame_number: int) -> dict:
+        """Per-cell agreement between this frame's links and an overlap-based
+        reference: `{"states": {label: state}, "counts": {...}}` with states
+        `agrees` / `disagrees` / `unjudgeable` / `broken`.
+
+        **This is not an error map, and the wording is load-bearing.** It says
+        a link disagrees with each cell's best-IoU successor. That reference is
+        itself biased -- it favours costs correlated with overlap and penalises
+        motion prediction -- and about a quarter of cells cannot be judged by
+        it at all. See `tracking_benchmark.iou_agreement`.
+        """
+        # Every empty return names its REASON. This mode previously failed
+        # silently in three ways -- sitting on the last frame, no npy folder, an
+        # unreadable mask -- and each produced `{}`, which the render branch
+        # draws as nothing at all. The view then looked identical to the mode
+        # being switched off, so "is it broken?" was a hunt instead of a glance.
+        if self.tracking_data is None:
+            return {"states": {}, "detail": {}, "counts": {}, "reason": "not_tracked",
+                    "message": "Track the movie before checking link agreement."}
+        frames = self.get_frame_numbers()
+        if frames and frame_number >= max(frames):
+            return {"states": {}, "detail": {}, "counts": {}, "reason": "last_frame",
+                    "message": f"Frame {frame_number} is the last frame - there is no next frame to "
+                               f"compare against, so no link can be judged here."}
+        masks = {}
+        for frame in (frame_number, frame_number + 1):
+            loaded = self._load_frame(frame)
+            if loaded is None:
+                return {"states": {}, "detail": {}, "counts": {}, "reason": "mask_unavailable",
+                        "message": f"Could not load the segmentation for frame {frame}. "
+                                   f"Check the masks folder is still readable."}
+            masks[frame] = loaded[0]
+        registration = self._registration()
+        entries = tracking_benchmark.classify_links(
+            self.tracking_data, masks, frame_number,
+            register=bool(registration.get("register")) and self.register_reference,
+            drift_by_frame=registration.get("drift_by_frame"),
+        )
+        counts: dict = {}
+        for entry in entries.values():
+            counts[entry["state"]] = counts.get(entry["state"], 0) + 1
+        return {
+            "states": {int(k): v["state"] for k, v in entries.items()},
+            "detail": {int(k): v for k, v in entries.items()},
+            "counts": counts,
+            "registered": bool(registration.get("register")) and self.register_reference,
+            "reason": None if entries else "no_cells",
+            "message": "" if entries else f"No tracked cells in frame {frame_number}.",
+        }
+
+    def _registration(self) -> dict:
+        """Cached `tracking_benchmark.registration_decision` for this project.
+
+        Measured once per project rather than assumed per dataset: the rule
+        (drift magnitude > 20% of the median cell radius) answers it for
+        `AS_dorsal`, `pupae` and `cp_dataset` without anyone choosing.
+        """
+        if self._registration_cache is None:
+            masks = {}
+            for frame in self.get_frame_numbers():
+                loaded = self._load_frame(frame)
+                if loaded is not None:
+                    masks[frame] = loaded[0]
+            if not masks:
+                return {"register": False, "drift_by_frame": {}}
+            info = self.cells_info.set_index("Cell Index") if self.cells_info is not None else None
+            self._registration_cache = tracking_benchmark.registration_decision(masks, info)
+        return self._registration_cache
+
+    def get_registration_status(self) -> dict:
+        """The measured drift and the resulting decision, for the Track tab.
+
+        Surfaced rather than applied silently: a user seeing "6.97 px drift
+        against a 13.0 px cell radius = 0.54, so the reference is registered"
+        can judge the basis. A user seeing tracking behave differently cannot.
+        """
+        decision = self._registration()
+        return {
+            "register": bool(decision.get("register")),
+            "applied": bool(decision.get("register")) and self.register_reference,
+            "median_drift_px": round(float(decision.get("median_drift_px", 0.0)), 2),
+            "median_cell_radius_px": round(float(decision.get("median_cell_radius_px", 0.0)), 2),
+            "ratio": round(float(decision.get("ratio", 0.0)), 3),
+            "threshold": float(decision.get("threshold", 0.2)),
+            "enabled": bool(self.register_reference),
+        }
+
+    def set_register_reference(self, enabled: bool = True) -> dict:
+        """Turn the registered reference on or off. The measured decision still
+        governs whether registration would apply at all."""
+        self.register_reference = bool(enabled)
+        return self.get_registration_status()
 
 
 if __name__ == "__main__":
