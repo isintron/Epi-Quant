@@ -958,6 +958,26 @@ class EpiQuantAPI:
             "gained_persistent": len(settled["gained"]), "lost_persistent": len(settled["lost"]),
             "gained_unjudgeable": len(unjudgeable["gained"]), "lost_unjudgeable": len(unjudgeable["lost"]),
             "persist_frames": int(self.t1_persist_frames),
+            # Provenance travels with every count. `25 / 15` is a statement
+            # about one objective and one binning: on a dataset at half the
+            # pixel size the same physical junction has roughly twice the
+            # contact strength, so the same numbers are a looser filter. The
+            # whole repo has no `pixel_size` / `um_per_px` anywhere, so without
+            # this stamp no T1 count in this project is reproducible outside
+            # the session that produced it.
+            "parameters": self.t1_parameters(),
+        }
+
+    def t1_parameters(self) -> dict:
+        """The settings any T1 count depends on, for stamping onto exports and
+        figure captions. Reported even when a filter is off, because "off" is
+        itself the setting that was used."""
+        return {
+            "enter_px": self.t1_enter_px,
+            "exit_px": self.t1_exit_px,
+            "dilation_px": adjacency.DEFAULT_DILATION_PX,
+            "persist_frames": int(self.t1_persist_frames),
+            "axis_filter": self.t1_axis_filter,
         }
 
     # The three named modes the UI offers. `centroid_weight` and
@@ -1732,12 +1752,41 @@ class EpiQuantAPI:
             self.output_dirs["cell_track_output"], "all_cell_tracking", "all_cell_merged_tracking_results.xlsx",
         ) if self.output_dirs else None
         tracked_at = os.path.getmtime(tracking_path) if tracking_path and os.path.isfile(tracking_path) else None
+        extract_path = os.path.join(
+            self.output_dirs["cell_classification_output"], "Cells_info.xlsx",
+        ) if self.output_dirs else None
+        extracted_at = os.path.getmtime(extract_path) if extract_path and os.path.isfile(extract_path) else None
+
+        # Staleness must be judged from the masks a HUMAN edits, not from
+        # `npy_converted`. That folder is a derived artefact this code
+        # regenerates on demand, so its mtimes always postdate the Extract
+        # output and comparing against it flags every frame as stale --
+        # measured: converted npy at 22:46, Cells_info at 18:29, source TIFFs
+        # at 14:22. A check that always fires is worse than no check.
+        # `list_segmentation_files` lists only `.npy`, so on a TIFF project it
+        # returns nothing and every frame would silently fall back to the
+        # derived mtime -- which is the false-positive this whole block exists
+        # to avoid. Match both source formats explicitly.
+        source_folder = self.mask_folder or self.npy_folder or ""
+        source_times = {}
+        try:
+            names = sorted(
+                f for f in os.listdir(source_folder)
+                if f.lower().endswith((".npy", ".tif", ".tiff")) and not f.startswith(".")
+            )
+            for filename, frame in data_input.resolve_frame_numbers(names).items():
+                source_times[frame] = os.path.getmtime(os.path.join(source_folder, filename))
+        except Exception:
+            logger.debug("Could not read source mask mtimes from %s", source_folder)
 
         frames = []
         seg_files = data_input.list_segmentation_files(self.npy_folder or "")
         for filename, frame in data_input.resolve_frame_numbers(seg_files).items():
             path = os.path.join(self.npy_folder, filename)
             mtime = os.path.getmtime(path)
+            # No source mtime for this frame means the comparison is not
+            # possible; treat it as NOT stale rather than blocking on a guess.
+            source_mtime = source_times.get(frame)
             manual = 0
             try:
                 flags = np.load(path, allow_pickle=True).item().get("ismanual")
@@ -1747,14 +1796,28 @@ class EpiQuantAPI:
             frames.append({
                 "frame": frame,
                 "stale": tracked_at is not None and mtime > tracked_at,
+                # Stale relative to EXTRACT, which is the one that matters for
+                # re-tracking: the cost reads centroids and radii from
+                # `Cells_info` while the IoU term reads masks off disk, so a
+                # mask edited after Extract makes the two disagree about what
+                # the cells even are. `overlaps` is keyed by labels parsed from
+                # the OLD `Cell{f}_{label}` strings, which after a
+                # hand-correction may name different cells or cells that no
+                # longer exist. Comparing only against the tracking output --
+                # which is what this did -- cannot see that at all.
+                "cells_info_stale": (extracted_at is not None and source_mtime is not None
+                                    and source_mtime > extracted_at),
                 "manual_cells": manual,
             })
         frames.sort(key=lambda f: f["frame"])
         stale = [f["frame"] for f in frames if f["stale"]]
+        needs_extract = [f["frame"] for f in frames if f["cells_info_stale"]]
         return {
             "tracked": tracked_at is not None,
+            "extracted": extracted_at is not None,
             "frames": frames,
             "stale_frames": stale,
+            "cells_info_stale_frames": needs_extract,
             "suggested_range": [min(stale), max(stale)] if stale else None,
         }
 
@@ -1770,17 +1833,67 @@ class EpiQuantAPI:
             if self.cells_info is None or self.tracking_data is None:
                 raise ValueError("Extract and track the movie before re-tracking a range.")
             cb = self._progress_cb("retrack")
+
+            # A5: refuse rather than silently mixing old features with new
+            # masks. The whole point of this feature is "you hand-corrected the
+            # segmentation", and that is exactly the state in which
+            # `Cells_info` no longer describes those masks.
+            stale = self.get_stale_frames().get("cells_info_stale_frames") or []
+            affected = [f for f in stale if start_frame - 1 <= f <= end_frame + 1]
+            if affected:
+                raise ValueError(
+                    "Frame(s) %s changed after the last Extract, so Cells_info no longer describes "
+                    "these masks. Re-run Extract first -- re-tracking now would combine old centroids "
+                    "and radii with new masks, and the overlap term would be keyed by labels that may "
+                    "no longer exist." % ", ".join(str(f) for f in affected)
+                )
+
             cb(f"Re-tracking frames {start_frame}-{end_frame}...", 10)
-            result = cell_tracking.retrack_frame_range(
-                self.cells_info.set_index("Cell Index"), self.tracking_data, start_frame, end_frame,
+            registration = self._registration() if self.drift_mode != "none" else {}
+            shared = dict(
                 # Must be the same cost the full run used, or a "repair" can
-                # land on a link the full run would never have chosen.
+                # land on a link the full run would never have chosen. Every
+                # argument `_run_tracking` passes is passed here too; the four
+                # LAP parameters are deliberately excluded (see
+                # `cell_tracking.RETRACK_EXCLUDED_PARAMETERS`).
                 npy_folder=self.npy_folder,
                 overlap_weight=self.overlap_weight,
                 centroid_weight=self.centroid_weight,
                 motion_compensation=self.motion_compensation,
+                drift_mode=self.drift_mode,
+                drift_by_frame=registration.get("drift_by_frame"),
+                max_frame_gap=self.max_frame_gap,
             )
-            self.tracking_data = result.pop("tracking_data")
+
+            # A3: the full run splits mes/epi into two INDEPENDENT assignment
+            # problems. Re-tracking the unsplit table solves one problem across
+            # both, which lets a mes cell link to an epi cell -- something the
+            # full run cannot do -- and raises the displacement ceiling to the
+            # max over both populations. Reuse `split_by_leading_edge` so the
+            # split logic has exactly one implementation.
+            info = self.cells_info
+            if "leading_edge" in info.columns:
+                mes, epi = cell_tracking.split_by_leading_edge(info)
+                result = {"reconciled": [], "new_tracks": [], "frames": [], "relinked": 0}
+                for part in (mes, epi):
+                    if part.empty:
+                        continue
+                    piece = cell_tracking.retrack_frame_range(
+                        part.set_index("Cell Index"), self.tracking_data,
+                        start_frame, end_frame, **shared,
+                    )
+                    self.tracking_data = piece.pop("tracking_data")
+                    for key in ("reconciled", "new_tracks"):
+                        result[key].extend(piece.get(key, []))
+                    result["relinked"] += piece.get("relinked", 0)
+                    result["frames"] = piece.get("frames", result["frames"])
+            else:
+                result = cell_tracking.retrack_frame_range(
+                    info.set_index("Cell Index"), self.tracking_data,
+                    start_frame, end_frame, **shared,
+                )
+                self.tracking_data = result.pop("tracking_data")
+
             cb("Re-track complete.", 100)
             self._notify("onRetrackDone", {**result, "track_count": int(len(self.tracking_data))})
         except Exception as e:
@@ -2244,12 +2357,22 @@ class EpiQuantAPI:
         if self.cells_info is None or self.tracking_data is None:
             return {"candidates": []}
         try:
+            # Topology confirmation, when both frames' graphs are available.
+            # A confirmer only: it promotes a candidate geometry already
+            # proposed and never demotes one -- see `suggest_match_candidates`.
+            graphs = None
+            previous = self._get_neighbor_graph(int(frame_number) - 1)
+            current = self._get_neighbor_graph(int(frame_number))
+            if previous and current:
+                graphs = (previous, current,
+                          self._label_to_track(int(frame_number) - 1),
+                          self._label_to_track(int(frame_number)))
             candidates = manual_correction_tracking.suggest_match_candidates(
                 self.cells_info, self.tracking_data, int(frame_number), cell_index,
                 lambda f: (self._load_frame(f) or (None, None, None))[0],
-                top_k=int(top_k),
+                top_k=int(top_k), topology_graphs=graphs,
             )
-            return {"candidates": candidates}
+            return {"candidates": candidates, "topology_available": graphs is not None}
         except (KeyError, ValueError) as e:
             return {"error": str(e)}
 
@@ -2392,9 +2515,17 @@ class EpiQuantAPI:
     def _registration(self) -> dict:
         """Cached `tracking_benchmark.registration_decision` for this project.
 
-        Measured once per project rather than assumed per dataset: the rule
-        (drift magnitude > 20% of the median cell radius) answers it for
-        `AS_dorsal`, `pupae` and `cp_dataset` without anyone choosing.
+        Measured once per project rather than assumed per dataset: the rule is
+        drift magnitude > 20% of the median cell radius.
+
+        Validated on the three REAL MOVIES in `test_data/` -- `embryos_GBE_GAP43`
+        (ratio 0.50, register), `AS_dorsal view_E-cad` (0.099, no) and
+        `AS_LE_lateral view_E-cad` (0.092, no). An earlier version of this
+        docstring named `pupae` and `cp_dataset` instead; both are separate-image
+        collections, so a cross-frame drift over them is meaningless.
+
+        The threshold has never been exercised near 0.2 (observed: 0.50 / 0.099
+        / 0.092), so `radius_fraction` is an untested free parameter.
         """
         if self._registration_cache is None:
             masks = {}

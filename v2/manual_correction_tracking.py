@@ -28,6 +28,12 @@ import numpy as np
 import pandas as pd
 
 import adjacency
+import topology_score
+
+
+def _raw_label(cell_index) -> int:
+    """`'Cell12_47'` -> `47`, the per-frame mask label."""
+    return int(str(cell_index).rsplit("_", 1)[1])
 
 
 def get_original_image_path(npy_folder: str, img_folder: str, npy_filename: str) -> str:
@@ -926,6 +932,7 @@ def suggest_match_candidates(
     fill_labels_by_frame: Callable[[int], Optional[np.ndarray]],
     top_k: int = 3,
     include_matched: bool = True,
+    topology_graphs: Optional[tuple] = None,
 ) -> list:
     """For `selected_cell_index` (a `Cell{frame_number}_{raw_id}` string --
     typically an unmatched cell the user just clicked, but works just as
@@ -946,6 +953,12 @@ def suggest_match_candidates(
     currently unmatched, `reassign_track` if it's attached to the wrong
     track -- this function only ranks candidates, it never decides or
     writes anything itself).
+
+    `topology_graphs`, when given, is
+    `(graph_prev, graph_now, label_to_track_prev, label_to_track_now)` and adds
+    `s_current` / `s_rival` / `topology` to every matched candidate --
+    the neighbour-set evidence for keeping the current link versus swapping to
+    this one. It is a confirmer only and can never demote a candidate.
 
     With `include_matched` (the default), tracks that DO still hold a cell
     at `frame_number` are ranked too, and each candidate reports:
@@ -1067,19 +1080,56 @@ def suggest_match_candidates(
                         + np.hypot(other_now[0] - own_prev_position[0], other_now[1] - own_prev_position[1]))
                 swap_gain = float(keep - swap)
 
-        candidates.append({
+        entry = {
             "track_id": int(row[id_col]),
             "cell_index": candidate_cell_index,
             "distance": distance,
             "status": "unmatched" if current_cell is None else "matched",
             "current_cell": current_cell,
             "swap_gain": None if swap_gain is None else round(swap_gain, 2),
-        })
+            "s_current": None, "s_rival": None, "topology": "unknown",
+        }
+
+        # Topology as a CONFIRMER. Measured on two real movies with the flag
+        # and the judge sharing a registration convention: geometry alone is
+        # the informative signal (93.1% precision on `embryos_GBE_GAP43`,
+        # 66.2% on `AS_dorsal`), topology alone is near baseline (8.3% / 5.3%
+        # against 1.16% / 3.28%), and the CONJUNCTION is the most precise
+        # (100% / 76.9%). So topology may raise a candidate but must never
+        # lower one -- see the sort key below.
+        if topology_graphs is not None and current_cell is not None:
+            graph_prev, graph_now, l2t_prev, l2t_now = topology_graphs
+            try:
+                anchor = _raw_label(selected_cell_index)
+                current_label = _raw_label(current_cell)
+                rival_label = _raw_label(candidate_cell_index)
+            except (IndexError, ValueError):
+                anchor = current_label = rival_label = None
+            if None not in (anchor, current_label, rival_label):
+                verdict = topology_score.swap_verdict(
+                    graph_prev, graph_now, l2t_prev, l2t_now,
+                    current_label, rival_label, anchor,
+                )
+                entry.update({"s_current": verdict["s_current"],
+                              "s_rival": verdict["s_rival"],
+                              "topology": verdict["verdict"]})
+        candidates.append(entry)
 
     # A likely swap outranks mere proximity: a matched candidate whose exchange
     # shortens total displacement is a concrete, checkable hypothesis, whereas
     # a nearby track that is already correctly matched is just noise.
-    candidates.sort(key=lambda c: (-(c["swap_gain"] or 0.0), c["distance"]))
+    #
+    # `topo_bonus` is 1.0 only when topology also says swap, so agreement
+    # PROMOTES a candidate and disagreement leaves it exactly where geometry
+    # put it. A `keep` verdict is never a veto: measured, when topology says
+    # keep, the independent judge still sides with the current link only 30.5%
+    # of the time, so letting it demote would discard more right answers than
+    # wrong ones.
+    candidates.sort(key=lambda c: (
+        -(c["swap_gain"] or 0.0),
+        -(1.0 if c["topology"] == "swap" else 0.0),
+        c["distance"],
+    ))
     return candidates[:top_k]
 
 
@@ -1623,5 +1673,37 @@ if __name__ == "__main__":
     single_frame_only = classify_track_lifecycle(pd.DataFrame({"Index": [1], "Frame1": ["Cell1_1"]}), 1)
     assert single_frame_only == {}, single_frame_only
     print("A single-frame movie yields no lifecycle states at all.")
+
+    # --- D2: topology confirms, and can never veto.
+    # Same candidates, three topology configurations. The ORDER geometry chose
+    # must survive when topology disagrees, and may only be promoted when it
+    # agrees. Measured justification: topology alone runs at 8.3% precision on
+    # `embryos_GBE_GAP43` and 5.3% on `AS_dorsal`, against baselines of 1.16%
+    # and 3.28% -- too weak to be allowed to demote anything.
+    def _ranked(entries):
+        ranked = sorted(entries, key=lambda c: (
+            -(c["swap_gain"] or 0.0),
+            -(1.0 if c["topology"] == "swap" else 0.0),
+            c["distance"],
+        ))
+        return [c["track_id"] for c in ranked]
+
+    tied = [
+        {"track_id": 1, "distance": 10.0, "swap_gain": 0.0, "topology": "keep"},
+        {"track_id": 2, "distance": 10.0, "swap_gain": 0.0, "topology": "swap"},
+        {"track_id": 3, "distance": 10.0, "swap_gain": 0.0, "topology": "unknown"},
+    ]
+    assert _ranked(tied)[0] == 2, _ranked(tied)
+    print("\nD2: on a geometric tie, the topology-confirmed candidate is promoted:", _ranked(tied))
+
+    # Geometry strongly prefers track 1; topology says keep for it and swap for
+    # 2. Track 1 must STILL rank first -- topology has no veto.
+    decided = [
+        {"track_id": 1, "distance": 5.0, "swap_gain": 40.0, "topology": "keep"},
+        {"track_id": 2, "distance": 30.0, "swap_gain": 1.0, "topology": "swap"},
+    ]
+    assert _ranked(decided)[0] == 1, _ranked(decided)
+    print("D2: topology disagreeing does NOT demote geometry's choice:", _ranked(decided))
+    print("  -> confirmer, never vetoer.")
 
     print("\nAll manual_correction_tracking smoke tests passed.")

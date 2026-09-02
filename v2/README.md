@@ -1399,6 +1399,288 @@ is correctly a no-op. Then, breaking 30 `Frame10` claims deliberately (20
 nulled, 10 swapped) and re-tracking `[9,11]` **repaired all 30 exactly**,
 with zero residual difference from the original table.
 
+### Round 13 addendum: the separate-image audit, and a premise that inverted twice (2026-09-02)
+
+#### The datasets are not all movies, and four rounds of smoke tests knew it for QC but not for tracking
+
+| dataset | kind |
+|---|---|
+| `AS_dorsal view_E-cad`, `AS_LE_lateral view_E-cad`, `embryos_GBE_GAP43`, `CTC` | movies |
+| `cp_dataset_puzzle-like_cells` (12), `Demo_Seg_QC` (3), `pupae_E-cad` (2), `Vofeley_Dryad_dataset` | **separate images** |
+
+**`Demo_Seg_QC` is dropped from every TRACKING verification line.** Its three
+masks are two unrelated specimens plus a hand-corrected copy of one:
+pair 1->2 has mismatched dimensions (209x209 vs 210x210) and cannot be compared
+at all, and pair 2->3 has a **median best IoU of 1.000** with 97.5% of cells
+above 0.9 -- a near-identity map. **Any tracking number computed on it is ~100%
+by construction**, so a completely broken tracker would still pass. It stays as
+the QC and extraction dataset it has always been; nothing about
+`junction_contrast`, gap closing, LUT windows or the false-junction case is
+affected.
+
+Severity, stated plainly: grepping this README for a *tracking* figure
+attributed to `Demo_Seg_QC` returns **none** -- every number quoted from it is
+extraction or QC. **A weakened safety net, not a wrong number.** The tracking
+regressions that mattered always ran on GBE and `AS_dorsal`, both real movies.
+**A dataset that scores perfectly is a warning, not a pass.**
+
+`data_input.warn_if_not_a_movie` now warns -- never refuses -- when consecutive
+frames have different shapes, or when filename stems are not a shared prefix
+plus a counter. Only the user can tell a two-frame movie from a two-specimen
+folder, so it informs. Known limit, recorded in its self-test: `pupae_E-cad`'s
+`_P1`/`_P2` share a long prefix and differ by one digit, so the filename
+heuristic cannot see them.
+
+#### The §D premise inverted twice, and the second inversion was my own measurement error
+
+See the corrected tables in the Round 13 §D section above. In short: the
+original document measured with the unregistered judge; the correction then
+scored a **registered judge against an unregistered geometry flag**. Registering
+both sides restores the original framing -- geometry is the recall engine
+(93.1% / 66.2% precision on the two movies), topology is a weak confirmer
+(8.3% / 5.3%, near baselines of 1.16% / 3.28%), and the conjunction is the most
+precise (100% / 76.9%, recall 62.0% / 14.3%).
+
+**D2 is wired; D3 is not.** Topology now promotes a candidate in
+`suggest_match_candidates` when it agrees, marks it "two criteria agree", and
+**never demotes one when it disagrees** -- shown unchanged with a tooltip,
+because when topology says keep an independent reference still sides with the
+current link only 30.5% of the time. Asserted in the self-test both ways: a
+geometric tie is broken by topology, and a decided geometric preference is not
+overturned by it. D3's OR is **not** implemented: its topology arm runs at
+8.3% / 5.3% precision, so it would contribute almost only false stops.
+
+#### `pupae`'s regenerated baseline does not match, and the reason is worth more than the file
+
+Regenerating `pupae_E-cad`'s classification via the pipeline gives
+**1,186 / 27** where README records **1,184 / 29** (total 1,213 matches
+exactly). Investigating rather than shrugging: **`pca_kmeans` runs
+`KMeans(..., random_state=None)`**, so the split is not deterministic. Repeating
+the pipeline's own k-means on one fixed PCA output gives (1183, 30) and
+(1184, 29) across eight trials, and the pipeline run gave (1186, 27).
+
+So the README's claim that `Cluster_Label` was *"byte-for-byte identical"*
+before and after the N-cluster generalisation describes **one draw from an
+unseeded estimator**, not a reproducible property. The generalisation itself is
+almost certainly fine -- the majority/minority structure is stable and only 2-3
+of 1,213 cells move -- but the *baseline* is not reproducible as documented.
+`random_state` is already an exposed parameter; **seeding it by default would
+change classification output, so it is left as a flagged decision rather than
+changed here.**
+
+#### Two closures that are less closed than they looked
+
+**The LapTrack localisation is now excluded too.** Round 12 attributed the
+8.91% disagreement to "the no-link / alternative-cost structure". The block
+matrix **is** that structure, and `four_quadrant=True` changes 0.00% of links in
+both regimes. So the structural explanation is excluded as well, and the
+residual difference is **unattributed** -- carried forward openly, like G2.
+
+**A3's blast radius is smaller than the plan implied.** No dataset in
+`test_data/` has a `leading_edge` column, so the population-split defect is
+structural but **unreachable with stored data**; it fires only once a user runs
+`compute_leading_edge` themselves. The synthetic test is the right coverage. Not
+a defect that was affecting real runs.
+
+#### Still open, deliberately
+
+- **G2**: the ~0.04 data-property gap (0.377 -> 0.709 measured against the
+  plan's 0.417 -> 0.752). Both candidate explanations were disproved in Round 12
+  and it remains **unexplained**, not settled.
+- `registration_decision`'s `radius_fraction` threshold has never been exercised
+  near 0.2 -- observed ratios are 0.50 / 0.099 / 0.092 -- so it is an untested
+  free parameter.
+- **§11**, the ground-truth capture UI, still deferred by decision.
+
+### Round 13: the re-track path solved a different problem (2026-09-02)
+
+#### A. The re-track path is now equivalent to the full run
+
+`retrack_frame_range`'s own comment states the invariant -- *"The cost has to be
+the one `track_cells` uses"* -- and that invariant had been broken **twice more**
+since it was written, because nothing tested it. Verified before fixing:
+
+| comparison | links differing |
+|---|---|
+| full run `mask` vs re-track | **15.96%** (audit: 16.01%) |
+| full run `centroid` vs re-track | 14.32% (audit: 14.15%) |
+
+`retrack_frame_range` had no `drift_mode` parameter at all -- not "the caller
+forgot", the function did not accept one -- so re-track was permanently
+`drift_mode="none"`. A user who turned registration on (the setting that scores
+best under every judge) and then re-tracked a range got **40% of that range
+solved by a different algorithm**, while the feature's entire promise is that
+identities outside the range do not move.
+
+Fixed: `drift_mode`, `drift_by_frame` and `max_frame_gap` threaded through
+(A1, A4); `_run_local_retrack` now passes everything the full run uses (A2);
+the mes/epi population split reuses `split_by_leading_edge` so there is one copy
+of that logic (A3).
+
+**A6, the test that would have caught all of it**, now asserts that re-tracking
+a range whose masks have not changed produces links **identical** to the full
+run's for that range:
+
+| dataset | drift_mode x max_frame_gap | result |
+|---|---|---|
+| `embryos_GBE_GAP43` | none / centroid / mask x 0 / 1 | **6 of 6 identical** |
+| `AS_dorsal view_E-cad` | none x 0 / 1 | identical |
+
+*A correction to the plan:* it says to run this on `AS_dorsal` "which has the
+population split". **No dataset in `test_data/` has a `leading_edge` column** --
+it is added by the Classify + leading-edge step, which none of the stored
+projects ran. A3 is therefore covered by a synthetic test in
+`cell_tracking.py`'s self-test, which builds two populations laid out so the
+only plausible partner for a mes cell is an epi cell, and asserts each
+population re-tracks as its own problem.
+
+#### A5. Stale `cells_info` -- and a false positive I nearly shipped
+
+Re-track advertises "after hand-correcting segmentation", which is exactly the
+state in which `Cells_info` (centroids, radii, and the labels `overlaps` is
+keyed by) no longer describes the masks on disk. `get_stale_frames` compared
+mask mtimes only against the **tracking** output, never against **Extract**, so
+the recommended UI path walked straight into it. `_run_local_retrack` now
+refuses, naming the frames and telling the user to re-run Extract.
+
+**The first version of that check flagged all 30 frames.** It compared against
+`npy_converted`, which is a *derived* folder this code regenerates on demand --
+measured mtimes: converted npy 22:46, `Cells_info` 18:29, source TIFFs 14:22.
+It now reads the source masks a human actually edits, and matches `.tif`/`.tiff`
+as well as `.npy`, because `list_segmentation_files` lists only `.npy` and
+returned nothing at all for a TIFF project. Verified in both directions: exactly
+the touched frame is flagged, a range clear of it proceeds, a range containing
+it refuses. **A check that always fires is worse than no check.**
+
+#### B. "Built in the harness, unreachable from the product" is now a test failure
+
+This had shipped three times: Round 10's LAP parameters, Round 11's
+registration, and registration again in `retrack_frame_range`. A
+signature-reachability test now asserts that every keyword of
+`build_cost_matrix`, `_no_match_sentinel` and `match_frames` reaches **both**
+`track_cells` and `retrack_frame_range`, and that every keyword of
+`track_cells` reaches `track_all_populations` -- or is listed in
+`UNTHREADED_PARAMETERS` with a one-line reason.
+
+**It failed on its first run**, catching `feature_columns` and `weights` as
+unreachable from `track_all_populations`. Both are now threaded. That is the
+test working as intended: a gap found at commit time instead of a round later.
+
+#### C. The LAP cost parameters -- retired, with the reason on the record
+
+Reproduced independently (exact values: `overlap_weight=1.0`,
+`centroid_weight=1.0`, `max_centroid_distance=31.0`, gate on):
+
+| variant | unregistered | mask-registered |
+|---|---|---|
+| `cost_form=multiplicative` | 7.55% | 0.36% |
+| `overlap_power=2.0` | 1.34% | 0.09% |
+| `overlap_power=0.5` | 1.07% | 0.09% |
+| `no_link_ratio=1.05` | 0.20% | 0.00% |
+| `no_link_ratio=1.5` | 5.18% | 0.51% |
+| **`four_quadrant=True`** | **0.00%** | **0.00%** |
+
+**Registration subsumes them.** Unregistered, the IoU term is small and noisy
+(median best IoU 0.377), so reshaping it absorbs drift and moves 1-8% of links.
+Registered (0.709), the correct link is unambiguous and no reshaping changes it.
+They stay in the cost primitives as the record of what was ruled out, and are
+listed in `UNTHREADED_PARAMETERS` with the reason.
+
+**The C-follow-on question is answered:** the four-quadrant block matrix --
+the structural form LapTrack and TrackMate use -- changes **0.00%** of links in
+*both* regimes, so it is not the residual difference either.
+
+**Reconciliation with Round 12's "byte-identical" claim.** There is no
+contradiction: Round 12 tested `four_quadrant`, the alternative-cost form and
+the per-cell extent gate, all at **`overlap_weight=0.0`** (centroid-only, to
+match LapTrack's Euclidean metric). It never tested `cost_form` or
+`overlap_power`, which are the two that move under this round's table. Both
+statements are true, about different parameters. Today's run confirms
+`four_quadrant` at 0.00%, which was the overlapping claim.
+
+#### D. Topology as a confirmer -- and the doc's numbers do not survive the judge
+
+`v2/topology_score.py` (new) is the one shared scoring function: `neighbour_dice`
+(unweighted set Dice in track space, TA's `pairwise_score` equivalent),
+`swap_verdict`, `settled_by_topology` at the 0.5 **repair** tier, and
+`mean_neighbour_dice` for the accept-and-revert loop.
+
+**Verification item 5 asked for the 2x2 under both judges, and that was the
+right thing to ask.** Every number in `topology-geometry.md` was measured with
+the unregistered judge, which Round 11 showed is the corrupted one:
+
+**Corrected, and the correction matters twice.** The first version of this
+table scored a registered judge against an **unregistered geometry flag** --
+the flag and the judge using different conventions, which is `CLAUDE.md`
+pattern 5 committed inside the section that introduced it. Registering both
+sides, with precision AND recall, on the two real movies:
+
+`embryos_GBE_GAP43` (6,808 scored links, 79 disagreements, baseline 1.16%):
+
+| flagged group | n | precision | recall |
+|---|---:|---:|---:|
+| geometry only | 29 | **93.1%** | 34.2% |
+| topology only | 12 | 8.3% | 1.3% |
+| **both** | **49** | **100.0%** | **62.0%** |
+| neither | 6,718 | 0.03% | 2.5% |
+
+`AS_dorsal view_E-cad` (2,136 scored links, 70 disagreements, baseline 3.28%):
+
+| flagged group | n | precision | recall |
+|---|---:|---:|---:|
+| geometry only | 65 | **66.2%** | 61.4% |
+| topology only | 19 | 5.3% | 1.4% |
+| **both** | **13** | **76.9%** | 14.3% |
+| neither | 2,039 | 0.78% | 22.9% |
+
+**The original framing was right after all: geometry is the recall engine,
+topology is the confirmer.** Geometry alone is 93.1% / 66.2%; topology alone is
+8.3% / 5.3%, barely above baselines of 1.16% / 3.28%; the conjunction is the
+most precise on both (100% / 76.9%). Together they flag 90 of 6,808 links on
+GBE and catch **97.5%** of the disagreements.
+
+Two intermediate conclusions are therefore withdrawn: *"geometry's apparent
+strength is an artefact"* (it was the mismatched convention that was the
+artefact) and *"neither signal is informative alone"* (geometry is). The
+topology-only figure of 44% (n=25) also does not survive -- it falls to 8.3%
+once the flag is registered, and does not replicate on the second movie.
+
+**The drift-proxy control, WITHDRAWN.** This section previously used
+`pupae_E-cad` as the control. That is invalid: `pupae_E-cad` is **two separate
+specimens** (`_P1`, `_P2`), not a movie, so there is no correspondence between
+its two images and every "link" over that pair is arbitrary. "Registered
+identical to unregistered" there is trivially true because the measured offset
+is 0.06 px; it demonstrates nothing about topology. Withdrawn rather than
+softened -- it is the same error class as the stale-baseline pattern in
+`CLAUDE.md`, committed while writing about that error class.
+
+The valid control is a second real movie, and it is stronger. See the corrected
+table below.
+
+#### F1. T1 provenance
+
+Every T1 count now carries `(enter_px, exit_px, dilation_px, persist_frames,
+axis_filter)` via `api.t1_parameters()`, and `adjacency.DEFAULT_DILATION_PX` is
+named rather than repeated as a literal. Grepping the repo for `pixel_size`,
+`um_per_px`, `micron`, `scale_um` still returns **zero hits**: `25 / 15` is a
+statement about one objective and one binning, and until now nothing recorded
+which. **No T1 count produced before this round is reproducible outside the
+session that produced it.**
+
+#### Not done, and why
+
+- **§D2 / §D3 / §D4** -- `topology_score` is built, self-tested and measured,
+  but is not yet wired into `suggest_match_candidates`, `find_propagation_stop_frame`
+  or the accept-and-revert score. The measurement above is a reason to wire it
+  differently from the plan's design: the plan's "topology is a good confirmer,
+  geometry is the recall engine" rests on numbers that do not survive the
+  registered judge.
+- **§E1** (TA's `match_by_max_overlap` as a third solver) and **§E2** (per-move
+  accept/revert) -- untouched, not half-built.
+- **§F2** (calibrate the trigger from the disappearance-rate curve) -- not built;
+  F1's provenance stamp is the prerequisite and is done.
+- **§11** remains deferred by decision.
+
 ### Round 12: close Round 11, fix what shipping revealed (2026-09-01)
 
 #### A. Registration now reaches the tracker
@@ -1543,7 +1825,8 @@ baseline produced a second wrong number, not just a false regression.
 | **both directions present (TA's rule)** | **6,593** | **64.8%** | **22.5%** | **42.2%** |
 | any direction available | 7,421 | 62.4% | 21.2% | 41.2% |
 
-**G2 -- both candidate explanations disproved, gap unexplained.** The drift
+**G2 -- both candidate explanations disproved, gap unexplained. Still open as of
+Round 13, and carried forward deliberately -- do not read it as settled.** The drift
 estimate's provenance is not it: mask-derived and `Cells_info`-derived drifts
 differ by 0.089 px median and give 0.709 vs 0.711. Integer rounding is not it
 either: a half-pixel change in the applied shift moves median best IoU by
@@ -1647,10 +1930,29 @@ metrics do show is that IoU-only is the least self-consistent cost either way
 Registers when the median global drift exceeds a configurable fraction
 (default 0.2) of the median cell radius. On GBE that is 6.97 / 13.00 = **0.54
 -> register**; on a tissue with no bulk motion the ratio falls below threshold
-and registration would be an identity operation anyway. That rule answers
-`AS_dorsal`, `pupae` and `cp_dataset` without anyone choosing per dataset. The
-Track tab shows the measured drift and the resulting decision, so the basis is
-visible rather than the behaviour changing silently.
+and registration would be an identity operation anyway. The Track tab shows the
+measured drift and the resulting decision, so the basis is visible rather than
+the behaviour changing silently.
+
+**Corrected: this previously claimed the rule "answers `AS_dorsal`, `pupae` and
+`cp_dataset`".** Two of those three are separate-image collections, not movies
+-- `pupae_E-cad` is two specimens and `cp_dataset` is twelve unrelated images,
+10 of whose 11 consecutive pairs have different dimensions. Re-validated on the
+three real movies, using each dataset's own median `Circumscribed Circle
+Radius`:
+
+| dataset | frames | median drift | median radius | ratio | decision |
+|---|---:|---:|---:|---:|---|
+| `embryos_GBE_GAP43` | 32 | 6.50 px | 13.00 px | **0.50** | register |
+| `AS_dorsal view_E-cad` | 24 | 3.45 px | 35.00 px | **0.099** | no |
+| `AS_LE_lateral view_E-cad` | 86 | 3.05 px | 33.00 px | **0.092** | no |
+
+**A documentation defect, not a wrong rule.** It discriminates across a 5x
+spread on real movies, and the two AS movies clear the threshold for two
+independent reasons (half the drift, 2.7x the radius). But note the threshold
+has **never been exercised near 0.2** -- the observed ratios are 0.50 / 0.099 /
+0.092 -- so `radius_fraction` remains an untested free parameter rather than a
+calibrated one.
 
 #### Two reference-free judges (§2)
 

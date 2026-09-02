@@ -1368,9 +1368,27 @@ async function handleSuggestMatch() {
     const flag = swap && swap > 0
       ? ` \u26a0 looks swapped \u2014 exchanging saves ${swap.toFixed(1)}px`
       : "";
+    // Topology CONFIRMS; it never demotes. Measured with the flag and the
+    // judge sharing a registration convention, geometry alone is the
+    // informative signal (93.1% / 66.2% on the two movies) and topology alone
+    // is near baseline (8.3% / 5.3%) -- but where both agree, precision is
+    // 100% / 76.9%. So agreement is worth surfacing and disagreement is worth
+    // explaining, not acting on.
+    let topoNote = "";
+    if (candidate.topology === "swap") {
+      topoNote = " \u2713 two criteria agree \u2014 the neighbour set also favours this track";
+    } else if (candidate.topology === "keep") {
+      topoNote = " (neighbour set unchanged \u2014 geometry's call stands)";
+    }
     item.textContent =
-      `Track #${candidate.track_id} (last seen ${candidate.cell_index}, ${candidate.distance.toFixed(1)}px away, ${held})${flag} `;
+      `Track #${candidate.track_id} (last seen ${candidate.cell_index}, ${candidate.distance.toFixed(1)}px away, ${held})${flag}${topoNote} `;
+    if (candidate.topology === "keep") {
+      item.title = "The neighbour set did not change, so topology does not confirm this swap. "
+        + "It is shown unchanged and not demoted: when topology says keep, an independent "
+        + "reference still sides with the current link only 30.5% of the time.";
+    }
     if (swap && swap > 0) item.style.fontWeight = "600";
+    if (candidate.topology === "swap") item.style.color = "#1a7f37";
     const useBtn = document.createElement("button");
     useBtn.className = "secondary-btn";
     useBtn.textContent = "Use this";

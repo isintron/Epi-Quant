@@ -23,8 +23,14 @@ import numpy as np
 from scipy import ndimage
 
 
+# The dilation radius every neighbour graph in this project is built with.
+# Named rather than repeated as a default literal so a T1 count can be stamped
+# with the value that produced it -- the count is not reproducible without it.
+DEFAULT_DILATION_PX = 2
+
+
 def build_neighbor_graph(
-    fill_labels: np.ndarray, dilation_px: int = 2, return_weights: bool = False,
+    fill_labels: np.ndarray, dilation_px: int = DEFAULT_DILATION_PX, return_weights: bool = False,
 ):
     """Return `{cell_id: {neighbor_cell_id, ...}}` for every non-zero label
     in `fill_labels`.

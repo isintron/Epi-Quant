@@ -165,6 +165,79 @@ def _extract_frame_number(filename: str) -> float:
     return int(matches[-1]) if matches else float("inf")
 
 
+def warn_if_not_a_movie(folder: str, masks_by_frame: Optional[dict] = None) -> Optional[dict]:
+    """Warn -- never refuse -- when a folder looks like separate specimens
+    rather than a time series.
+
+    Returns `None` when the folder looks like a movie, otherwise
+    `{"reason", "message", "detail"}`.
+
+    **Why a warning and not a refusal.** Only the user can distinguish a
+    legitimate two-frame movie from a two-specimen folder; the filenames cannot.
+    So this informs and never blocks.
+
+    **Why it exists.** `resolve_frame_numbers` assigns frame numbers from
+    trailing digits, so every one of these silently becomes "a movie", and each
+    then fed a cross-frame operation in this project:
+
+    - `pupae_E-cad`'s `..._P1` / `..._P2` -- two different pupae;
+    - `cp_dataset_puzzle-like_cells` -- twelve unrelated images, 10 of whose 11
+      consecutive pairs have DIFFERENT dimensions;
+    - `Demo_Seg_QC`'s `1_Demo_OE` / `2_Demo_WT` / `3_Demo_WT_handCorrection` --
+      two specimens plus a hand-corrected copy of one of them. That last one is
+      the dangerous shape: its 2->3 pair has a median best IoU of **1.000**, so
+      any tracking score computed on it is ~100% by construction and a broken
+      tracker would still pass.
+
+    Differing array shapes is the cheapest and least ambiguous trigger, so it is
+    checked first and reported alone when it fires.
+    """
+    shapes = {}
+    if masks_by_frame:
+        shapes = {f: tuple(a.shape[:2]) for f, a in masks_by_frame.items() if a is not None}
+    if len(set(shapes.values())) > 1:
+        listed = ", ".join(f"frame {f}: {h}x{w}" for f, (h, w) in sorted(shapes.items())[:6])
+        return {
+            "reason": "shape_mismatch",
+            "message": (f"{os.path.basename(folder) or folder}: frames have different image "
+                        f"dimensions, so this is probably a set of separate images rather than a "
+                        f"movie. Cross-frame operations (tracking, T1, drift) are not meaningful "
+                        f"here; per-frame ones (extraction, QC, shape) are fine."),
+            "detail": listed,
+        }
+
+    stems = [os.path.splitext(n)[0] for n in data_input_listing(folder)]
+    if len(stems) > 1:
+        prefix = os.path.commonprefix(stems)
+        # A movie's names share a long prefix and differ only in a counter. Two
+        # specimens share little, or differ by more than digits.
+        tails = [t[len(prefix):] for t in stems]
+        if any(not re.fullmatch(r"\d*[^0-9]*\d*", t) for t in tails) and len(prefix) < 3:
+            return {
+                "reason": "unrelated_stems",
+                "message": (f"{os.path.basename(folder) or folder}: filenames do not look like a "
+                            f"shared prefix plus an incrementing index, so this may be a set of "
+                            f"separate images rather than a movie."),
+                "detail": ", ".join(stems[:6]),
+            }
+    return None
+
+
+def data_input_listing(folder: str) -> list:
+    """Segmentation filenames in `folder`, for the movie-shape guard.
+
+    Deliberately not `list_segmentation_files`: that one lists only `.npy` and
+    returns nothing at all for a TIFF project, which would make the guard
+    silently pass on exactly the datasets it exists to catch.
+    """
+    if not folder or not os.path.isdir(folder):
+        return []
+    return sorted(
+        name for name in os.listdir(folder)
+        if os.path.splitext(name)[1].lower() in (".npy", ".tif", ".tiff", ".png")
+    )
+
+
 def resolve_frame_numbers(filenames: list[str]) -> dict[str, int]:
     """Map each filename to its frame number, falling back to 1-based
     position when the filenames carry no digits at all.
@@ -1321,7 +1394,18 @@ if __name__ == "__main__":
         assert max(solidity.values()) > 0.99, "the convex square must have solidity ~1"
         assert min(solidity.values()) < 0.75, "the 6-lobed star must have clearly sub-1 solidity"
 
-        print("\nAll data_input self-tests passed.")
+        # --- the movie-shape guard: warns, never refuses
+    mismatched = warn_if_not_a_movie("mock", {1: np.zeros((209, 209)), 2: np.zeros((210, 210))})
+    assert mismatched and mismatched["reason"] == "shape_mismatch", mismatched
+    assert warn_if_not_a_movie("mock", {1: np.zeros((100, 100)), 2: np.zeros((100, 100))}) is None
+    print("\nmovie guard: differing frame shapes warn (%s); equal shapes do not."
+          % mismatched["reason"])
+    print("  KNOWN LIMIT: `pupae_E-cad`'s `_P1`/`_P2` are two specimens but share a long prefix")
+    print("  and differ by one digit, so the filename heuristic cannot see them. Only the shape")
+    print("  check could, and only if the images differ in size. This informs; it is not a")
+    print("  classifier, and it never blocks.")
+
+    print("\nAll data_input self-tests passed.")
 
     parser = argparse.ArgumentParser(description="Standalone debug entry for v2.data_input")
     parser.add_argument(

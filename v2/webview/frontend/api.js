@@ -342,11 +342,16 @@
     },
     async suggest_match_candidates(frame, _cellIndex, _topK) {
       return { candidates: [
-        { track_id: 2, cell_index: `Cell${frame - 1}_2`, distance: 4.2,
+        { topology: "swap", s_current: 0.55, s_rival: 0.82, track_id: 2, cell_index: `Cell${frame - 1}_2`, distance: 4.2,
           status: "matched", current_cell: `Cell${frame}_7`, swap_gain: 12.5 },
+        // A matched candidate where topology DISAGREES. The UI must show it
+        // unchanged and undemoted -- a mock with only the confirming case
+        // would hide the rule that matters most here.
+        { topology: "keep", s_current: 0.88, s_rival: 0.41, track_id: 5, cell_index: `Cell${frame - 1}_5`,
+          distance: 6.9, status: "matched", current_cell: `Cell${frame}_9`, swap_gain: 3.1 },
         { track_id: 3, cell_index: `Cell${frame - 1}_3`, distance: 11.7,
-          status: "unmatched", current_cell: null, swap_gain: null },
-      ] };
+          status: "unmatched", current_cell: null, swap_gain: null, topology: "unknown" },
+      ], topology_available: true };
     },
     async compute_propagation_stop_frame(frame, _oldId, _newId, _maxFramesAhead) {
       return { stop_frame: frame + 2, reason: "settled", unsettled_neighbors_by_frame: { [frame + 1]: [`Cell${frame + 1}_4`] } };

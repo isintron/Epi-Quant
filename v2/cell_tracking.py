@@ -147,6 +147,24 @@ class _FrameLabelLoader:
         return labels
 
 
+# Parameters that exist on the cost primitives but are DELIBERATELY not
+# threaded into the pipeline entry points. Each needs a reason, and the
+# reachability self-test fails if a parameter is missing from `track_cells` /
+# `retrack_frame_range` without being listed here -- so a gap is a decision on
+# the record rather than an omission nobody noticed.
+#
+# This class of defect has now shipped three times: Round 10's LAP parameters,
+# Round 11's registration, and registration again in `retrack_frame_range`.
+# Each was "implemented but unreachable from the path users run", and each was
+# found a round later.
+UNTHREADED_PARAMETERS = {
+    "cost_form": "measured: influence falls to 0.0-0.5% once registration is on",
+    "overlap_power": "measured: influence falls to 0.0-0.5% once registration is on",
+    "no_link_ratio": "measured: influence falls to 0.0-0.5% once registration is on",
+    "four_quadrant": "measured: influence falls to 0.0-0.5% once registration is on",
+}
+
+
 def _shift_labels(labels: np.ndarray, dx: float, dy: float) -> np.ndarray:
     """Translate a label image by whole pixels, filling the vacated edge with 0.
 
@@ -1072,6 +1090,9 @@ def retrack_frame_range(
     overlap_power: float = 1.0,
     no_link_ratio: Optional[float] = None,
     four_quadrant: bool = False,
+    drift_mode: str = "none",
+    drift_by_frame: Optional[dict] = None,
+    max_frame_gap: int = 0,
 ) -> dict:
     """Re-solve tracking for frames `start_frame..end_frame` only, leaving
     every other frame's identities untouched. For use after hand-correcting
@@ -1140,6 +1161,19 @@ def retrack_frame_range(
     # re-tracking a range solved a DIFFERENT problem than the full run had for
     # those same frames, and could "repair" a link into something the full run
     # would never have chosen.
+    #
+    # That was fixed once and then broken TWICE MORE, because every parameter
+    # added to `track_cells` had to be threaded here by hand and nothing
+    # checked. Measured cost the second time: 15.96% of links differing between
+    # a registered full run and a re-track, 40.95% on the worst frame pair.
+    # The invariant is now enforced by a signature-reachability test and a
+    # link-equivalence test in this module's self-test -- a comment is not an
+    # enforcement mechanism.
+    if feature_columns is None:
+        feature_columns = DEFAULT_TRACKING_FEATURES
+    if weights is None:
+        weights = DEFAULT_TRACKING_WEIGHTS
+
     label_loader = _FrameLabelLoader(npy_folder)
     links: dict[int, dict[str, str]] = {}
     previous_cells, previous_matches = None, None
@@ -1149,15 +1183,32 @@ def retrack_frame_range(
         if cells_a.empty or cells_b.empty:
             continue
 
+        shift = (0.0, 0.0)
+        if drift_mode != "none":
+            shift = (drift_by_frame or {}).get(frame) or _estimate_drift(label_loader, frame)
+
         overlaps = None
         if label_loader and overlap_weight != 0:
             labels_a, labels_b = label_loader.get(frame), label_loader.get(frame + 1)
             if labels_a is not None and labels_b is not None:
+                if drift_mode == "mask" and (shift[0] or shift[1]):
+                    labels_a = _shift_labels(labels_a, shift[0], shift[1])
                 overlaps = mask_overlap_fractions(labels_a, labels_b)
 
         predicted = None
         if motion_compensation:
             predicted = predict_centroids(previous_matches, previous_cells, cells_a, feature_columns)
+        if drift_mode != "none" and (shift[0] or shift[1]) and not cells_a.empty:
+            _, _, cx, cy = _gate_indices(list(feature_columns))
+            x_col, y_col = feature_columns[cx], feature_columns[cy]
+            base = predicted or {}
+            predicted = {
+                index: (base.get(index, (float(cells_a.at[index, x_col]),
+                                         float(cells_a.at[index, y_col])))[0] + shift[0],
+                        base.get(index, (float(cells_a.at[index, x_col]),
+                                         float(cells_a.at[index, y_col])))[1] + shift[1])
+                for index in cells_a.index
+            }
 
         cost = build_cost_matrix(
             cells_a, cells_b, feature_columns, weights,
@@ -1241,6 +1292,16 @@ def retrack_frame_range(
             if pd.notna(value) and value not in present:
                 tracking_data.at[pos, col] = None
 
+    if max_frame_gap:
+        # `track_cells` gap-closes after its merge; a re-track that did not
+        # would leave the range structurally different from the rest of the
+        # movie whenever the user has the option on.
+        tracking_data, joins = close_track_gaps(
+            tracking_data, cells_info, max_frame_gap=max_frame_gap,
+            feature_columns=feature_columns, max_centroid_distance=radius_fallback,
+        )
+        result["gap_joins"] = joins
+
     result["tracking_data"] = tracking_data
     return result
 
@@ -1275,6 +1336,8 @@ def track_all_populations(
     four_quadrant: bool = False,
     drift_mode: str = "none",
     drift_by_frame: Optional[dict] = None,
+    feature_columns: Optional[list[str]] = None,
+    weights: Optional[list[float]] = None,
 ) -> pd.DataFrame:
     """Orchestrates tracking for one or two populations (mes/epi, if
     `cells_info` has a `leading_edge` column; otherwise a single
@@ -1306,7 +1369,8 @@ def track_all_populations(
                                        max_frame_gap=max_frame_gap, cost_form=cost_form,
                                        overlap_power=overlap_power, no_link_ratio=no_link_ratio,
                                        four_quadrant=four_quadrant, drift_mode=drift_mode,
-                                       drift_by_frame=drift_by_frame)
+                                       drift_by_frame=drift_by_frame,
+                                       feature_columns=feature_columns, weights=weights)
             all_tracking_data = pd.concat([all_tracking_data, mes_tracking], axis=0)
         if not epi_cells_info.empty:
             epi_tracking = track_cells(epi_cells_info, output_dir, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
@@ -1314,7 +1378,8 @@ def track_all_populations(
                                        max_frame_gap=max_frame_gap, cost_form=cost_form,
                                        overlap_power=overlap_power, no_link_ratio=no_link_ratio,
                                        four_quadrant=four_quadrant, drift_mode=drift_mode,
-                                       drift_by_frame=drift_by_frame)
+                                       drift_by_frame=drift_by_frame,
+                                       feature_columns=feature_columns, weights=weights)
             all_tracking_data = pd.concat([all_tracking_data, epi_tracking], axis=0)
     else:
         cells_info = cells_info.set_index("Cell Index")
@@ -1323,7 +1388,8 @@ def track_all_populations(
                                        max_frame_gap=max_frame_gap, cost_form=cost_form,
                                        overlap_power=overlap_power, no_link_ratio=no_link_ratio,
                                        four_quadrant=four_quadrant, drift_mode=drift_mode,
-                                       drift_by_frame=drift_by_frame)
+                                       drift_by_frame=drift_by_frame,
+                                       feature_columns=feature_columns, weights=weights)
 
     if all_tracking_data is not None and not all_tracking_data.empty:
         all_cell_dir = os.path.join(output_dir, "all_cell_tracking")
@@ -1569,6 +1635,74 @@ if __name__ == "__main__":
         assert 0 < gated < many1.shape[0] * many2.shape[0], gated
         print("  (%d of %d pairs gated in the ceiling case, so the NaN paths are actually exercised)"
               % (gated, many1.shape[0] * many2.shape[0]))
+
+        # --- A3: the population split. NO dataset in test_data/ carries a
+        # `leading_edge` column (it is added by the Classify + leading-edge
+        # step, which none of the stored projects ran), so this path can only
+        # be exercised synthetically -- which is a reason to test it here, not
+        # a reason to skip it.
+        #
+        # Two populations laid out so the ONLY plausible partner for a mes cell
+        # is an epi cell: if the two are solved as one problem they link across
+        # populations, which the full run cannot do.
+        def _pop(name, x, y, edge):
+            row = {c: 0.0 for c in DEFAULT_TRACKING_FEATURES}
+            row["Center X Coordinate"], row["Center Y Coordinate"] = x, y
+            row["Maximum Horizontal Length"] = row["Maximum Vertical Length"] = 30.0
+            row["Circumscribed Circle Radius"] = 10.0
+            row["leading_edge"] = edge
+            return pd.Series(row, name=name)
+
+        split_rows = []
+        for f in (1, 2, 3):
+            split_rows.append(_pop(f"Cell{f}_1", 10.0 + f, 10.0, -1.0))   # mes
+            split_rows.append(_pop(f"Cell{f}_2", 12.0 + f, 10.0, 1.0))    # epi, right beside it
+        split_info = pd.DataFrame(split_rows)
+        split_info.index.name = "Cell Index"
+        flat = split_info.reset_index()
+        mes, epi = split_by_leading_edge(flat)
+        assert len(mes) == 3 and len(epi) == 3, (len(mes), len(epi))
+        # Each population, solved on its own, can only link within itself.
+        for part in (mes, epi):
+            indexed = part.set_index("Cell Index")
+            tracks = pd.DataFrame({"Index": [1], **{f"Frame{f}": [indexed.index[f - 1]] for f in (1, 2, 3)}})
+            out = retrack_frame_range(indexed, tracks, 2, 2)
+            claimed = [v for k, v in out["tracking_data"].iloc[0].items() if str(k).startswith("Frame")]
+            labels = {str(c).rsplit("_", 1)[1] for c in claimed if pd.notna(c)}
+            assert len(labels) == 1, f"a population must not link across to the other: {claimed}"
+        print("\npopulation split: mes and epi re-track as two independent problems")
+        print("  (no dataset in test_data/ has a leading_edge column, so this is synthetic on purpose)")
+
+        # --- B: signature reachability. A knob on a cost primitive that no
+        # pipeline entry point accepts is not implemented, whatever its
+        # docstring says.
+        import inspect
+        def keywords(fn):
+            return {n for n, p in inspect.signature(fn).parameters.items()
+                    if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) and p.default is not p.empty}
+        primitives = {}
+        for fn in (build_cost_matrix, _no_match_sentinel, match_frames):
+            primitives |= {k: fn.__name__ for k in keywords(fn)}
+        # Arguments the entry points supply themselves rather than accept.
+        supplied = {"overlaps", "max_centroid_distance", "predicted_centroids",
+                    "fallback", "sentinel", "cost_matrix", "no_link_ratio"}
+        for entry in (track_cells, retrack_frame_range):
+            have = keywords(entry)
+            for name, owner in primitives.items():
+                if name in supplied or name in have:
+                    continue
+                assert name in UNTHREADED_PARAMETERS, (
+                    f"{owner}'s '{name}' is not reachable from {entry.__name__} and is not listed "
+                    f"in UNTHREADED_PARAMETERS with a reason"
+                )
+        missing = keywords(track_cells) - keywords(track_all_populations) - {
+            "start_index", "progress_cb", "output_dir"}
+        assert not missing, f"track_cells parameters unreachable from track_all_populations: {missing}"
+        for name in UNTHREADED_PARAMETERS:
+            assert UNTHREADED_PARAMETERS[name], f"{name} needs a stated reason"
+        print("\nreachability: every cost-primitive keyword reaches track_cells AND")
+        print("  retrack_frame_range, or is listed in UNTHREADED_PARAMETERS with a reason")
+        print("  (%d excluded: %s)" % (len(UNTHREADED_PARAMETERS), ", ".join(sorted(UNTHREADED_PARAMETERS))))
 
         print("All cell_tracking self-tests passed.")
         raise SystemExit(0)
