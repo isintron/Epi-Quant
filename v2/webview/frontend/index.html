@@ -378,13 +378,6 @@
          instead of ending and a new ID being issued. It runs as a second matching pass over whole track
          segments, after the frame-to-frame pass &mdash; the same two-stage structure u-track and TrackMate
          use. It changes track counts, and therefore cell-loss&nbsp;%.</p>
-      <p><strong>Measured on a germband dataset, the default already wins</strong> (wrong-link rate):
-         centroid&nbsp;+&nbsp;overlap <strong>4.9%</strong>, IoU-only 5.0%, centroid-only 5.5%,
-         with motion compensation 9.6%. The swaps there come from about 8&nbsp;px of per-frame centroid
-         jitter with neighbours only 26&nbsp;px away &mdash; an ambiguity none of these terms resolves.
-         Motion compensation actively hurts because that jitter isn't persistent, so extrapolating it
-         adds noise; it suits a movie that genuinely drifts. <strong>Try these on your own data; don't
-         assume they help.</strong></p>
     </div>
     <div class="field-row">
       <button id="start-tracking-btn" class="primary-btn">Track Cells</button>
@@ -465,7 +458,7 @@
       (unmatched, or the track is absent in the compared frame).
     </p>
     <div class="field-row" id="correct-track-agreement" style="display:none">
-      <span class="control-group-label">Disagrees with overlap reference</span>
+      <span class="control-group-label">Disagrees with overlap</span>
       <label>Agrees <input type="color" id="agreement-agrees-color-input" value="#4a90d9"></label>
       <label>Disagrees <input type="color" id="agreement-disagrees-color-input" value="#ff3b30"></label>
       <label>Can't judge <input type="color" id="agreement-unjudgeable-color-input" value="#a06bd4"></label>
@@ -482,23 +475,13 @@
       <p>Each cell is compared against <strong>its highest-overlap successor</strong> in the next frame.
          Red means this tracking chose a <em>different</em> cell than mask overlap would have.
          <strong>That is a disagreement, not an error</strong> &mdash; overlap is a reference, not the truth.</p>
-      <p><strong>The reference is biased, in a known direction.</strong> It favours costs that follow mask
-         overlap and penalises costs that predict motion: on a germband dataset the correlation between
-         cost and overlap is &minus;0.85 without motion prediction but only &minus;0.71 with it. A change
-         that moved links <em>toward</em> the truth and away from the biggest-overlap cell would look worse
-         here, and this view could not tell the difference.</p>
       <p><strong>Violet cells could not be judged at all</strong> &mdash; their best overlap is too low for
          "which cell is the successor" to have an answer. That is about a quarter of cells on a germband
          dataset, so grey is common and is not a grade.</p>
       <p><strong>Registered reference.</strong> If the tissue drifts as a whole, comparing masks where they
-         sit exaggerates every disagreement. On a germband dataset the drift is ~6.9&nbsp;px per frame
-         against a 13&nbsp;px cell radius, and shifting the masks by it takes the reference's own median
-         self-overlap from <strong>0.377 to 0.709</strong> &mdash; unregistered it is barely above its own
-         0.3 usability threshold. Tissue Analyzer registers before matching for this reason. The same
-         tracking scores 4.9% or 14.0% disagreement depending only on this switch, so it is shown, not
-         hidden.</p>
+         sit exaggerates every disagreement.</p>
       <p>Click a flagged cell to see <strong>both overlaps</strong> &mdash; the reference's pick and the one
-         this tracking chose. Most disagreements are near-ties: 65% of them differ by less than 0.15 IoU.</p>
+         this tracking chose.</p>
       <p>Use it to find cells worth <em>looking at</em>, then judge them with the correction tools below.</p>
     </div>
     <div class="field-row" id="correct-track-lifecycle" style="display:none">
@@ -569,6 +552,55 @@
       <button id="apply-track-swap-btn" class="secondary-btn">Swap</button>
     </div>
     <div id="correct-track-swap-status" class="status-line"></div>
+
+    <h3>Ground-truth census</h3>
+    <p class="hint">Labels one link at a time: <em>is the cell at frame f the same cell as the one
+      this link points to at f+1?</em> Hold <b>space</b> to blink between the two frames &mdash; a
+      correct link shifts slightly, a swap jumps. Then <b>J</b> correct, <b>K</b> wrong,
+      <b>L</b> can&rsquo;t tell; after K, press <b>1</b>&ndash;<b>3</b> to pick the right cell or
+      <b>0</b> for none of them. Some items are checks: a few show a deliberately wrong link, and a
+      few silently repeat an earlier one. You are not told which, and that is the point &mdash; the
+      pass-rate on those is what makes the labels quotable.</p>
+    <div class="field-row">
+      <label>Set
+        <select id="census-kind-select">
+          <option value="geometry_flagged">Every link the overlap reference disagrees with</option>
+          <option value="frame_pair">Every link in one frame pair</option>
+        </select>
+      </label>
+      <label id="census-frame-wrap" style="display:none">Frame
+        <input type="number" id="census-frame-input" class="small-input" min="1" value="1"></label>
+      <label>Your name <input type="text" id="census-labeller-input" class="small-input" placeholder="optional"></label>
+      <button id="census-start-btn" class="secondary-btn">Start census →</button>
+    </div>
+    <div id="census-status" class="status-line"></div>
+    <div id="census-panel" style="display:none">
+      <div class="census-blink">
+        <img id="census-image" class="frame-preview census-crop">
+        <div id="census-frame-tag" class="hint"></div>
+      </div>
+      <div id="census-candidates" class="field-row" style="display:none"></div>
+      <div class="field-row">
+        <button id="census-correct-btn" class="secondary-btn">J &mdash; correct</button>
+        <button id="census-wrong-btn" class="secondary-btn">K &mdash; wrong</button>
+        <button id="census-unjudgeable-btn" class="secondary-btn">L &mdash; can&rsquo;t tell</button>
+        <button id="census-summary-btn" class="secondary-btn">Show session numbers</button>
+      </div>
+      <div id="census-progress" class="status-line"></div>
+    </div>
+    <div id="census-summary" class="status-line"></div>
+
+    <h3>Review coverage</h3>
+    <p class="hint">Records which frames were displayed and which cells were clicked, so a
+      cell you looked at and left alone can be told apart from one you never saw. Corrections
+      are labelled errors; this is the other half. Nothing here changes the tracking.</p>
+    <div class="field-row">
+      <button id="coverage-summary-btn" class="secondary-btn">Show coverage →</button>
+      <label>Count a frame as reviewed after
+        <input type="number" id="coverage-dwell-input" class="small-input" value="1500" min="0" step="100"> ms</label>
+    </div>
+    <div id="coverage-summary-status" class="status-line"></div>
+    <ul id="coverage-summary-list" class="status-line" style="display:none"></ul>
 
     <div class="field-row">
       <button id="save-tracking-btn" class="secondary-btn">Save Corrections</button>
@@ -646,9 +678,7 @@
       <dl>
         <dt>Division</dt>
         <dd>A track ends while two mutually-adjacent tracks begin beside it, their areas summing to
-            roughly the mother's. <strong>Inferred from geometry and unvalidated</strong> &mdash; there is no
-            reference implementation to check against, because TissueMiner reads divisions from a
-            mask Tissue Analyzer paints rather than detecting them.</dd>
+            roughly the mother's. <strong>Inferred from geometry</strong></dd>
         <dt>Delamination</dt>
         <dd>A track ends away from the tissue margin with the cell's area shrinking AND ending small
             relative to its neighbours. Both terms are needed: a cell that vanishes at full size is a

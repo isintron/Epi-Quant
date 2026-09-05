@@ -1194,7 +1194,12 @@ def classify_links(
         # Both IoUs travel with the verdict. A reader shown "0.301 vs 0.231"
         # can see a near-tie for what it is; a reader shown a red cell cannot.
         entry = {"reference_iou": round(float(value), 3),
-                 "tracker_iou": round(float(overlaps.get((label, linked), 0.0)), 3) if linked else None}
+                 "tracker_iou": round(float(overlaps.get((label, linked), 0.0)), 3) if linked else None,
+                 # The label the reference would have picked. Carried so a
+                 # human queue can show the rival as a candidate instead of
+                 # asking the labeller to find it.
+                 "reference_label": None if partner is None else int(partner),
+                 "tracker_label": None if linked is None else int(linked)}
         if value < iou_threshold or (margin and (value - runner_up.get(label, 0.0)) < margin):
             entry["state"] = "unjudgeable"
         elif linked is None:

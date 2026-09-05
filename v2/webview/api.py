@@ -32,6 +32,7 @@ needs). Per-frame `outlines`/base-image arrays are deliberately NOT cached
 isn't, and re-reading avoids ever serving a stale frame after a correction.
 """
 
+import datetime
 import json
 import logging
 import os
@@ -48,7 +49,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import adjacency
 import cell_tracking
+import census
 import common
+import coverage_log
 import data_input
 import manual_correction_classification
 import manual_correction_tracking
@@ -75,6 +78,10 @@ def _finite(value) -> Optional[float]:
 class EpiQuantAPI:
     def __init__(self):
         self.window = None
+
+        # One id per app run, so a coverage log accumulated over several
+        # sittings can still be split by session (fatigue is per-session).
+        self.coverage_session_id: str = coverage_log.new_session_id()
 
         self.mask_folder: Optional[str] = None
         self.image_folder: Optional[str] = None
@@ -1469,7 +1476,7 @@ class EpiQuantAPI:
         self,
         n_clusters: Union[int, str] = "auto",
         k_range: tuple = (2, 9),
-        random_state: Optional[int] = None,
+        random_state: Optional[int] = pca_kmeans.DEFAULT_RANDOM_STATE,
         feature_families: Optional[list] = None,
         selected_features: Optional[list] = None,
         prune_correlation: Optional[float] = None,
@@ -1987,6 +1994,282 @@ class EpiQuantAPI:
             "flagged_total": int(sum(1 for v in scores.values() if v < self.environment_dead_band)),
             "n": len(scores),
         }
+
+    # --- Ground-truth census: one link at a time -----------------------------
+    #
+    # Round 14 §A3 left a question no reference-free metric can answer: every
+    # geometry-flagged disagreement had its rival already claimed by another
+    # track, which is a global solver trading off against a greedy per-cell
+    # reference. Only a human breaks that tie. See `census` for why this is a
+    # census and never a sample, and for the decoy / repeat / timing checks.
+
+    def _census_masks(self) -> dict:
+        masks = {}
+        for frame in tracking_benchmark.frame_numbers(self.tracking_data):
+            loaded = self._load_frame(frame)
+            if loaded and loaded[0] is not None:
+                masks[frame] = loaded[0]
+        return masks
+
+    def start_census(self, kind: str = "geometry_flagged", frame: int = None,
+                     decoy_rate: float = census.DEFAULT_DECOY_RATE,
+                     repeat_rate: float = census.DEFAULT_REPEAT_RATE,
+                     seed: int = 0, labeller: str = "") -> dict:
+        """Build the labelling queue. `kind` is `geometry_flagged` (the whole
+        movie's disagreements) or `frame_pair` (every link in one pair).
+
+        The judge is registered whenever the tracking was, and the answer says
+        so. An overlap reference computed on unregistered masks scoring a
+        registered tracker is the preprocessing mismatch that has already moved
+        one figure from 4.9% to 14.0% on nothing but that switch.
+        """
+        if self.tracking_data is None:
+            return {"error": "Track the movie before starting a census."}
+        masks = self._census_masks()
+        if len(masks) < 2:
+            return {"error": "Need at least two frames with masks."}
+        register = self.drift_mode != "none"
+        drift = self._registration().get("drift_by_frame") if register else None
+        if kind == "frame_pair":
+            if frame is None:
+                return {"error": "A frame_pair census needs a frame number."}
+            items = census.frame_pair_items(self.tracking_data, masks, int(frame))
+        elif kind == "geometry_flagged":
+            items = census.geometry_flagged_items(
+                self.tracking_data, masks, register=register, drift_by_frame=drift)
+        else:
+            return {"error": f"Unknown census kind {kind!r}."}
+        if not items:
+            return {"error": "Nothing to label: that set is empty."}
+
+        queue = census.build_queue(items, masks, decoy_rate=float(decoy_rate),
+                                   repeat_rate=float(repeat_rate), seed=int(seed))
+        self._census = {
+            "queue": queue, "masks": masks, "kind": kind, "frame": frame,
+            "register": register, "labeller": labeller,
+            "session_id": coverage_log.new_session_id(),
+            "path": os.path.join(self.output_dirs["cell_track_output"], "ground_truth_links.csv"),
+        }
+        self._write_census_provenance()
+        return {"n": len(queue), "n_real": len(items),
+                "n_decoys": sum(1 for e in queue if e["is_decoy"]),
+                "n_repeats": sum(1 for e in queue if e["is_repeat"]),
+                "kind": kind, "register": register,
+                "session_id": self._census["session_id"], "path": self._census["path"]}
+
+    def _write_census_provenance(self) -> None:
+        """Ground truth collected against one tracking run is not automatically
+        valid for another -- the link set itself changes. Same treatment the
+        tracking baselines get."""
+        state = self._census
+        record = {
+            "written_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "session_id": state["session_id"],
+            "kind": state["kind"],
+            "frame": state["frame"],
+            "labeller": state["labeller"],
+            "judge_registered": state["register"],
+            "mask_folder": self.mask_folder,
+            "frames": sorted(state["masks"]),
+            "queue_size": len(state["queue"]),
+            "tracking": {
+                "tracks": int(len(self.tracking_data)),
+                "overlap_weight": self.overlap_weight,
+                "centroid_weight": self.centroid_weight,
+                "motion_compensation": self.motion_compensation,
+                "max_frame_gap": self.max_frame_gap,
+                "drift_mode": self.drift_mode,
+            },
+        }
+        try:
+            with open(state["path"] + ".provenance.json", "w", encoding="utf-8") as handle:
+                json.dump(record, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+        except OSError as error:
+            logger.warning("could not write census provenance: %s", error)
+
+    def get_census_item(self, position: int, pad: int = 28) -> dict:
+        """One item, with the two crops the blink toggles between.
+
+        `before` is the cell at frame f; `after` is the SHOWN successor at
+        f+1 -- which for a decoy is deliberately the wrong cell. Both crops
+        share one window so the blink is a true toggle: two differently-framed
+        crops would make every link look like it jumped.
+        """
+        state = getattr(self, "_census", None)
+        if not state:
+            return {"error": "Start a census first."}
+        queue = state["queue"]
+        if not 0 <= int(position) < len(queue):
+            return {"error": f"Position {position} is outside the queue (0-{len(queue) - 1})."}
+        item = queue[int(position)]
+        masks = state["masks"]
+        frame = item["frame"]
+        before_labels, after_labels = masks.get(frame), masks.get(frame + 1)
+        if before_labels is None or after_labels is None:
+            return {"error": f"No masks for frames {frame}/{frame + 1}."}
+
+        window = self._census_window(before_labels, after_labels, item, pad)
+        if window is None:
+            return {"error": f"Cell {item['label']} has no pixels at frame {frame}."}
+
+        candidates = self._census_candidates(item, after_labels, window)
+        return {
+            "position": int(position), "total": len(queue),
+            "item_id": item["item_id"], "frame": frame, "label": item["label"],
+            "track_id": item["track_id"], "shown_label": item["shown_label"],
+            "is_repeat": bool(item["is_repeat"]),
+            # `is_decoy` is deliberately NOT returned: the labeller must not be
+            # able to see which items are checks.
+            "reference_iou": item.get("reference_iou"),
+            "tracker_iou": item.get("tracker_iou"),
+            "before": self._census_crop(frame, before_labels, item["label"], window, "#00ff88"),
+            "after": (self._census_crop(frame + 1, after_labels, item["shown_label"], window, "#ffcc00")
+                      if item["shown_label"] is not None else None),
+            "candidates": candidates,
+        }
+
+    def _census_window(self, before_labels, after_labels, item, pad):
+        ys, xs = np.nonzero(before_labels == int(item["label"]))
+        if not len(ys):
+            return None
+        if item["shown_label"] is not None:
+            ys2, xs2 = np.nonzero(after_labels == int(item["shown_label"]))
+            if len(ys2):
+                ys = np.concatenate([ys, ys2]); xs = np.concatenate([xs, xs2])
+        height, width = before_labels.shape
+        return (max(0, int(ys.min()) - pad), min(height, int(ys.max()) + pad + 1),
+                max(0, int(xs.min()) - pad), min(width, int(xs.max()) + pad + 1))
+
+    def _census_crop(self, frame_number, labels, label, window, color):
+        from PIL import Image
+        loaded = self._load_frame(frame_number)
+        base = loaded[2] if loaded else None
+        if base is None:
+            base = np.zeros(labels.shape + (3,), dtype=np.uint8)
+        top, bottom, left, right = window
+        image = rendering.render_cell_highlight(labels, base, int(label), color) \
+            if label is not None else Image.fromarray(base)
+        return rendering.encode_png_base64(image.crop((left, top, right, bottom)))
+
+    def _census_candidates(self, item, after_labels, window):
+        """The alternatives offered when the verdict is "wrong": the overlap
+        reference's own pick, then the nearest other cells. Numbered, so the
+        labeller presses a digit instead of clicking a small target."""
+        shown = item.get("shown_label")
+        options, seen = [], {shown}
+        for label in (item.get("reference_label"), item.get("true_label")):
+            if label is not None and label not in seen:
+                options.append(int(label)); seen.add(int(label))
+        centres = census._centroids(after_labels)
+        origin = centres.get(int(shown)) if shown is not None else None
+        if origin is not None:
+            nearby = sorted(((np.hypot(c[0] - origin[0], c[1] - origin[1]), l)
+                             for l, c in centres.items() if l not in seen),
+                            key=lambda pair: pair[0])
+            options.extend(int(l) for _, l in nearby[:3])
+        return [{"label": label,
+                 "image": self._census_crop(item["frame"] + 1, after_labels, label, window, "#ff6b6b")}
+                for label in options[:3]]
+
+    def submit_census_verdict(self, position: int, verdict: str,
+                              chosen_label: int = None, ms_elapsed: float = 0.0) -> dict:
+        state = getattr(self, "_census", None)
+        if not state:
+            return {"error": "Start a census first."}
+        queue = state["queue"]
+        if not 0 <= int(position) < len(queue):
+            return {"error": f"Position {position} is outside the queue."}
+        try:
+            census.append_verdict(state["path"], state["session_id"], queue[int(position)],
+                                  verdict, chosen_label, ms_elapsed, labeller=state["labeller"])
+        except ValueError as error:
+            return {"error": str(error)}
+        return {"saved": True, "next": int(position) + 1, "total": len(queue)}
+
+    def get_census_summary(self) -> dict:
+        """Counts, decoy pass-rate, intra-rater agreement, median seconds.
+
+        The last three are not decoration: an accuracy from these labels is
+        only meaningful against the self-consistency ceiling measured in the
+        same session, and only if the decoys were caught.
+        """
+        state = getattr(self, "_census", None)
+        path = state["path"] if state else (
+            os.path.join(self.output_dirs["cell_track_output"], "ground_truth_links.csv")
+            if self.output_dirs else None)
+        if path is None:
+            return {"error": "Set up the project paths first."}
+        summary = census.summarise(path, state["session_id"] if state else None)
+        if state:
+            summary["queue_size"] = len(state["queue"])
+            summary["judge_registered"] = state["register"]
+        return summary
+
+    # --- Coverage log: what the human actually looked at ---------------------
+    #
+    # The Correct Tracking view produces corrections, which are labelled errors.
+    # It has never produced the other half: a cell that was on screen, clicked,
+    # and deliberately left alone. Without that, "unchanged" and "never looked
+    # at" are the same value, which is why no ground truth has come out of this
+    # tool. These three methods record the difference; `coverage_log` turns it
+    # into weak positives, and is deliberately conservative about what counts.
+
+    def _coverage_log_path(self) -> Optional[str]:
+        if not self.output_dirs:
+            return None
+        return os.path.join(self.output_dirs["cell_track_output"], "coverage_log.csv")
+
+    def log_coverage_event(self, event: str, frame_number: int, cell_index: str = None,
+                           track_id: int = None, ms_elapsed: float = None,
+                           zoom_percent: float = None, render_mode: str = "",
+                           color_mode: str = "", detail: str = "") -> dict:
+        """Append one `frame_shown` / `cell_inspected` / `cell_changed` event.
+
+        Never raises into the UI: a failed log line must not interrupt a
+        correction the user is in the middle of making. It returns
+        `{"logged": False, ...}` instead, so a silently-empty log is still
+        visible to anyone who looks at the return value.
+        """
+        path = self._coverage_log_path()
+        if path is None:
+            return {"logged": False, "reason": "no output directory yet"}
+        try:
+            coverage_log.append(
+                path, self.coverage_session_id, event, int(frame_number),
+                cell_index=cell_index, track_id=track_id, ms_elapsed=ms_elapsed,
+                zoom_percent=zoom_percent, render_mode=render_mode,
+                color_mode=color_mode, detail=detail,
+            )
+        except Exception as error:  # noqa: BLE001 - never break a correction
+            logger.warning("coverage log write failed: %s", error)
+            return {"logged": False, "reason": str(error)}
+        return {"logged": True, "session_id": self.coverage_session_id}
+
+    def get_coverage_summary(self, min_dwell_ms: float = None) -> dict:
+        """Per-frame coverage against the cells that exist in `cells_info`.
+
+        Distinguishes `inspected_unchanged` (a weak positive) from
+        `never_displayed` (no evidence). Cells are the ground set from
+        `cells_info`, not from the tracking table, so a cell the tracker never
+        claimed still counts as uncovered rather than vanishing.
+        """
+        path = self._coverage_log_path()
+        if path is None:
+            return {"error": "Set up the project paths first."}
+        if self.cells_info is None:
+            return {"error": "Extract cell info before reading coverage."}
+        index = (self.cells_info["Cell Index"] if "Cell Index" in self.cells_info.columns
+                 else self.cells_info.index)
+        cells_by_frame: dict = {}
+        for value in index:
+            match = re.match(r"Cell(\d+)_", str(value))
+            if match:
+                cells_by_frame.setdefault(int(match.group(1)), []).append(str(value))
+        kwargs = {} if min_dwell_ms is None else {"min_dwell_ms": float(min_dwell_ms)}
+        summary = coverage_log.summarise(path, cells_by_frame, **kwargs)
+        summary["weak_positives"] = len(coverage_log.weak_positives(summary))
+        return summary
 
     def save_ground_truth_links(self, links: dict = None, path: str = None) -> dict:
         """Write hand-labelled links to `cell_track_output/ground_truth_links.csv`.
@@ -2715,6 +2998,38 @@ if __name__ == "__main__":
 
             print("compute_confirmed_identity_moves (expect a graceful dict):",
                   api.compute_confirmed_identity_moves(frame_range["min_frame"], old_id))
+
+            # --- coverage log (Round 15 C4): the assertion that matters is
+            # that "displayed and left alone" and "never displayed" are
+            # different values on a real movie.
+            print("\n== coverage log ==")
+            frames_present = sorted({int(m.group(1)) for m in
+                                     (re.match(r"Cell(\d+)_", str(c))
+                                      for c in api.cells_info["Cell Index"]) if m})
+            looked_at, never_opened = frames_present[0], frames_present[-1]
+            cells_here = [c for c in api.cells_info["Cell Index"]
+                          if str(c).startswith(f"Cell{looked_at}_")]
+            api.log_coverage_event("frame_shown", looked_at, ms_elapsed=9000,
+                                   zoom_percent=200, render_mode="mask", color_mode="identity")
+            api.log_coverage_event("cell_inspected", looked_at, cell_index=cells_here[0])
+            if len(cells_here) > 1:
+                api.log_coverage_event("cell_inspected", looked_at, cell_index=cells_here[1])
+                api.log_coverage_event("cell_changed", looked_at, cell_index=cells_here[1],
+                                       detail="harness")
+            coverage = api.get_coverage_summary()
+            seen = coverage["frames"][looked_at]
+            unseen = coverage["frames"][never_opened]
+            assert seen["displayed"] and not unseen["displayed"], (seen, unseen)
+            assert cells_here[0] in seen["inspected_unchanged"], seen
+            assert seen["never_displayed"] == [], seen
+            assert unseen["never_displayed"] and unseen["inspected_unchanged"] == [], unseen
+            print(f"  frame {looked_at}: displayed {seen['dwell_ms']:.0f} ms, "
+                  f"{len(seen['changed'])} corrected, "
+                  f"{len(seen['inspected_unchanged'])} inspected-and-left, "
+                  f"{len(seen['displayed_only'])} not clicked")
+            print(f"  frame {never_opened}: never displayed "
+                  f"({len(unseen['never_displayed'])} cells) -- distinct from unchanged")
+            print(f"  weak positives: {coverage['weak_positives']}  log: {coverage['path']}")
 
             api.save_tracking()
             print("Saved tracking.")

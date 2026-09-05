@@ -1399,6 +1399,369 @@ is correctly a no-op. Then, breaking 30 `Frame10` claims deliberately (20
 nulled, 10 swapped) and re-tracking `[9,11]` **repaired all 30 exactly**,
 with zero residual difference from the original table.
 
+### Round 15: close the leftovers, build the mechanisms, collect the first ground truth (2026-09-03)
+
+Full item-by-item ledger at the end of this section -- §B2 makes accounting for
+**every** numbered item mandatory, so it is written out rather than summarised.
+
+#### §A1 -- four validations, plus a fifth found while testing them
+
+`drift_mode` typos, `no_link_ratio <= 1.0` and `overlap_power <= 0` now raise;
+`track_all_populations` concatenates with `ignore_index=True` so the merged
+index is unique; and requesting drift without masks warns instead of silently
+running unregistered. Each has a test asserting the bad value raises.
+
+The fifth was not in the plan. `_FrameLabelLoader.__bool__` is true for any
+folder that **exists**, so a folder holding no `.npy` at all passed the new
+warning and still fell back to centroids with no sign that it had. That shape
+is not hypothetical: `embryos_GBE_GAP43` ships TIFF masks, and its own
+`masks/` folder looks exactly like a valid `npy_folder` from outside -- the
+arrays live in the extractor's `npy_converted/` subfolder beneath it. It now
+warns, naming that subfolder.
+
+*Recorded because it nearly became a false finding:* measuring through
+`track_all_populations(npy_folder="…/masks")` on GBE produced no overlap term
+and no registration, and the obvious reading was "the overlap term has never
+been active on GBE". It was wrong. The product path calls extraction first,
+which sets `npy_folder` to `npy_converted/`, and the term works. The tell was
+that `overlap_weight` 0 vs 20 still changed the table (414 -> 408 tracks). This
+is `CLAUDE.md` rule 6 form 3 from the inside: **the fixture was broken, not the
+product**, and from outside the two look identical.
+
+#### §A2 -- `retrack_frame_range`'s three divergences, all closed
+
+- **Gap-closing scope.** `close_track_gaps` was handed the whole table, so a
+  re-track bounded to `[1,2]` merged a track spanning frames 8-9 into one
+  spanning 5-6 -- frames the caller excluded, and exactly the manual
+  corrections the function exists to preserve. **Reproduced in a fixture
+  first**, then fixed: it still solves over the whole table (a segment's best
+  partner may sit outside the range) but applies only joins whose bridged hole
+  lies inside `[start_frame, end_frame]`, chains all-or-nothing. The fixture
+  now asserts frames 5-9 are untouched, with 1 out-of-range join rejected.
+- **`leading_edge`.** `track_cells` raises on a mixed-sign column; the re-track
+  built one cost matrix over both populations and returned silently. It now
+  raises the same way -- the divergence was on the quiet side, which is the
+  worse one.
+- **Index normalisation.** `.map(str)` was applied in `track_cells` and not
+  here. Confirmed by deleting the new line: a mixed-dtype index raises
+  `ValueError: Cannot mask with non-boolean array` without it.
+
+#### §A3, §A4 -- dead references and paths that reported success
+
+`reassign_track` does exist -- as `EpiQuantAPI.reassign_track`, a webview
+method, not a function in `manual_correction_tracking`. Both docstrings now
+name what a caller can actually reach (`update_tracking_data`, or
+`merge_tracks_from_frame` to carry the fix forward) and say where the API
+wrapper lives. `add_tracking_id` gained `update_tracking_data`'s dedup, so one
+cell string can no longer be claimed by two tracks at one frame with
+`_claim_owners_at_frame` silently keeping the last.
+
+Three failure paths stopped reporting success:
+
+- `settled_by_topology` returned `score is None or score >= threshold` -- i.e.
+  **"settled" when it failed to look**. Now three states (`settled` /
+  `unsettled` / `unknown`), and it refuses to pick a default for `unknown`:
+  treating it as settled is the old bug, treating it as unsettled runs
+  propagation past any evidence.
+- A mask that fails to load in `find_propagation_stop_frame` now reports
+  `mask_unavailable`, not `track_ended`. A track ending is a fact about the
+  data; a mask not loading is a fact about the filesystem.
+- `_FrameLabelLoader` no longer hands back 1-px `outlines` when `masks` is
+  absent. **But not by deleting the fallback**: `_load_frame`'s docstring
+  records an older `convert_tiff_masks_to_npy` that wrote a *filled* array
+  under the same key, and that array is a perfectly good label image. The
+  fallback now checks which it is -- a filled cell fills most of its bounding
+  box, a boundary ring fills a thin fraction -- and accepts the first while
+  refusing the second. Two boundary rings essentially never intersect, so the
+  refused case gave IoU ~0 for every pair and turned the overlap term into a
+  near-constant penalty that ranked exactly like centroids alone.
+
+#### §A5 -- three wrong numbers rather than crashes
+
+**Gap-join chains close whole.** `if tail in absorbed or head in absorbed:
+continue` applied only the first link of an A->B->C chain. Measured on the
+pre-change code: three segments one gap apart came back as **two tracks**
+under all three row orders tried. *The plan called the survivor "row-order
+dependent"; it is not* -- `tail_ids`/`head_ids` are sorted by track id, so the
+survivor is deterministic. It is the **lowest-id link that wins, not the best
+one**, which is arbitrary rather than unstable. Real-data effect is small and
+is reported as measured: `max_frame_gap=2` on GBE joins **one** more segment
+(396 -> 395 tracks); every other combination tried on GBE and `AS_dorsal` at
+gap 1 and 2 is unchanged.
+
+**Track ids are now scoped to the run.** `start_index` auto-detection read the
+sibling population's Excel file off disk, which on a re-run is the *previous
+run's*. Measured before/after on a two-population fixture: three consecutive
+calls into one directory gave `[1,2,3,4]`, `[5,6,7,8]`, `[9,10,11,12]`; they
+now give `[1,2,3,4]` every time. Any manual correction keyed by `Index` used to
+misalign after a re-run. First runs into a clean directory are unaffected, so
+no stored baseline moves.
+
+**The mutation contract was backwards and is now stated correctly.** Verified
+empirically: appending a new track's row is done *in place* and returns the
+same object; the calls that rebind are `merge_tracks_from_frame` and the
+gap-join application. The docstring said the opposite. Use
+`result["tracking_data"]`.
+
+**The "matched" stop settles later than the docstring said.** The code requires
+the neighbour's owner to be *unchanged* between frames; the docstring said
+merely "already claimed". The code's rule is the deliberate one -- an owner
+that changes is precisely an unsettled neighbourhood -- so the docstring was
+corrected, the fixture labelled "settled (via match)" was renamed to what it
+actually tests (`track_ended`), and a second fixture was added that reaches the
+real `matched` branch.
+
+#### §B1 -- the stale baseline, mechanised (`v2/baselines.py`)
+
+Three wrong conclusions came from one GBE table produced with drift on (473
+tracks) while the pipeline at defaults produces 414. `CLAUDE.md` already said a
+baseline must be pipeline-produced; nothing enforced it. Now:
+
+- **A baseline is written only by running the pipeline.** `regenerate()` calls
+  `track_all_populations` and writes the table and its
+  `<baseline>.provenance.json` together. There is no path that stamps
+  provenance onto a hand-produced file -- that is the failure being prevented.
+- **Every comparison checks provenance first**, and a mismatch fails with
+  *"this is not a baseline for these settings"* naming the differing
+  parameters, explicitly **not** as a regression. Asserted in the self-test.
+- The parameter list is read from `track_all_populations`'s signature, so
+  changing a default cannot leave the list describing the old one.
+- The provenance carries a hash of the table, so an out-of-band edit stops it
+  being a baseline the moment it is touched.
+
+All three stored baselines were regenerated through it: `AS_dorsal` 181,
+`embryos_GBE_GAP43` 414, `AS_LE_lateral` 151 tracks. Content was verified
+identical to the pre-change code's output on the same inputs -- the A/B that
+matters, per the rule that comparing against a stored artefact tests the
+artefact.
+
+#### §C4 -- the coverage log (`v2/coverage_log.py`)
+
+Corrections are labelled errors. Nothing recorded the other half, so a cell
+displayed, clicked and deliberately left alone was indistinguishable from a
+cell nobody saw -- which is why no ground truth has ever come out of the
+correction tool. The Correct Tracking view now logs `frame_shown` (with dwell,
+zoom and overlay mode), `cell_inspected` and `cell_changed`, and
+`summarise()` reports four disjoint sets per frame: `changed`,
+`inspected_unchanged` (a weak positive), `displayed_only`, `never_displayed`.
+
+A frame shown for under `min_dwell_ms` (default 1500) is `glimpsed` and yields
+**no** weak positives: paging past a frame is not inspection, and counting it
+as such is how a coverage log turns into a fabricated ground truth.
+
+Asserted on both real movies through the harness. GBE: frame 1 displayed
+9,000 ms with 1 corrected, 1 inspected-and-left, 260 displayed-but-not-clicked;
+frame 30 never displayed (210 cells), a distinct state. `AS_dorsal` likewise
+(175 not clicked at frame 1; frame 24 never displayed).
+
+#### §C1/§C2/§C6 -- the census UI (`v2/census.py`)
+
+Built and verified end to end in dev mode: blink on hold-space (the two srcs
+differ and revert), `J`/`K`/`L`, `1`-`3`/`0` candidate picking, auto-advance,
+completion, and a summary carrying all four qualifying numbers together. Crops
+verified on real GBE data: every crop in an item shares **one** window exactly
+(64x87, 73x91, ...), so the blink is a true toggle rather than two differently
+framed images -- checked by measuring the encoded PNGs, and by rendering four
+real items and looking at them.
+
+**The decoy quota is exact, not a per-item coin flip.** At census sizes a 15%
+Bernoulli rate returns zero decoys about 2% of the time and seed 0 was one of
+those -- a 24-item GBE census came back with no rubber-stamping check at all.
+A quota with a floor of 1 removes that variance.
+
+**The set size depends entirely on matching the registration convention**, and
+this is worth reading before quoting any of it. On GBE, all four combinations:
+
+| tracking | judge | flagged |
+|---|---|---|
+| unregistered | unregistered | 265 / 7,221 (3.67%) |
+| unregistered | **registered** | 955 / 7,221 (13.23%) |
+| registered | unregistered | 517 / 7,219 (7.16%) |
+| registered | registered | **24 / 7,219 (0.33%)** |
+
+Only the diagonal is a comparison of like with like; the off-diagonal cells are
+the preprocessing mismatch of `CLAUDE.md` rule 5 case 5, differing by 40x on
+nothing but that switch. The census therefore runs registered-vs-registered and
+the API records which convention it used. `AS_dorsal` matched-convention:
+66 / 2,818 (2.34%), queue 73 items. GBE queue: 26 items.
+
+Ground truth gets the same `.provenance.json` treatment as the baselines --
+which movie, which frame pairs, which tracking run, and whether the judge was
+registered. **Ground truth collected against one tracking run is not
+automatically valid for another**: the link set itself changes.
+
+#### Ledger (§B2): every numbered item
+
+| item | outcome |
+|---|---|
+| A1 (4 validations) | **done**, each with a test; a 5th gap found and fixed |
+| A2a `leading_edge` | **done** -- re-track now raises as `track_cells` does |
+| A2b gap scope | **done** -- reproduced, then bounded to the re-tracked range |
+| A2c index normalisation | **done** -- confirmed by deleting the fix |
+| A3 `reassign_track` refs | **done** -- it exists at the API layer; both docstrings corrected |
+| A3 `add_tracking_id` dedup | **done**, with a fixture |
+| A4 `settled_by_topology` | **done** -- three states |
+| A4 `mask_unavailable` | **done**, with a fixture |
+| A4 `outlines` fallback | **done**, refined: filled-vs-boundary check, not deletion |
+| A5 chain gap-closing | **done**; "row-order dependent" **corrected to** lowest-id-wins |
+| A5 `start_index` scoping | **done**, measured before and after |
+| A5 mutation contract | **done** -- docstring was backwards, verified empirically |
+| A5 `matched` stop frame | **done** -- docstring corrected, second fixture added |
+| B1 baseline provenance | **done** -- `v2/baselines.py`, all three baselines stamped |
+| B2 full accounting | **done** -- this table |
+| B3 `CLAUDE.md` rule 6 | **done** -- third form added, with its reviewing-side mirror |
+| C4 coverage log | **done**, asserted on both movies |
+| C5 storage + provenance | **done** -- census CSV extended, `.provenance.json` written |
+| C6(1) coverage log first | **done** |
+| C6(2) flagged census | **BUILT, NOT LABELLED** -- 26 items on GBE, 73 on `AS_dorsal`, both queued and ready; §A3 stays open until a human labels them |
+| C6(3) measured seconds/judgment | **NOT DONE** -- it is measured *from* C6(2), which needs the user |
+| D3 smart-stop topology | **out of scope this round**, as the plan states |
+
+**Not verified in the native window.** Everything above was checked through
+module self-tests, the real-data harness, and a dev-mode click-through in a
+browser. The Browser pane's screenshot capture would not follow page scroll, so
+the census panel's *appearance* was confirmed from DOM geometry and page text
+plus a rendered image of the real crops -- not from a screenshot of the panel
+itself.
+
+### Round 14: the D2 confirmer was measuring noise, and three paths destroyed data (2026-09-02)
+
+Every finding was **re-verified in-repo before being fixed**, as the plan asked.
+All reproduced except one, which reproduced once the fixture was built correctly
+-- recorded below, because "my first reproduction was wrong" is a different
+statement from "the finding is wrong".
+
+#### A. The topology confirmer shipped last round was wired to the wrong frames
+
+**A1 -- the verdict was noise.** `swap_verdict` took `(current, rival, anchor)`
+and compared `anchor` against each of the other two. But `anchor` and `current`
+are both **frame-N** labels while `neighbour_dice` resolves its first argument in
+`graph_prev` and its second in `graph_now`, so the anchor was looked up in the
+**previous** frame's graph -- hitting whatever unrelated cell happened to carry
+that number -- and the rival in the next frame's. Raw labels are renumbered every
+frame, so the score was noise. **It could not be fixed by reordering arguments:
+the call shape was wrong.** The parameters are now named for the frame they live
+in (`candidate_prev_label`, `current_now_label`, `anchor_now_label`) and both
+comparisons run the same frame pair.
+
+**A2 -- the never-veto invariant was violated in the primary use case.** The
+topology term sat between `swap_gain` and `distance`. `swap_gain` is `None` for
+*every* candidate when the selected cell is held by no track -- which is exactly
+why a user clicks it -- so topology became the **first discriminating key**.
+Reproduced: two candidates at 1 px and 500 px, both `swap_gain=None`; geometry
+gives `[1, 2]`, adding a `keep` on the near one and a `swap` on the far one gives
+`[2, 1]`. **A 1 px candidate demoted below a 500 px one.** The README, the
+function's own comment and `topology_score`'s docstring all claimed the opposite.
+
+**The old self-test could not see it**: its `tied` fixture gave every candidate
+`distance: 10.0`, and its `decided` fixture varied `swap_gain`. The one case that
+breaks the invariant -- *equal `swap_gain`, different `distance`* -- was in
+neither. It is now the test.
+
+**A3 -- and the ranking should not have existed.** Reproduced on both movies,
+fully registered, splitting the geometry-flagged disagreements:
+
+| | GBE | AS_dorsal |
+|---|---:|---:|
+| flagged, n | 78 of 6,808 | 78 of 2,136 |
+| rival **already claimed** by another track | **100.0%** | 98.1% |
+| nearest rival IS the best-IoU cell | 100.0% | 98.1% |
+| forms a true 2-cycle (an actual swap) | **2.6%** | **0.0%** |
+| chain displacement / other | 97.4% | 100.0% |
+
+Every flagged disagreement is a cell whose nearest neighbour was **already taken
+by another track** -- a global solver making a trade-off -- and the greedy
+per-cell reference then names that same taken cell. **Both signals restate one
+fact.** Almost none are 2-cycles, the signature of an identity swap. So the flag
+detects **crowding, not swaps**, and its high measured precision against that
+reference is not evidence of error detection.
+
+**Resolution: mark, do not rank.** Topology is now a badge; the ordering is
+purely geometric. That also makes the never-veto property true by construction --
+"never demote" and "promote on agreement" cannot both hold in one sort key unless
+promotion is confined to exact geometric ties, which essentially never occur.
+
+#### B. Three correction paths destroyed data, all through one unbounded eviction
+
+`_evict_future_if_colliding` relocates a track's **entire** future and has no
+inverse. All three callers invoked it on data that was not in collision.
+
+| | reproduced | fix |
+|---|---|---|
+| **B1** | a plan covering frames 2-4 tore track 18's **frame-5 continuation** -- the one the walk had *settled* on -- onto a junk track | bound the eviction to the plan's last frame |
+| **B2** | `merge_tracks_from_frame(..., end_frame=3)` relocated the target's frames **4-5**, outside the merge range and colliding with nothing. This is the smart-stop workflow, i.e. exactly where the bound exists to protect data | bound it to the merge's own range |
+| **B3** | a **no-op** edit truncated an unrelated healthy track and scattered its future: `original_cell_id_str` was never NaN-checked, and `current_value != NaN` is always True | return unchanged when the source holds no cell at that frame |
+
+*Reproduction note:* B3 did not fire on my first fixture -- I had put the NaN on
+the wrong side. The finding is real; my first attempt at it was not. Worth
+recording, because "does not reproduce" and "I reproduced it wrongly" are easy to
+confuse and only one of them is a result.
+
+`_evict_future_if_colliding` now takes `to_frame`, and all three call sites pass
+a bound. Each has a regression test that fails without the fix.
+
+#### C. `_merge_tracking_pairs` lost data two more ways
+
+- **C1** -- a frame *count* was used as a frame *span*
+  (`range(start, start + len(matching_frames))`). Reproduced on frames
+  1,2,5,6,9,10: the pair file `9_10` was written correctly and **never opened**,
+  so frames 8-10 vanished from the merged table with no error and no log line.
+  Frame holes are normal. Now iterates the frame numbers that exist.
+- **C2** -- the merge listed the output directory, so a **previous run's** pair
+  files were stitched into a new result. Reproduced: a 5-frame movie re-tracked
+  as 2 frames into the same directory produced a phantom track describing cells
+  that no longer exist. **That is the hand-correction -> re-track workflow this
+  module is built around.** `track_cells` now records which pairs it produced and
+  the merge honours only those.
+
+#### D. `weights` was indexed positionally against `feature_columns`
+
+The module docstring promised both the gate and the weights were "resolved by
+NAME ... so adding or removing a column cannot quietly repoint them at the wrong
+data". **That was true of `_gate_indices` only.** Reproduced: calling
+`track_cells(..., feature_columns=[the four columns tracking actually needs])`
+left every resolved weight at zero, so the distance term was identically 0, the
+whole cost matrix was zeros, and `linear_sum_assignment` returned an **arbitrary
+permutation** -- no exception, no warning, because the both-terms-disabled guard
+does not fire while `centroid_weight` is 1.0.
+
+`resolve_weights` now resolves by name, an all-zero resolution raises, and a
+length mismatch raises. The docstring has been corrected to describe what the
+code does.
+
+#### The k-means baseline is seeded, after measuring that seeding hides nothing
+
+Round 13's addendum found `pupae`'s regenerated classification did not match its
+documented baseline. Cause: `KMeans(random_state=None)`. Before seeding, the
+plan required checking that auto-`k` does not flip -- if it did, seeding would
+be papering over an unstable model.
+
+Measured on `pupae_E-cad` (n=1213), 20 seeds: **`_select_k_by_silhouette` chose
+k=2 in 20/20**, and all 20 seeds produced an identical (1186, 27) split, while
+unseeded runs wandered between (1183, 30), (1184, 29) and (1186, 27). So any
+fixed seed converges to the same optimum and the unseeded variation was landing
+in worse local ones.
+
+`DEFAULT_RANDOM_STATE = 0`. The regenerated baseline is **(1186, 27)** against
+the previously documented **(1184, 29)** -- a one-time diff, recorded here with
+the **measured spread (1183-1186)** so the seed does not create false confidence.
+The N-cluster generalisation itself is unaffected: only 2-3 of 1,213 cells move
+and the majority/minority structure is stable.
+
+#### Documentation
+
+- **`v2/docs/topology-geometry.md` is marked WITHDRAWN**, not deleted -- the
+  withdrawal is the finding. It carried unregistered-judge numbers while
+  `CLAUDE.local.md` declared `v2/docs/` authoritative, so the project vouched for
+  a stale document for two rounds. Its 30.5% was cited in two code comments;
+  both now say what is actually true.
+- The Round 13 §D claim that topology "never demotes one when it disagrees" is
+  corrected where it stands.
+- `CLAUDE.local.md`'s tracking paragraph is now explicitly *the manuscript's*
+  method, noting the three specifics `v2/` has since changed -- including that
+  `linear_sum_assignment` is **Jonker-Volgenant** (Crouse 2016), not Hungarian,
+  a naming error repeated in several docstrings.
+
 ### Round 13 addendum: the separate-image audit, and a premise that inverted twice (2026-09-02)
 
 #### The datasets are not all movies, and four rounds of smoke tests knew it for QC but not for tracking
@@ -1441,14 +1804,11 @@ both sides restores the original framing -- geometry is the recall engine
 (8.3% / 5.3%, near baselines of 1.16% / 3.28%), and the conjunction is the most
 precise (100% / 76.9%, recall 62.0% / 14.3%).
 
-**D2 is wired; D3 is not.** Topology now promotes a candidate in
-`suggest_match_candidates` when it agrees, marks it "two criteria agree", and
-**never demotes one when it disagrees** -- shown unchanged with a tooltip,
-because when topology says keep an independent reference still sides with the
-current link only 30.5% of the time. Asserted in the self-test both ways: a
-geometric tie is broken by topology, and a decided geometric preference is not
-overturned by it. D3's OR is **not** implemented: its topology arm runs at
-8.3% / 5.3% precision, so it would contribute almost only false stops.
+**D2 was wired here and is CORRECTED in Round 14** -- the never-demote claim
+this paragraph originally made was false in the function's primary use case, and
+the flag it modulated turns out to detect crowding rather than swaps. Topology
+now **marks and does not rank**. See the Round 14 section for the measurement
+and the fix. D3's OR was never implemented, which turned out to be right.
 
 #### `pupae`'s regenerated baseline does not match, and the reason is worth more than the file
 

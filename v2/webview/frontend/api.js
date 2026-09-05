@@ -34,7 +34,30 @@
     registerReference: true,
     deadBand: 0.75,
     repairThreshold: 0.5,
+    // Coverage log. `outputDirsReady` starts FALSE so dev mode exercises the
+    // "no output directory yet" path -- the real API returns
+    // `{logged: false}` there, and a mock that always succeeded would hide it.
+    outputDirsReady: false,
+    coverageSessionId: "devmode00cov",
+    coverage: [],
+    census: null,
+    censusVerdicts: [],
   };
+
+  // A tiny distinguishable PNG per key, so two census crops are not the same
+  // pixels. `offset` shifts the block, which is what the blink reveals.
+  function mockCrop(key, color, offset) {
+    const size = 48;
+    const canvas = typeof document !== "undefined" && document.createElement
+      ? document.createElement("canvas") : null;
+    if (!canvas) return MOCK_PNG;
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#1c1c1e"; ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = color; ctx.fillRect(8 + offset, 12, 24, 22);
+    ctx.fillStyle = "#ffffff"; ctx.font = "9px sans-serif"; ctx.fillText(key, 3, 45);
+    return canvas.toDataURL("image/png");
+  }
 
   function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -45,6 +68,7 @@
       return "/mock/selected/folder";
     },
     async set_project(_maskFolder, _imageFolder, outputBase) {
+      mockState.outputDirsReady = true;
       return {
         format: "npy",
         output_dirs: {
@@ -327,6 +351,155 @@
     },
     async get_tracking_cell_at_pixel(frame, _x, _y) {
       return { cell_index: `Cell${frame}_1`, cell_id: 1, track_id: 1 };
+    },
+    // Ground-truth census (Round 15 C1/C2). The mock keeps a real queue with
+    // real decoys and repeats, and its crops differ between the two frames, so
+    // the blink actually blinks in dev mode. A stub that returned one constant
+    // image for both frames would make every link look correct -- which is the
+    // failure the blink exists to expose.
+    async start_census(kind, frame, decoyRate, repeatRate, seed, labeller) {
+      if (!mockState.trackNumbers.length) return { error: "Track the movie before starting a census." };
+      if (kind === "frame_pair" && (frame === null || frame === undefined)) {
+        return { error: "A frame_pair census needs a frame number." };
+      }
+      if (!["geometry_flagged", "frame_pair"].includes(kind)) {
+        return { error: `Unknown census kind '${kind}'.` };
+      }
+      const real = kind === "frame_pair" ? 6 : 4;
+      const queue = [];
+      for (let i = 0; i < real; i += 1) {
+        queue.push({ item_id: `i000${i}`, frame: mockState.frameNumbers[i % mockState.frameNumbers.length],
+                     label: 10 + i, track_id: 100 + i, shown_label: 20 + i,
+                     is_decoy: i === 1, is_repeat: false, source_item_id: null });
+      }
+      queue.push({ ...queue[0], item_id: "r0000", source_item_id: "i0000", is_repeat: true, is_decoy: false });
+      mockState.census = { queue, kind, register: mockState.trackingCost.drift_mode !== "none", labeller };
+      mockState.censusVerdicts = [];
+      return { n: queue.length, n_real: real,
+               n_decoys: queue.filter((e) => e.is_decoy).length,
+               n_repeats: queue.filter((e) => e.is_repeat).length,
+               kind, register: mockState.census.register,
+               session_id: "devmodecensus",
+               path: "(dev mode: nothing is written to disk)" };
+    },
+    async get_census_item(position, _pad) {
+      const census = mockState.census;
+      if (!census) return { error: "Start a census first." };
+      if (position < 0 || position >= census.queue.length) {
+        return { error: `Position ${position} is outside the queue (0-${census.queue.length - 1}).` };
+      }
+      const item = census.queue[position];
+      // Two visibly different crops, so blink is testable in dev mode.
+      const before = mockCrop(`f${item.frame}`, "#00ff88", 0);
+      const after = mockCrop(`f${item.frame + 1}`, "#ffcc00", item.is_decoy ? 14 : 3);
+      return {
+        position, total: census.queue.length, item_id: item.item_id,
+        frame: item.frame, label: item.label, track_id: item.track_id,
+        shown_label: item.shown_label, is_repeat: item.is_repeat,
+        reference_iou: 0.37, tracker_iou: 0.05,
+        before, after,
+        candidates: [40, 41, 42].map((label) => ({ label, image: mockCrop(`c${label}`, "#ff6b6b", 6) })),
+      };
+    },
+    async submit_census_verdict(position, verdict, chosenLabel, msElapsed) {
+      const census = mockState.census;
+      if (!census) return { error: "Start a census first." };
+      if (!["correct", "wrong", "unjudgeable"].includes(verdict)) {
+        return { error: `unknown verdict '${verdict}'; expected one of correct, wrong, unjudgeable` };
+      }
+      mockState.censusVerdicts.push({ position, verdict, chosenLabel, msElapsed,
+                                      item: census.queue[position] });
+      return { saved: true, next: position + 1, total: census.queue.length };
+    },
+    async get_census_summary() {
+      const rows = mockState.censusVerdicts || [];
+      if (!mockState.census) return { error: "Start a census first." };
+      const real = rows.filter((r) => !r.item.is_decoy && !r.item.is_repeat);
+      const decoys = rows.filter((r) => r.item.is_decoy);
+      const repeats = rows.filter((r) => r.item.is_repeat);
+      const counts = { correct: 0, wrong: 0, unjudgeable: 0 };
+      real.forEach((r) => { counts[r.verdict] += 1; });
+      const judged = counts.correct + counts.wrong;
+      const caught = decoys.filter((r) => r.verdict === "wrong").length;
+      let agree = 0, compared = 0;
+      repeats.forEach((r) => {
+        const original = rows.find((o) => o.item.item_id === r.item.source_item_id);
+        if (original) { compared += 1; agree += original.verdict === r.verdict ? 1 : 0; }
+      });
+      const times = rows.map((r) => r.msElapsed).sort((a, b) => a - b);
+      const median = times.length ? times[Math.floor(times.length / 2)] : null;
+      return {
+        path: "(dev mode: nothing is written to disk)",
+        n_total: rows.length, n_real: real.length, counts,
+        error_rate: judged ? counts.wrong / judged : null,
+        n_unjudgeable: counts.unjudgeable,
+        decoys_shown: decoys.length, decoys_caught: caught,
+        decoy_pass_rate: decoys.length ? caught / decoys.length : null,
+        repeats_compared: compared,
+        intra_rater_agreement: compared ? agree / compared : null,
+        median_ms: median, median_seconds: median === null ? null : Math.round(median / 100) / 10,
+        queue_size: mockState.census.queue.length,
+        judge_registered: mockState.census.register,
+      };
+    },
+    // Coverage log (Round 15 C4). The mock keeps a real in-memory log rather
+    // than returning a constant `{logged: true}`: a stub that always succeeds
+    // has structurally hidden a real bug twice on this project, and a coverage
+    // log that silently records nothing is invisible by construction. Dev mode
+    // must be able to show an EMPTY summary and a wrong-frame summary too.
+    async log_coverage_event(event, frame, cellIndex, trackId, msElapsed, zoomPercent,
+                             renderMode, colorMode, detail) {
+      if (!["frame_shown", "cell_inspected", "cell_changed"].includes(event)) {
+        return { logged: false, reason: `unknown coverage event '${event}'` };
+      }
+      if (!mockState.outputDirsReady) {
+        return { logged: false, reason: "no output directory yet" };
+      }
+      mockState.coverage.push({ event, frame, cellIndex, trackId, msElapsed,
+                                zoomPercent, renderMode, colorMode, detail });
+      return { logged: true, session_id: mockState.coverageSessionId };
+    },
+    async get_coverage_summary(minDwellMs) {
+      const dwell = minDwellMs === null || minDwellMs === undefined ? 1500 : minDwellMs;
+      const frames = {};
+      const cellsPerFrame = 3;
+      for (const frame of mockState.frameNumbers || []) {
+        const ground = Array.from({ length: cellsPerFrame }, (_, i) => `Cell${frame}_${i + 1}`);
+        const rows = mockState.coverage.filter((r) => r.frame === frame);
+        const shown = rows.filter((r) => r.event === "frame_shown");
+        const ms = shown.reduce((total, r) => total + (r.msElapsed || 0), 0);
+        const changed = [...new Set(rows.filter((r) => r.event === "cell_changed")
+                                        .map((r) => r.cellIndex))].filter((c) => ground.includes(c));
+        const glimpsed = shown.length > 0 && ms < dwell;
+        const inspected = glimpsed ? [] :
+          [...new Set(rows.filter((r) => r.event === "cell_inspected").map((r) => r.cellIndex))]
+            .filter((c) => ground.includes(c) && !changed.includes(c));
+        frames[frame] = {
+          displayed: shown.length > 0,
+          dwell_ms: ms,
+          glimpsed,
+          zoom_percent: [...new Set(shown.map((r) => r.zoomPercent).filter((z) => z != null))],
+          changed,
+          inspected_unchanged: inspected,
+          displayed_only: shown.length
+            ? ground.filter((c) => !changed.includes(c) && !inspected.includes(c)) : [],
+          never_displayed: shown.length ? [] : ground,
+        };
+      }
+      const total = (key) => Object.values(frames).reduce((n, f) => n + f[key].length, 0);
+      return {
+        path: "(dev mode: nothing is written to disk)",
+        events: mockState.coverage.length,
+        sessions: mockState.coverage.length ? [mockState.coverageSessionId] : [],
+        min_dwell_ms: dwell,
+        frames,
+        unknown_frames: [],
+        totals: {
+          changed: total("changed"), inspected_unchanged: total("inspected_unchanged"),
+          displayed_only: total("displayed_only"), never_displayed: total("never_displayed"),
+        },
+        weak_positives: total("inspected_unchanged"),
+      };
     },
     async reassign_track(_frame, _oldId, _newId, _propagate) {
       return { success: true, displaced: null };

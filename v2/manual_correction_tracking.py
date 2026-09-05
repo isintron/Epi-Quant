@@ -111,6 +111,15 @@ def update_tracking_data(
         raise ValueError("The new ID does not exist in the index column. Invalid modification.")
     new_row_index = new_row_indices[0]
 
+    # A NaN in the original means the source track holds no cell at this frame,
+    # so there is nothing to move and the call is a no-op. Without this check
+    # `current_value != NaN` is always True, so the guard below fired, evicted an
+    # UNRELATED healthy track's entire future onto a fresh id, and then wrote NaN
+    # into its slot -- destroying data on an edit that should have done nothing.
+    # The dedup loop further down silently no-ops for the same reason (NaN != NaN).
+    if pd.isna(original_cell_id_str):
+        return tracking_data, None
+
     displaced = None
     current_value = tracking_data.at[new_row_index, column_name]
     if pd.notna(current_value) and current_value != original_cell_id_str:
@@ -198,7 +207,11 @@ def merge_tracks_from_frame(
     ]
     displaced = None
     if overlap_frames:
-        tracking_data, displaced = _evict_future_if_colliding(tracking_data, id_col, new_pos, min(overlap_frames))
+        # Bounded by the merge's own range: it only writes `later_cols`, so
+        # relocating the target beyond that moves data the merge never touches.
+        merge_end = max(int(c[len("Frame"):]) for c in later_cols) if later_cols else None
+        tracking_data, displaced = _evict_future_if_colliding(
+            tracking_data, id_col, new_pos, min(overlap_frames), to_frame=merge_end)
 
     for col in later_cols:
         value = tracking_data.at[old_pos, col]
@@ -231,6 +244,7 @@ def _centroid_and_radius_from_mask(fill_labels: np.ndarray, raw_id: int) -> Opti
 
 def _evict_future_if_colliding(
     tracking_data: pd.DataFrame, id_col: str, target_row_pos, from_frame: int,
+    to_frame: Optional[int] = None,
 ) -> tuple:
     """If `target_row_pos`'s row already holds non-null values at
     `Frame{n}` for any `n >= from_frame`, relocate its entire future (from
@@ -251,9 +265,27 @@ def _evict_future_if_colliding(
     The fresh ID is `max(existing Index) + 1` -- robust to non-contiguous
     or gapped IDs (deleted/never-reused numbers), unlike a raw
     row-count-based scheme.
+
+    `to_frame` bounds the relocation to `[from_frame, to_frame]`. **Leaving it
+    unbounded destroyed data in two separate callers**, because this relocates a
+    track's ENTIRE future while its callers only rewrite a bounded range:
+
+    - `merge_tracks_from_frame(..., end_frame=3)` on a 5-frame movie relocated
+      the target's frames 4-5 -- outside the merge range and colliding with
+      nothing -- onto a fresh id. That is the smart-stop workflow, i.e. exactly
+      where the bound exists to protect data.
+    - `apply_confirmed_identity_moves` with a plan covering frames 2-4 tore off
+      the frame-5 continuation the walk had *settled* on.
+
+    This has no clean inverse, so an over-broad relocation is unrecoverable.
+    Bound it to what the caller will actually rewrite.
     """
     frame_cols = [c for c in tracking_data.columns if c.startswith("Frame")]
-    later_cols = [c for c in frame_cols if int(c[len("Frame"):]) >= from_frame]
+    later_cols = [
+        c for c in frame_cols
+        if int(c[len("Frame"):]) >= from_frame
+        and (to_frame is None or int(c[len("Frame"):]) <= to_frame)
+    ]
 
     if not any(pd.notna(tracking_data.at[target_row_pos, c]) for c in later_cols):
         return tracking_data, None
@@ -393,7 +425,9 @@ def find_propagation_stop_frame(
        propagate.
     2. Walk `f = frame_number+1 .. frame_number+max_frames_ahead`. If
        `old_id`'s row has no value at `Frame{f}`, stop with
-       `reason="track_ended"`. Otherwise recompute the corrected cell's
+       `reason="track_ended"`; if the row has a value but the mask for `f`
+       will not load, stop with `reason="mask_unavailable"` -- a failure to
+       look, not a track that ended. Otherwise recompute the corrected cell's
        neighbor set at `f`, and for each still-unsettled flagged neighbor,
        re-localize it by **last-known centroid position** (not raw cell ID
        -- Cellpose relabels raw IDs arbitrarily per frame, so identity must
@@ -402,7 +436,13 @@ def find_propagation_stop_frame(
        gate):
        - No cell within the gate at all -> **disappeared** (no plausible
          continuation nearby -- the extrusion/death signal).
-       - Nearest cell already claimed at `f` -> **matched**.
+       - Nearest cell claimed at `f` by the **same track that claimed it at
+         the previous frame** -> **matched**. Merely being claimed is not
+         enough, and the docstring used to say it was: a neighbour whose
+         owner CHANGES between frames is precisely a neighbourhood that has
+         not settled, so it stays unsettled and the walk continues. The
+         practical difference is that the stop lands one or more frames later
+         than "already claimed" would put it.
        - Nearest cell is within the gate but has moved more than half the
          gate radius AND is currently one of the corrected cell's own
          neighbors -> **disappeared** (absorbed: a real ~jitter-only
@@ -490,7 +530,13 @@ def find_propagation_stop_frame(
         corrected_cell = _corrected_cell_at(f)
         frame_fill_labels = fill_labels_by_frame(f)
         if corrected_cell is None or frame_fill_labels is None:
-            return {"stop_frame": f - 1, "reason": "track_ended", "unsettled_neighbors_by_frame": trail}
+            # These two are NOT the same event. The track genuinely stopping is
+            # a fact about the data; a mask that failed to load is a fact about
+            # the filesystem, and reporting it as `track_ended` told the user
+            # the propagation had found its natural end when it had only failed
+            # to look. Same distinction Round 12 §B1 drew for `get_link_agreement`.
+            reason = "track_ended" if corrected_cell is None else "mask_unavailable"
+            return {"stop_frame": f - 1, "reason": reason, "unsettled_neighbors_by_frame": trail}
 
         graph = adjacency.build_neighbor_graph(frame_fill_labels, dilation_px=dilation_px)
         current_neighbor_indices = {
@@ -674,7 +720,7 @@ def find_confirmed_identity_moves(
 ) -> dict:
     """Starting from `track_id`'s own (human-confirmed) cell at
     `frame_number` -- typically just attached via `suggest_match_candidates`
-    + `add_tracking_id`/`reassign_track` -- walk forward tracking that
+    + `add_tracking_id`/`update_tracking_data` -- walk forward tracking that
     SAME physical cell by centroid position, and reconcile it against
     whichever track (if any) currently claims it at each later frame.
 
@@ -864,6 +910,7 @@ def apply_confirmed_identity_moves(tracking_data: pd.DataFrame, track_id: int, m
     track_row = track_rows[0]
 
     displaced_list = []
+    plan_last_frame = max((int(m["frame"]) for m in moves), default=None)
     for move in moves:
         frame_col = f"Frame{move['frame']}"
         cell_index = move["cell_index"]
@@ -871,7 +918,14 @@ def apply_confirmed_identity_moves(tracking_data: pd.DataFrame, track_id: int, m
 
         current_value = tracking_data.at[track_row, frame_col]
         if pd.notna(current_value) and current_value != cell_index:
-            tracking_data, displaced = _evict_future_if_colliding(tracking_data, id_col, track_row, move["frame"])
+            # Bounded by the LAST frame this plan rewrites. Unbounded, this tore
+            # off the continuation the walk stopped on -- the docstring's claim
+            # that the slot "should already be empty by construction of the plan"
+            # is false, because `find_confirmed_identity_moves` stops when the
+            # nearest cell is claimed by `track_id`, not when `track_id` merely
+            # holds some other cell there.
+            tracking_data, displaced = _evict_future_if_colliding(
+                tracking_data, id_col, track_row, move["frame"], to_frame=plan_last_frame)
             if displaced is not None:
                 displaced_list.append(displaced)
 
@@ -902,6 +956,10 @@ def add_tracking_id(
     `tracking_data` may be a NEW DataFrame object when a relocation
     happens -- always use the returned value.
 
+    Any OTHER track still claiming `cell_id_str` at `frame_number` has that
+    claim cleared, so one cell string is never held by two tracks at one frame
+    (the same dedup `update_tracking_data` does).
+
     Raises `KeyError` if `new_index` isn't found in `tracking_data`'s `Index`
     column (v1 showed a `QMessageBox.warning` instead).
 
@@ -921,6 +979,16 @@ def add_tracking_id(
         tracking_data, displaced = _evict_future_if_colliding(tracking_data, "Index", row_pos, frame_number)
 
     tracking_data.at[row_pos, column_name] = cell_id_str
+
+    # Mirror `update_tracking_data`'s dedup: without it a cell string could be
+    # claimed by two tracks at one frame, and `_claim_owners_at_frame` then
+    # silently keeps whichever row it reaches last -- a wrong answer with no
+    # error anywhere. `cell_id_str` is never NaN here (it names a real cell),
+    # so this loop cannot no-op the way the NaN case does over there.
+    for pos, value in tracking_data[column_name].items():
+        if value == cell_id_str and pos != row_pos:
+            tracking_data.at[pos, column_name] = None
+
     return tracking_data, displaced
 
 
@@ -950,9 +1018,11 @@ def suggest_match_candidates(
     which existing track it continues -- not the reverse. `frame_number` is
     the frame of the cell the user clicked; the caller decides how to apply
     a chosen candidate (`add_tracking_id` if `selected_cell_index` is
-    currently unmatched, `reassign_track` if it's attached to the wrong
-    track -- this function only ranks candidates, it never decides or
-    writes anything itself).
+    currently unmatched, `update_tracking_data` -- or `merge_tracks_from_frame`
+    to carry the fix forward -- if it's attached to the wrong track; the UI
+    reaches both through `EpiQuantAPI.reassign_track`, which is a webview
+    method, not a function in this module. This function only ranks
+    candidates, it never decides or writes anything itself).
 
     `topology_graphs`, when given, is
     `(graph_prev, graph_now, label_to_track_prev, label_to_track_now)` and adds
@@ -1106,9 +1176,15 @@ def suggest_match_candidates(
             except (IndexError, ValueError):
                 anchor = current_label = rival_label = None
             if None not in (anchor, current_label, rival_label):
+                # Named for the frame each label lives in. `candidate_cell_index`
+                # is the candidate track's cell at frame N-1; `current_cell` is
+                # what it holds at frame N; the anchor is the selected cell at
+                # frame N. Both comparisons then run the same frame pair.
                 verdict = topology_score.swap_verdict(
                     graph_prev, graph_now, l2t_prev, l2t_now,
-                    current_label, rival_label, anchor,
+                    candidate_prev_label=rival_label,
+                    current_now_label=current_label,
+                    anchor_now_label=anchor,
                 )
                 entry.update({"s_current": verdict["s_current"],
                               "s_rival": verdict["s_rival"],
@@ -1119,17 +1195,26 @@ def suggest_match_candidates(
     # shortens total displacement is a concrete, checkable hypothesis, whereas
     # a nearby track that is already correctly matched is just noise.
     #
-    # `topo_bonus` is 1.0 only when topology also says swap, so agreement
-    # PROMOTES a candidate and disagreement leaves it exactly where geometry
-    # put it. A `keep` verdict is never a veto: measured, when topology says
-    # keep, the independent judge still sides with the current link only 30.5%
-    # of the time, so letting it demote would discard more right answers than
-    # wrong ones.
-    candidates.sort(key=lambda c: (
-        -(c["swap_gain"] or 0.0),
-        -(1.0 if c["topology"] == "swap" else 0.0),
-        c["distance"],
-    ))
+    # **The ordering is purely geometric. Topology MARKS; it does not rank.**
+    #
+    # It used to sit between `swap_gain` and `distance`, which broke the
+    # never-veto rule in this function's own primary use case: when the selected
+    # cell is held by no track, `swap_gain` is `None` for EVERY candidate, so
+    # topology became the first discriminating key. Measured, that demoted a
+    # 1 px candidate below a 500 px one on a `keep` verdict.
+    #
+    # Removing it is not just a fix for that ordering bug. On registered GBE and
+    # `AS_dorsal`, 100% / 98.1% of the geometry-flagged disagreements have their
+    # nearest rival ALREADY CLAIMED by another track, and only 2.6% / 0.0% form a
+    # true 2-cycle -- the signature of an actual identity swap. The flag detects
+    # CROWDING, which is a global solver making a trade-off, and the greedy
+    # per-cell reference then names the same taken cell. Reordering candidates on
+    # that evidence would have users undoing global assignment decisions one at a
+    # time. "Never demote" and "promote on agreement" also cannot both hold in
+    # one sort key unless promotion is confined to exact geometric ties, which
+    # essentially never occur. Marking resolves the contradiction rather than
+    # hiding it.
+    candidates.sort(key=lambda c: (-(c["swap_gain"] or 0.0), c["distance"]))
     return candidates[:top_k]
 
 
@@ -1413,7 +1498,7 @@ if __name__ == "__main__":
     def _cells_info_row(cell_index, x, y, radius=3.0):
         return {"Cell Index": cell_index, "Center X Coordinate": x, "Center Y Coordinate": y, "Circumscribed Circle Radius": radius}
 
-    # -- settled (via match) --
+    # -- an unrelated track's claim is NOT a match: the walk keeps going --
     settled_frames = {1: _grid_with_two_cells(), 2: _grid_with_two_cells()}
     settled_cells_info = pd.DataFrame([
         _cells_info_row("Cell1_1", 3, 3), _cells_info_row("Cell1_2", 7, 3),
@@ -1422,17 +1507,41 @@ if __name__ == "__main__":
     settled_tracking = pd.DataFrame({
         "Index": [1, 2, 99],
         "Frame1": ["Cell1_1", "Cell1_9", None],
-        "Frame2": ["Cell2_1", None, "Cell2_2"],  # Cell2_2 claimed by an unrelated track -> matched
+        # Cell2_2 is claimed at frame 2 by track 99, which did NOT claim its
+        # frame-1 predecessor -- an owner change, so not settled. The walk runs
+        # on to the end of the fixture.
+        "Frame2": ["Cell2_1", None, "Cell2_2"],
     })
     result = find_propagation_stop_frame(
         settled_tracking, settled_cells_info, lambda f: settled_frames.get(f),
         frame_number=1, old_id=1, new_id=2,
     )
-    print("\nfind_propagation_stop_frame (settled via match):", result)
-    # The walk now RUNS -- it used to return before the loop because the only
-    # neighbour was already claimed. Here it walks to the end of the fixture.
+    print("\nfind_propagation_stop_frame (owner changed -> not a match):", result)
+    # The walk RUNS -- it used to return before the loop because the only
+    # neighbour was already claimed. Here it walks to the end of the fixture,
+    # and the reason is `track_ended`, not `settled`.
     assert result["stop_frame"] == 2, result
     assert result["reason"] == "track_ended", result
+
+    # -- A5 (R15): the genuine `matched` branch -- same owner across frames.
+    # This is the case the docstring described as "already claimed"; the code
+    # has always required the owner to be UNCHANGED, so this fixture is what
+    # actually reaches it.
+    same_owner_frames = {f: _grid_with_two_cells() for f in (1, 2)}
+    same_owner_info = pd.DataFrame([
+        _cells_info_row(f"Cell{f}_{c}", 3 if c == 1 else 7, 3) for f in (1, 2) for c in (1, 2)
+    ])
+    same_owner_tracking = pd.DataFrame({
+        "Index": [1, 2, 99],
+        "Frame1": ["Cell1_1", "Cell1_9", "Cell1_2"],
+        "Frame2": ["Cell2_1", None, "Cell2_2"],  # track 99 holds cell 2 in BOTH frames
+    })
+    result = find_propagation_stop_frame(
+        same_owner_tracking, same_owner_info, lambda f: same_owner_frames.get(f),
+        frame_number=1, old_id=1, new_id=2,
+    )
+    print("find_propagation_stop_frame (same owner -> matched):", result)
+    assert result["reason"] == "settled" and result["stop_frame"] == 2, result
 
     # A dense frame: every cell claimed, which is the germband-extension case.
     # This is the regression that matters -- the old code returned
@@ -1674,36 +1783,92 @@ if __name__ == "__main__":
     assert single_frame_only == {}, single_frame_only
     print("A single-frame movie yields no lifecycle states at all.")
 
-    # --- D2: topology confirms, and can never veto.
-    # Same candidates, three topology configurations. The ORDER geometry chose
-    # must survive when topology disagrees, and may only be promoted when it
-    # agrees. Measured justification: topology alone runs at 8.3% precision on
-    # `embryos_GBE_GAP43` and 5.3% on `AS_dorsal`, against baselines of 1.16%
-    # and 3.28% -- too weak to be allowed to demote anything.
+    # --- Round 14: topology MARKS, it does not rank.
+    #
+    # The old self-test could not see the defect it was meant to guard: its
+    # "tied" fixture gave every candidate `distance: 10.0` (so it only ever
+    # observed promotion inside a total tie) and its "decided" fixture varied
+    # `swap_gain` (where term 1 dominates). The one case that breaks the
+    # invariant -- EQUAL swap_gain, DIFFERENT distance -- was in neither.
     def _ranked(entries):
-        ranked = sorted(entries, key=lambda c: (
-            -(c["swap_gain"] or 0.0),
-            -(1.0 if c["topology"] == "swap" else 0.0),
-            c["distance"],
-        ))
-        return [c["track_id"] for c in ranked]
+        return [c["track_id"] for c in sorted(entries, key=lambda c: (
+            -(c["swap_gain"] or 0.0), c["distance"]))]
 
-    tied = [
-        {"track_id": 1, "distance": 10.0, "swap_gain": 0.0, "topology": "keep"},
-        {"track_id": 2, "distance": 10.0, "swap_gain": 0.0, "topology": "swap"},
-        {"track_id": 3, "distance": 10.0, "swap_gain": 0.0, "topology": "unknown"},
+    # The missing case. `swap_gain` is None for every candidate whenever the
+    # selected cell is held by no track -- this function's primary documented
+    # use case -- so any topology term would become the first discriminating key.
+    unheld = [
+        {"track_id": 1, "distance": 1.0, "swap_gain": None, "topology": "keep"},
+        {"track_id": 2, "distance": 500.0, "swap_gain": None, "topology": "swap"},
     ]
-    assert _ranked(tied)[0] == 2, _ranked(tied)
-    print("\nD2: on a geometric tie, the topology-confirmed candidate is promoted:", _ranked(tied))
+    geometry_only = [dict(c, topology="unknown") for c in unheld]
+    assert _ranked(unheld) == _ranked(geometry_only) == [1, 2], _ranked(unheld)
+    print("\nR14: equal swap_gain, different distance -- topology does not reorder:",
+          _ranked(unheld))
+    print("  (before the fix this returned [2, 1]: a 1px candidate demoted below a")
+    print("   500px one by a `keep` verdict, in the function's primary use case.)")
 
-    # Geometry strongly prefers track 1; topology says keep for it and swap for
-    # 2. Track 1 must STILL rank first -- topology has no veto.
-    decided = [
-        {"track_id": 1, "distance": 5.0, "swap_gain": 40.0, "topology": "keep"},
-        {"track_id": 2, "distance": 30.0, "swap_gain": 1.0, "topology": "swap"},
-    ]
-    assert _ranked(decided)[0] == 1, _ranked(decided)
-    print("D2: topology disagreeing does NOT demote geometry's choice:", _ranked(decided))
-    print("  -> confirmer, never vetoer.")
+    # --- B1/B2/B3: the three eviction paths that destroyed data.
+    b3 = pd.DataFrame({"Index": [1, 2, 3],
+                       "Frame1": ["Cell1_1", "Cell1_11", "Cell1_21"],
+                       "Frame2": [None, "Cell2_11", "Cell2_21"],
+                       "Frame3": [None, "Cell3_11", "Cell3_21"]})
+    out, displaced = update_tracking_data(b3.copy(deep=True), b3.copy(deep=True), 2, old_id=1, new_id=2)
+    assert displaced is None, displaced
+    assert out.loc[out["Index"] == 2, "Frame2"].iloc[0] == "Cell2_11", out
+    print("\nB3: a no-op edit (source has no cell at that frame) evicts nothing.")
+
+    b2 = pd.DataFrame({"Index": [11, 15],
+                       "Frame1": ["Cell1_1", "Cell1_2"], "Frame2": ["Cell2_1", "Cell2_2"],
+                       "Frame3": ["Cell3_1", "Cell3_2"], "Frame4": [None, "Cell4_2"],
+                       "Frame5": [None, "Cell5_2"]})
+    out, _ = merge_tracks_from_frame(b2.copy(deep=True), 2, old_id=11, new_id=15, end_frame=3)
+    kept = out.loc[out["Index"] == 15, ["Frame4", "Frame5"]].iloc[0].tolist()
+    assert kept == ["Cell4_2", "Cell5_2"], kept
+    print("B2: a merge bounded at end_frame=3 leaves frames 4-5 alone:", kept)
+
+    b1 = pd.DataFrame({"Index": [18, 19],
+                       "Frame1": ["Cell1_A", "Cell1_B"], "Frame2": ["Cell2_X", "Cell2_A"],
+                       "Frame3": [None, "Cell3_A"], "Frame4": [None, "Cell4_A"],
+                       "Frame5": ["Cell5_A", None]})
+    plan = [{"frame": f, "cell_index": f"Cell{f}_A", "from_track_id": 19} for f in (2, 3, 4)]
+    out, _ = apply_confirmed_identity_moves(b1.copy(deep=True), 18, plan)
+    settled = out.loc[out["Index"] == 18, "Frame5"].iloc[0]
+    assert settled == "Cell5_A", out.to_string()
+    print("B1: the frame the walk settled on survives the moves:", settled)
+    print("  -> all three went through `_evict_future_if_colliding`, which has no inverse.")
+
+    # --- A4 (R15): a mask that will not load is not a track that ended.
+    ma_tracks = pd.DataFrame({"Index": [1, 2],
+                              "Frame1": ["Cell1_1", "Cell1_2"],
+                              "Frame2": ["Cell2_1", "Cell2_2"],
+                              "Frame3": ["Cell3_1", "Cell3_2"]})
+    ma_info = pd.DataFrame([
+        {"Cell Index": f"Cell{f}_{i}", "Center X Coordinate": 10.0 + 30 * i,
+         "Center Y Coordinate": 10.0, "Circumscribed Circle Radius": 8.0}
+        for f in (1, 2, 3) for i in (1, 2)
+    ])
+    ma_labels = np.zeros((40, 80), dtype=int)
+    ma_labels[5:20, 5:25] = 1
+    ma_labels[5:20, 25:45] = 2
+
+    def _only_first_frame(frame):
+        return ma_labels if frame == 1 else None
+
+    result = find_propagation_stop_frame(
+        ma_tracks, ma_info, _only_first_frame, 1, 1, 2, max_frames_ahead=3,
+    )
+    assert result["reason"] == "mask_unavailable", result
+    print("\nA4: a frame whose mask will not load reports 'mask_unavailable',")
+    print("  not 'track_ended' -- the row still holds a cell at that frame.")
+
+    # --- A3b (R15): add_tracking_id dedups, as update_tracking_data does.
+    dup = pd.DataFrame({"Index": [1, 2], "Frame1": ["Cell1_1", "Cell1_2"],
+                        "Frame2": [None, "Cell2_7"]})
+    dup, _ = add_tracking_id(dup, 2, 1, "Cell2_7")
+    owners = [int(dup.at[p, "Index"]) for p in dup.index if dup.at[p, "Frame2"] == "Cell2_7"]
+    assert owners == [1], dup.to_string()
+    print("\nA3b: add_tracking_id clears the losing track's claim -- one owner per cell")
+    print("  per frame (before: two rows held Cell2_7 and _claim_owners_at_frame kept the last).")
 
     print("\nAll manual_correction_tracking smoke tests passed.")

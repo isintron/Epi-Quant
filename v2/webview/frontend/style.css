@@ -537,3 +537,33 @@ details summary {
   font-variant-numeric: tabular-nums;
   color: var(--fg, inherit);
 }
+
+/* Ground-truth census. The crop is a few dozen pixels across, so it is scaled
+   up with nearest-neighbour: a smoothed crop hides exactly the boundary detail
+   the judgment turns on. `image-rendering` is the whole reason this rule
+   exists -- without it the blink compares two blurs. */
+.census-crop {
+  image-rendering: pixelated;
+  width: 320px;
+  max-width: 100%;
+  border: 1px solid var(--border, #444);
+}
+
+.census-blink {
+  display: inline-block;
+  margin: 8px 0;
+}
+
+.census-candidate {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.census-candidate img {
+  image-rendering: pixelated;
+  width: 96px;
+  border: 1px solid var(--border, #444);
+}

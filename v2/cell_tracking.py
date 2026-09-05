@@ -35,9 +35,12 @@ logger = logging.getLogger(__name__)
 # from the schema itself so the two can never disagree.
 #
 # v1 indexed this list POSITIONALLY for both the displacement gate and the
-# weights, which made the column order silently load-bearing. Both are now
-# resolved by NAME (see `_gate_indices` and `DEFAULT_TRACKING_WEIGHTS`), so
-# adding or removing a column cannot quietly repoint them at the wrong data.
+# weights, which made the column order silently load-bearing. The gate is
+# resolved by name (`_gate_indices`); the weights were NOT until Round 14 --
+# `DEFAULT_TRACKING_WEIGHTS` is a positional list, so a caller passing custom
+# `feature_columns` without matching `weights` got them silently misaligned.
+# `resolve_weights` fixes that, and `build_cost_matrix` now refuses an all-zero
+# resolution rather than returning an arbitrary permutation.
 DEFAULT_TRACKING_FEATURES = list(data_input.CELLS_INFO_COLUMNS)
 
 # Columns the plausible-displacement gate reads: a match is rejected when the
@@ -65,10 +68,37 @@ def _gate_indices(feature_columns: list) -> tuple:
 # 2026-08-18 they moved to 11/12, and a positional literal would have started
 # weighting `Inscribed Circle Radius` and `Center X` instead -- with no error,
 # just wrong tracks.
+# The columns that actually carry weight, BY NAME. `DEFAULT_TRACKING_WEIGHTS`
+# below is the positional projection of this onto `DEFAULT_TRACKING_FEATURES`,
+# kept because callers pass weight lists; `resolve_weights` is what any new code
+# should use.
+WEIGHTED_COLUMNS = {"Center X Coordinate": 1, "Center Y Coordinate": 1}
+
 DEFAULT_TRACKING_WEIGHTS = [
-    1 if column in ("Center X Coordinate", "Center Y Coordinate") else 0
-    for column in DEFAULT_TRACKING_FEATURES
+    WEIGHTED_COLUMNS.get(column, 0) for column in DEFAULT_TRACKING_FEATURES
 ]
+
+
+def resolve_weights(feature_columns: list) -> list:
+    """Weights for `feature_columns`, resolved BY NAME.
+
+    The module docstring has always claimed both the gate and the weights are
+    "resolved by NAME ... so adding or removing a column cannot quietly repoint
+    them at the wrong data". That was true of `_gate_indices` only. `weights`
+    defaulted to `DEFAULT_TRACKING_WEIGHTS` -- built against
+    `DEFAULT_TRACKING_FEATURES` -- and was then indexed **positionally** against
+    whatever `feature_columns` the caller actually passed.
+
+    Measured consequence: calling `track_cells(..., feature_columns=[
+    "Maximum Horizontal Length", "Maximum Vertical Length",
+    "Center X Coordinate", "Center Y Coordinate"])` -- the four columns tracking
+    genuinely needs -- left every resolved weight at 0, so the distance term was
+    identically zero, the whole cost matrix was zeros, and
+    `linear_sum_assignment` returned an **arbitrary permutation**. No exception
+    and no warning: the both-terms-disabled guard does not fire, because
+    `centroid_weight` is still 1.0. The mirror case raises `IndexError`.
+    """
+    return [WEIGHTED_COLUMNS.get(column, 0) for column in feature_columns]
 
 # Weight of the mask-overlap term, in units of the cell's own diameter (see
 # `build_cost_matrix`). 1.0 means a completely non-overlapping candidate is
@@ -108,12 +138,36 @@ def mask_overlap_fractions(labels1: np.ndarray, labels2: np.ndarray) -> dict:
     return overlaps
 
 
+def _looks_filled(labels) -> bool:
+    """Is this a filled label image, or a 1-px boundary array?
+
+    Cellpose's `outlines` key is the boundary line; some older output of
+    `convert_tiff_masks_to_npy` wrote a filled array under the same name. They
+    cannot be told apart by key, so tell them apart by shape: a filled cell
+    occupies most of its bounding box, a ring occupies a thin fraction of it.
+    Checked on the largest label, which is the least noisy one.
+    """
+    if labels is None or not hasattr(labels, "shape") or labels.ndim != 2:
+        return False
+    values, counts = np.unique(labels[labels > 0], return_counts=True)
+    if not len(values):
+        return False
+    label = values[int(np.argmax(counts))]
+    ys, xs = np.nonzero(labels == label)
+    box = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
+    return box > 0 and (len(ys) / box) > 0.35
+
+
 class _FrameLabelLoader:
     """Loads a frame's filled label array from a segmentation folder, once.
 
     Tracking is driven by `Cells_info`, which has no pixels in it, so the
     overlap term needs the masks back. Each frame is read once and reused for
     both of the frame-pairs it participates in.
+
+    Returns `None` -- never a substitute array -- when the frame has no
+    `masks`. The caller then tracks that pair on centroids alone, which is a
+    stated fallback rather than a silent one.
     """
 
     def __init__(self, npy_folder: Optional[str]):
@@ -135,12 +189,45 @@ class _FrameLabelLoader:
                 number: os.path.join(self.npy_folder, name)
                 for name, number in data_input.resolve_frame_numbers(files).items()
             }
+            if not self._paths:
+                # A folder that EXISTS but holds no `.npy` segmentation. The
+                # `__bool__` check above passes, so the overlap term and drift
+                # estimation both silently fall back to nothing and tracking
+                # runs on centroids alone with no sign that it did. This is the
+                # real shape of it: a TIFF-mask dataset's own `masks/` folder
+                # looks exactly like a valid npy_folder from outside, and it is
+                # `npy_converted/` beneath it that actually holds the arrays.
+                logger.warning(
+                    "npy_folder %r contains no .npy segmentation, so the mask-overlap term and "
+                    "drift estimation have nothing to read and this run is centroid-only. For a "
+                    "TIFF-mask dataset the arrays live in the extractor's 'npy_converted' "
+                    "subfolder, not in the mask folder itself.", self.npy_folder,
+                )
         path = self._paths.get(frame_number)
         labels = None
         if path is not None:
             try:
                 dat = np.load(path, allow_pickle=True).item()
-                labels = dat["masks"] if "masks" in dat else dat["outlines"]
+                if "masks" in dat:
+                    labels = dat["masks"]
+                elif _looks_filled(dat.get("outlines")):
+                    # Older output of `convert_tiff_masks_to_npy` stored one
+                    # FILLED array under 'outlines' (see `_load_frame`'s
+                    # docstring), and that array is a perfectly good label
+                    # image. Accept it only after checking it actually is one.
+                    labels = dat["outlines"]
+                else:
+                    # A genuine 'outlines' array is the ~2-5%-of-pixels
+                    # boundary line. Two boundary rings essentially never
+                    # intersect, so every IoU came out ~0 and the overlap term
+                    # degenerated into a near-constant penalty -- the same
+                    # ranking as centroids alone, but reported as if the mask
+                    # had been used. Returning None says so instead.
+                    logger.warning(
+                        "Frame %s has no filled label array (keys: %s); tracking that pair on "
+                        "centroids alone rather than on boundary outlines, which carry no "
+                        "usable overlap", frame_number, sorted(dat)[:6],
+                    )
             except Exception:
                 logger.exception("Could not load masks for frame %s; tracking that pair on centroids alone", frame_number)
         self._cache[frame_number] = labels
@@ -163,6 +250,22 @@ UNTHREADED_PARAMETERS = {
     "no_link_ratio": "measured: influence falls to 0.0-0.5% once registration is on",
     "four_quadrant": "measured: influence falls to 0.0-0.5% once registration is on",
 }
+
+
+DRIFT_MODES = ("none", "centroid", "mask")
+
+
+def _validate_drift_mode(drift_mode: str) -> str:
+    """Reject an unknown `drift_mode` instead of silently running another one.
+
+    Only `!= "none"` and `== "mask"` were ever tested, so `"Mask"`, `"masks"` or
+    any typo fell through to the CENTROID experiment while the caller believed
+    mask registration was on. `tracking_benchmark._solve_pairs` already raises;
+    this matches it.
+    """
+    if drift_mode not in DRIFT_MODES:
+        raise ValueError(f"drift_mode must be one of {DRIFT_MODES}, got {drift_mode!r}")
+    return drift_mode
 
 
 def _shift_labels(labels: np.ndarray, dx: float, dy: float) -> np.ndarray:
@@ -248,6 +351,14 @@ def _no_match_sentinel(cost_matrix: pd.DataFrame, fallback: float, no_link_ratio
     highest = float(max(finite.max(), fallback))
     if no_link_ratio is None:
         return highest + 1.0
+    if no_link_ratio <= 1.0:
+        # At or below 1.0 the sentinel lands at or under the largest real cost,
+        # so the genuine maximum-cost link is filtered out as a non-link -- the
+        # solver silently drops the very link the ceiling was meant to keep.
+        raise ValueError(
+            f"no_link_ratio must be > 1.0 (TrackMate uses 1.05), got {no_link_ratio!r}: "
+            "at or below 1.0 the sentinel sits under the largest real cost."
+        )
     return highest * float(no_link_ratio)
 
 
@@ -402,6 +513,10 @@ def build_cost_matrix(
     # misconfiguration.
     if cost_form not in ("additive", "multiplicative"):
         raise ValueError(f"Unknown cost_form {cost_form!r}; expected 'additive' or 'multiplicative'.")
+    if overlap_power <= 0:
+        # (1 - IoU)**0 == 1 even for a PERFECT overlap, so a zero power inverts
+        # the term: the best possible match pays the full penalty.
+        raise ValueError(f"overlap_power must be > 0, got {overlap_power!r}.")
     if (centroid_weight == 0 and (overlap_weight == 0 or not overlaps)
             and not cells_frame1.empty and not cells_frame2.empty):
         raise ValueError(
@@ -411,7 +526,18 @@ def build_cost_matrix(
     if feature_columns is None:
         feature_columns = DEFAULT_TRACKING_FEATURES
     if weights is None:
-        weights = DEFAULT_TRACKING_WEIGHTS
+        weights = resolve_weights(feature_columns)
+    if len(weights) != len(feature_columns):
+        raise ValueError(
+            f"weights has {len(weights)} entries for {len(feature_columns)} feature_columns; "
+            "they are matched positionally, so the lengths must agree."
+        )
+    if not any(weights):
+        raise ValueError(
+            "Every resolved weight is zero, so the distance term would be identically 0 and the "
+            "assignment arbitrary. feature_columns must include at least one of "
+            f"{sorted(WEIGHTED_COLUMNS)}; got {list(feature_columns)}."
+        )
 
     # Zero-weight columns are skipped rather than multiplied by zero. With all
     # but two of the default columns weighted 0, `0 * value` was already pure
@@ -625,7 +751,10 @@ def load_and_process_data(file_path: str) -> pd.DataFrame:
     return data
 
 
-def _merge_tracking_pairs(frame_output_dir: str, folder_prefix: str, start_index: int) -> pd.DataFrame:
+def _merge_tracking_pairs(
+    frame_output_dir: str, folder_prefix: str, start_index: int,
+    produced_frames: Optional[list] = None,
+) -> pd.DataFrame:
     """Stitch all `{folder_prefix}Matching_Results_new_{i}_{i+1}.xlsx` files
     in `frame_output_dir` into one wide `Index, Frame{start}..Frame{last}`
     DataFrame, writes `{folder_prefix}merged_tracking_results.xlsx`, and
@@ -657,18 +786,32 @@ def _merge_tracking_pairs(frame_output_dir: str, folder_prefix: str, start_index
     matching_frames = sorted(
         set(int(re.search(r"\d+", f).group(0)) for f in matching_files if re.search(r"\d+", f))
     )
+    # Only the pairs THIS run produced. Listing the directory stitches in files
+    # left by a previous run, and `track_cells` never clears it: measured, a
+    # 5-frame movie re-tracked as 2 frames into the same output directory
+    # produced a phantom track assembled entirely from the old files, describing
+    # cells that no longer exist. That is exactly the hand-correction ->
+    # re-track workflow this module is built around.
+    if produced_frames is not None:
+        matching_frames = [f for f in matching_frames if f in set(produced_frames)]
     if not matching_frames:
         data_final = pd.DataFrame()
         data_final.to_excel(os.path.join(frame_output_dir, f"{folder_prefix}merged_tracking_results.xlsx"), index=False)
         return data_final
 
     start_frame = min(matching_frames)
-    files_count = len(matching_frames)
 
     tracks: list[dict[str, str]] = []
     open_tracks: dict[str, int] = {}
 
-    for i in range(start_frame, start_frame + files_count):
+    # Iterate the frame numbers that actually EXIST, not a count treated as a
+    # span. `range(start, start + len(matching_frames))` is correct only when
+    # the frame numbers are contiguous; measured on a movie with frames
+    # 1,2,5,6,9,10 it wrote `Matching_Results_new_9_10.xlsx` correctly and then
+    # never opened it, so frames 8-10 vanished from the merged table with no
+    # error and no log line. Frame holes are normal -- a frame whose
+    # segmentation yields no cells, or a partially segmented movie.
+    for i in matching_frames:
         pair_path = os.path.join(frame_output_dir, f"{folder_prefix}Matching_Results_new_{i}_{i + 1}.xlsx")
         if not os.path.exists(pair_path):
             continue
@@ -687,7 +830,7 @@ def _merge_tracking_pairs(frame_output_dir: str, folder_prefix: str, start_index
             tracks[track_idx][frame_i1_col] = cell_i1
             open_tracks[cell_i1] = track_idx
 
-    frame_columns = [f"Frame{n}" for n in range(start_frame, start_frame + files_count + 1)]
+    frame_columns = [f"Frame{n}" for n in sorted(set(matching_frames) | {f + 1 for f in matching_frames})]
     data_final = pd.DataFrame(tracks, columns=frame_columns)
     data_final.insert(0, "Index", range(start_index, start_index + len(data_final)))
 
@@ -854,6 +997,18 @@ def track_cells(
     # The value the old sentinel implicitly enforced as a displacement ceiling.
     radius_ceiling = cells_info["Circumscribed Circle Radius"].max()
 
+    _validate_drift_mode(drift_mode)
+    if drift_mode != "none" and not drift_by_frame and not (npy_folder and os.path.isdir(npy_folder)):
+        # `_estimate_drift` returns (0, 0) with no masks to measure from, so the
+        # run is silently UNREGISTERED while the caller believes otherwise.
+        logger.warning(
+            "drift_mode=%r was requested but no npy_folder and no drift_by_frame were given, so the "
+            "drift is (0, 0) and this run is effectively unregistered.", drift_mode,
+        )
+
+    # Which frame pairs THIS run actually wrote, so the merge cannot stitch in a
+    # previous run's leftovers (see `_merge_tracking_pairs`).
+    produced_frames: list = []
     # Carried across iterations so each pair can predict from the last one's
     # answer; `None` on the first pair, where no velocity exists yet.
     previous_cells, previous_matches = None, None
@@ -925,6 +1080,7 @@ def track_cells(
         matching_result.insert(0, "Index", range(start_index, start_index + len(matching_result)))
         matching_result = matching_result[matching_result["Difference"] != sentinel]
 
+        produced_frames.append(fig_id)
         previous_cells = cells_info_fig1
         previous_matches = dict(zip(
             matching_result[f"Frame{fig_id}"], matching_result[f"Frame{fig_id + 1}"]
@@ -936,7 +1092,10 @@ def track_cells(
         )
         start_index += len(matching_result)
 
-    merged = _merge_tracking_pairs(frame_output_dir, folder_prefix, start_index=merge_start_index)
+    merged = _merge_tracking_pairs(
+        frame_output_dir, folder_prefix, start_index=merge_start_index,
+        produced_frames=produced_frames,
+    )
     if max_frame_gap:
         merged, joins = close_track_gaps(
             merged, cells_info, max_frame_gap=max_frame_gap,
@@ -948,6 +1107,40 @@ def track_cells(
             merged.to_excel(
                 os.path.join(frame_output_dir, f"{folder_prefix}merged_tracking_results.xlsx"), index=False,
             )
+    return merged
+
+
+def _join_hole(join: dict) -> tuple:
+    """The frames a gap-join bridges, as `(first_missing, last_missing)`.
+
+    Read from the join's own `seam_frame` rather than re-derived from the
+    table: after the first link of a chain the surviving row's last frame is no
+    longer the seam, so re-deriving would mis-scope every later link.
+    """
+    seam = int(join["seam_frame"])
+    return (seam + 1, seam + int(join["gap"]))
+
+
+def _apply_selected_joins(tracking_data: pd.DataFrame, id_col: str, joins: list) -> pd.DataFrame:
+    """Apply only `joins`, leaving every other track alone."""
+    merged = tracking_data.copy(deep=True)
+    frame_cols = [c for c in merged.columns if c.startswith("Frame")]
+    absorbed = set()
+    for join in joins:
+        into_rows = merged.index[merged[id_col] == int(join["into_track_id"])]
+        from_rows = merged.index[merged[id_col] == int(join["from_track_id"])]
+        if not len(into_rows) or not len(from_rows):
+            continue
+        into_row, from_row = into_rows[0], from_rows[0]
+        for col in frame_cols:
+            value = merged.at[from_row, col]
+            if pd.notna(value):
+                merged.at[into_row, col] = value
+                merged.at[from_row, col] = None
+        absorbed.add(int(join["from_track_id"]))
+    if absorbed:
+        keep = [p for p in merged.index if int(merged.at[p, id_col]) not in absorbed]
+        merged = merged.loc[keep].reset_index(drop=True)
     return merged
 
 
@@ -963,8 +1156,11 @@ def close_track_gaps(
     momentarily lost to segmentation re-attaches instead of minting a new id.
 
     Returns `(tracking_data, joins)` where `joins` is a list of
-    `{"from_track_id", "into_track_id", "gap", "distance"}`. The table is
-    rebuilt, not mutated.
+    `{"from_track_id", "into_track_id", "gap", "seam_frame", "distance"}`. The
+    table is rebuilt, not mutated. A chain of segments (A ends, B fills one gap
+    later, C one gap after B) is closed **whole**: every link reports the same
+    `into_track_id` -- the surviving root -- and `seam_frame` is the last frame
+    of the segment that link bridges from.
 
     **This is a second assignment problem over track SEGMENTS, not a special
     case inside the frame-to-frame one** -- the structure u-track (Jaqaman
@@ -1046,28 +1242,54 @@ def close_track_gaps(
     square[:cost.shape[0], :cost.shape[1]] = np.where(np.isfinite(cost), cost, sentinel)
     rows, columns = linear_sum_assignment(square)
 
+    # Collect the accepted links first, then apply them as CHAINS.
+    #
+    # A5 (R15): the old loop applied a link only if neither end had been touched
+    # (`if tail in absorbed or head in absorbed: continue`), so an A->B->C chain
+    # kept whichever of its two links `linear_sum_assignment` happened to emit
+    # first -- and which one that was depended on row order. Three segments one
+    # gap apart came back as two tracks instead of one, understating by a
+    # run-order-dependent amount the very cell-loss figure this feature exists
+    # to improve. The links form disjoint paths (each tail links out once, each
+    # head is absorbed once, and a head always starts after its tail ends, so
+    # there are no cycles), so walking each path from its root closes the whole
+    # chain deterministically.
+    links = {}
+    for i, j in zip(rows, columns):
+        if i >= cost.shape[0] or j >= cost.shape[1] or square[i, j] == sentinel:
+            continue
+        links[tail_ids[i]] = (head_ids[j], float(cost[i, j]))
+
     merged = tracking_data.copy()
     row_of = {int(merged.at[p, id_col]): p for p in merged.index}
     joins = []
     absorbed = set()
-    for i, j in zip(rows, columns):
-        if i >= cost.shape[0] or j >= cost.shape[1] or square[i, j] == sentinel:
-            continue
-        tail, head = tail_ids[i], head_ids[j]
-        if tail in absorbed or head in absorbed:
-            continue
-        tail_row, head_row = row_of[tail], row_of[head]
-        for _, col in frame_cols:
-            value = merged.at[head_row, col]
-            if pd.notna(value):
-                merged.at[tail_row, col] = value
-                merged.at[head_row, col] = None
-        joins.append({
-            "from_track_id": head, "into_track_id": tail,
-            "gap": starts[head][0] - ends[tail][0] - 1,
-            "distance": round(float(cost[i, j]), 2),
-        })
-        absorbed.add(head)
+    heads = {head for head, _ in links.values()}
+    for root in sorted(t for t in links if t not in heads):
+        current = root
+        while current in links:
+            head, distance = links[current]
+            if head in absorbed:
+                break
+            root_row, head_row = row_of[root], row_of[head]
+            for _, col in frame_cols:
+                value = merged.at[head_row, col]
+                if pd.notna(value):
+                    merged.at[root_row, col] = value
+                    merged.at[head_row, col] = None
+            joins.append({
+                "from_track_id": head, "into_track_id": root,
+                "gap": starts[head][0] - ends[current][0] - 1,
+                # The last frame held by the segment this link bridges FROM.
+                # Recorded here rather than re-derived later, because after the
+                # first link of a chain the surviving row's last frame is no
+                # longer the seam -- `retrack_frame_range` needs the true one to
+                # decide whether a join falls inside its range.
+                "seam_frame": ends[current][0],
+                "distance": round(distance, 2),
+            })
+            absorbed.add(head)
+            current = head
 
     if absorbed:
         keep = [p for p in merged.index if int(merged.at[p, id_col]) not in absorbed]
@@ -1101,9 +1323,16 @@ def retrack_frame_range(
     manual tracking corrections elsewhere.
 
     Returns `{"reconciled": [...], "new_tracks": [...], "frames": [...],
-    "relinked": int}`; `tracking_data` is mutated in place (and may be a NEW
-    object if rows were appended -- use the returned dict's caller-side
-    value, i.e. re-read from the caller's own reference).
+    "relinked": int, "tracking_data": DataFrame, "gap_joins": [...],
+    "gap_joins_rejected_out_of_range": int}`.
+
+    **Always use `result["tracking_data"]`.** The docstring used to have this
+    backwards: appending a new track's row (`tracking_data.loc[max + 1] = ...`)
+    is done *in place* and does NOT produce a new object, while the calls that
+    DO rebind are `merge_tracks_from_frame` (seam reconciliation) and the
+    gap-join application. So the caller's own reference is stale exactly when
+    the docstring said it was current, and vice versa. Treat the argument as
+    an input whose mutation is unspecified.
 
     **This is not the "local re-track" that was built and removed earlier.**
     That one re-ran Hungarian matching in a spatial neighborhood around a
@@ -1141,6 +1370,26 @@ def retrack_frame_range(
     if start_frame > end_frame:
         raise ValueError(f"start_frame {start_frame} is after end_frame {end_frame}.")
 
+    # Normalised exactly as `track_cells` does. Without it `.str.contains` below
+    # raises on a non-string index that `track_cells` accepts -- a divergence
+    # that the signature-reachability test cannot see, because it compares
+    # keyword names rather than behaviour.
+    cells_info = cells_info.copy()
+    cells_info.index = cells_info.index.map(str)
+
+    # A re-track must refuse what `track_cells` refuses. `track_cells` raises on
+    # a mixed-sign `leading_edge` because one cost matrix over two populations
+    # is not the problem it solves; this function used to build exactly that
+    # matrix and return silently -- the divergence was on the quiet side.
+    if "leading_edge" in cells_info.columns:
+        edge = cells_info["leading_edge"]
+        if not ((edge <= 0).all() or (edge > 0).all()):
+            raise ValueError(
+                "cells_info['leading_edge'] must be entirely <= 0, entirely > 0, or the column must be "
+                "absent entirely -- re-tracking one cost matrix over both populations is not the problem "
+                "track_cells solves (split populations with split_by_leading_edge before calling)."
+            )
+
     id_col = tracking_data.columns[0]
     frame_numbers = sorted(set(
         int(match.group(1)) for idx in cells_info.index
@@ -1173,6 +1422,13 @@ def retrack_frame_range(
         feature_columns = DEFAULT_TRACKING_FEATURES
     if weights is None:
         weights = DEFAULT_TRACKING_WEIGHTS
+
+    _validate_drift_mode(drift_mode)
+    if drift_mode != "none" and not drift_by_frame and not (npy_folder and os.path.isdir(npy_folder)):
+        logger.warning(
+            "drift_mode=%r was requested but no npy_folder and no drift_by_frame were given, so the "
+            "drift is (0, 0) and this re-track is effectively unregistered.", drift_mode,
+        )
 
     label_loader = _FrameLabelLoader(npy_folder)
     links: dict[int, dict[str, str]] = {}
@@ -1293,14 +1549,38 @@ def retrack_frame_range(
                 tracking_data.at[pos, col] = None
 
     if max_frame_gap:
-        # `track_cells` gap-closes after its merge; a re-track that did not
-        # would leave the range structurally different from the rest of the
-        # movie whenever the user has the option on.
-        tracking_data, joins = close_track_gaps(
-            tracking_data, cells_info, max_frame_gap=max_frame_gap,
+        # `track_cells` gap-closes after its merge, so a re-track that skipped
+        # it would leave the range structurally different from the rest of the
+        # movie. But `close_track_gaps` sees the WHOLE table, and the joins it
+        # proposes are not all inside the range the caller asked for: a
+        # re-track bounded to [1,2] was observed merging a track spanning
+        # frames 8-9 into one spanning 5-6 -- frames the caller excluded, and
+        # exactly the manual corrections this function exists to preserve.
+        # So: let it solve over everything (a segment's best partner may sit
+        # outside the range), then apply only the joins whose bridged hole
+        # lies wholly within [start_frame, end_frame].
+        id_col = tracking_data.columns[0]
+        _, proposed = close_track_gaps(
+            tracking_data.copy(deep=True), cells_info, max_frame_gap=max_frame_gap,
             feature_columns=feature_columns, max_centroid_distance=radius_fallback,
         )
+        # A chain is all-or-nothing: its links share one surviving root and
+        # must be applied in order, so applying only its tail links would merge
+        # a later segment into a root it was never adjacent to.
+        out_of_range_roots = {
+            int(j["into_track_id"]) for j in proposed
+            if not (start_frame <= _join_hole(j)[0] and _join_hole(j)[1] <= end_frame)
+        }
+        joins, rejected = [], 0
+        for join in proposed:
+            if int(join["into_track_id"]) in out_of_range_roots:
+                rejected += 1
+                continue
+            joins.append(join)
+        if joins:
+            tracking_data = _apply_selected_joins(tracking_data, id_col, joins)
         result["gap_joins"] = joins
+        result["gap_joins_rejected_out_of_range"] = rejected
 
     result["tracking_data"] = tracking_data
     return result
@@ -1352,6 +1632,11 @@ def track_all_populations(
     `cells_info` should have `'Cell Index'` as a plain column (not the
     index) -- matching v1's runtime shape (loaded via plain
     `pd.read_excel(cells_info_path)`).
+
+    Track `Index` numbering is scoped to this call: the first population starts
+    at 1 and the second continues from it, regardless of what a previous run
+    left in `output_dir`. Re-running is therefore idempotent in the ids, which
+    is what any manual correction keyed by `Index` depends on.
     """
     has_leading_edge = "leading_edge" in cells_info.columns
     all_tracking_data = pd.DataFrame()
@@ -1363,27 +1648,38 @@ def track_all_populations(
         mes_cells_info = mes_cells_info.set_index("Cell Index")
         epi_cells_info = epi_cells_info.set_index("Cell Index")
 
+        # A5 (R15): scope the id numbering to THIS run. Left to auto-detect,
+        # each `track_cells` reads the sibling population's Excel file off
+        # disk -- which, on a re-run into the same output directory, is the
+        # PREVIOUS run's. Three consecutive calls returned `Index` [1,2], then
+        # [3,4], then [5,6], so any manual correction keyed by `Index`
+        # misaligned after a re-run. Seeding explicitly makes the numbering a
+        # function of this call and nothing else. (`track_cells` keeps its
+        # file-reading fallback for direct callers, which is v1's behaviour.)
+        epi_start_index = 1
         if not mes_cells_info.empty:
-            mes_tracking = track_cells(mes_cells_info, output_dir, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
+            mes_tracking = track_cells(mes_cells_info, output_dir, start_index=1, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
                                        centroid_weight=centroid_weight, motion_compensation=motion_compensation,
                                        max_frame_gap=max_frame_gap, cost_form=cost_form,
                                        overlap_power=overlap_power, no_link_ratio=no_link_ratio,
                                        four_quadrant=four_quadrant, drift_mode=drift_mode,
                                        drift_by_frame=drift_by_frame,
                                        feature_columns=feature_columns, weights=weights)
-            all_tracking_data = pd.concat([all_tracking_data, mes_tracking], axis=0)
+            all_tracking_data = pd.concat([all_tracking_data, mes_tracking], axis=0, ignore_index=True)
+            if not mes_tracking.empty:
+                epi_start_index = int(mes_tracking.iloc[:, 0].max()) + 1
         if not epi_cells_info.empty:
-            epi_tracking = track_cells(epi_cells_info, output_dir, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
+            epi_tracking = track_cells(epi_cells_info, output_dir, start_index=epi_start_index, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
                                        centroid_weight=centroid_weight, motion_compensation=motion_compensation,
                                        max_frame_gap=max_frame_gap, cost_form=cost_form,
                                        overlap_power=overlap_power, no_link_ratio=no_link_ratio,
                                        four_quadrant=four_quadrant, drift_mode=drift_mode,
                                        drift_by_frame=drift_by_frame,
                                        feature_columns=feature_columns, weights=weights)
-            all_tracking_data = pd.concat([all_tracking_data, epi_tracking], axis=0)
+            all_tracking_data = pd.concat([all_tracking_data, epi_tracking], axis=0, ignore_index=True)
     else:
         cells_info = cells_info.set_index("Cell Index")
-        all_tracking_data = track_cells(cells_info, output_dir, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
+        all_tracking_data = track_cells(cells_info, output_dir, start_index=1, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
                                        centroid_weight=centroid_weight, motion_compensation=motion_compensation,
                                        max_frame_gap=max_frame_gap, cost_form=cost_form,
                                        overlap_power=overlap_power, no_link_ratio=no_link_ratio,
@@ -1402,6 +1698,8 @@ def track_all_populations(
 
 
 if __name__ == "__main__":
+    import tempfile
+
     import argparse
 
     parser = argparse.ArgumentParser(description="Standalone debug entry for v2.cell_tracking")
@@ -1703,6 +2001,198 @@ if __name__ == "__main__":
         print("\nreachability: every cost-primitive keyword reaches track_cells AND")
         print("  retrack_frame_range, or is listed in UNTHREADED_PARAMETERS with a reason")
         print("  (%d excluded: %s)" % (len(UNTHREADED_PARAMETERS), ", ".join(sorted(UNTHREADED_PARAMETERS))))
+
+        # --- C1: a frame COUNT is not a frame SPAN.
+        import tempfile as _tmp
+        holed = pd.DataFrame([_cell(f"Cell{f}_{i}", 10.0 if i == 1 else 200.0, 10.0)
+                              for f in (1, 2, 5, 6, 9, 10) for i in (1, 2)])
+        out_dir = _tmp.mkdtemp()
+        merged_holed = track_cells(holed, out_dir)
+        produced = sorted(int(re.search(r"new_(\d+)_", f).group(1))
+                          for f in os.listdir(os.path.join(out_dir, "All_cell_tracking"))
+                          if "Matching_Results" in f)
+        columns = {int(c[len("Frame"):]) for c in merged_holed.columns if c.startswith("Frame")}
+        assert max(produced) + 1 in columns, (produced, sorted(columns))
+        print("\nC1: non-contiguous frames %s survive the merge; columns reach %d"
+              % (produced, max(columns)))
+
+        # --- C2: a second run must not stitch in the first run's pair files.
+        dirty = _tmp.mkdtemp()
+        track_cells(pd.DataFrame([_cell(f"Cell{f}_{i}", 10.0 if i == 1 else 200.0, 10.0)
+                                  for f in (1, 2, 3, 4, 5) for i in (1, 2)]), dirty)
+        shrunk = track_cells(pd.DataFrame([_cell(f"Cell{f}_1", 10.0, 10.0) for f in (1, 2)]), dirty)
+        ghosts = [v for v in shrunk.values.ravel()
+                  if isinstance(v, str) and v.startswith(("Cell3_", "Cell4_", "Cell5_"))]
+        assert not ghosts, ghosts
+        print("C2: re-tracking 2 frames into a dirty output dir yields %d track(s), no phantoms"
+              % len(shrunk))
+
+        # --- D: weights resolved by NAME, and an all-zero resolution refused.
+        four = ["Maximum Horizontal Length", "Maximum Vertical Length",
+                "Center X Coordinate", "Center Y Coordinate"]
+        assert resolve_weights(four) == [0, 0, 1, 1], resolve_weights(four)
+        narrowed = build_cost_matrix(frame1[four], frame2[four], feature_columns=four)
+        assert np.nansum(np.abs(narrowed.to_numpy())) > 0, narrowed
+        try:
+            build_cost_matrix(frame1, frame2, feature_columns=["Cell Area", "Cell Perimeter"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("an all-zero weight resolution must raise, not return a permutation")
+        print("D: custom feature_columns resolve by name (%s); an all-zero resolution raises."
+              % resolve_weights(four))
+        print("  (before: weights were indexed positionally, so those four columns gave a")
+        print("   zero cost matrix and linear_sum_assignment returned an arbitrary permutation.)")
+
+        # --- A2 (R15): re-track must not touch identities outside its range.
+        # `close_track_gaps` used to be handed the WHOLE table, so a re-track
+        # bounded to [1,2] merged a track spanning frames 8-9 into one spanning
+        # 5-6 -- exactly the manual corrections this function exists to preserve.
+        far = pd.DataFrame([_cell(f"Cell{f}_1", 10.0, 10.0) for f in (1, 2, 3)] +
+                           [_cell(f"Cell{f}_9", 300.0, 300.0) for f in (5, 6, 8, 9)])
+        far_tracks = pd.DataFrame({
+            "Index": [1, 2, 3],
+            **{f"Frame{f}": [f"Cell{f}_1" if f <= 3 else None,
+                             f"Cell{f}_9" if f in (5, 6) else None,
+                             f"Cell{f}_9" if f in (8, 9) else None] for f in range(1, 10)},
+        })
+        before_far = far_tracks.copy(deep=True)
+        out = retrack_frame_range(far, far_tracks.copy(deep=True), 1, 2, max_frame_gap=1)
+        after = out["tracking_data"]
+        untouched = all(
+            sorted(str(v) for v in before_far.loc[before_far["Index"] == t].values.ravel()
+                   if isinstance(v, str))
+            == sorted(str(v) for v in after.loc[after["Index"] == t].values.ravel()
+                      if isinstance(v, str))
+            for t in (2, 3) if t in set(after["Index"])
+        )
+        assert untouched, after.to_string()
+        assert out.get("gap_joins_rejected_out_of_range", 0) >= 0
+        print("\nA2 (R15): a re-track bounded to [1,2] with gap closing on leaves")
+        print("  frames 5-9 untouched (%d out-of-range join(s) rejected)."
+              % out.get("gap_joins_rejected_out_of_range", 0))
+
+        # A2c: a mixed-dtype index (one stray non-string label, as a merged or
+        # partially re-indexed frame can produce) used to break the `.str`
+        # accessor here while `track_cells` tolerated it.
+        mixed = far.copy()
+        mixed.index = pd.Index(list(far.index[:-1]) + [0], dtype=object)
+        try:
+            retrack_frame_range(mixed, far_tracks.copy(deep=True), 1, 2)
+            print("  A2c: a mixed-dtype cells_info index is normalised, not an AttributeError.")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise AssertionError("index normalisation missing in retrack_frame_range: %s" % exc)
+
+        # --- A5 (R15): re-running into the same output directory must return
+        # the same track ids. Auto-detection read the sibling population's
+        # Excel file off disk, which on a re-run is the PREVIOUS run's, so
+        # three consecutive calls gave [1,2,3,4], [5,6,7,8], [9,10,11,12] and
+        # every manual correction keyed by `Index` misaligned.
+        edge_rows = []
+        for f in (1, 2):
+            for i, (x, edge) in enumerate([(10.0, -1.0), (200.0, -1.0),
+                                           (400.0, 1.0), (600.0, 1.0)], start=1):
+                row = {col: 1.0 for col in DEFAULT_TRACKING_FEATURES}
+                row.update({"Cell Index": f"Cell{f}_{i}", "leading_edge": edge,
+                            "Center X Coordinate": x + 2 * f, "Center Y Coordinate": 10.0,
+                            "Circumscribed Circle Radius": 10.0,
+                            "Maximum Horizontal Length": 10.0, "Maximum Vertical Length": 10.0})
+                edge_rows.append(row)
+        rerun_dir = tempfile.mkdtemp()
+        seen = []
+        for _ in range(3):
+            table = track_all_populations(pd.DataFrame(edge_rows), rerun_dir)
+            seen.append(sorted(int(v) for v in table.iloc[:, 0]))
+        assert seen[0] == seen[1] == seen[2] == [1, 2, 3, 4], seen
+        print("  A5: three runs into one output directory give the same ids %s" % (seen[0],))
+        print("     (before: %s, then [5, 6, 7, 8], then [9, 10, 11, 12])." % (seen[0],))
+
+        # --- A5 (R15): an A->B->C chain of gaps closes WHOLE. The old loop
+        # refused any link touching an already-absorbed track, so it kept
+        # exactly ONE of the chain's two links and returned two tracks where
+        # one is correct -- measured here on the pre-change code, under all
+        # three row orders below. (The plan called the survivor "row-order
+        # dependent"; it is not -- `tail_ids`/`head_ids` are sorted by track
+        # id, so the survivor is deterministic. It is the LOWEST-id link that
+        # wins, not the best one, which is arbitrary rather than unstable.)
+        chain_info = pd.DataFrame(
+            [_cell("Cell1_1", 10.0, 10.0), _cell("Cell2_1", 12.0, 10.0),
+             _cell("Cell4_1", 16.0, 10.0), _cell("Cell5_1", 18.0, 10.0),
+             _cell("Cell7_1", 22.0, 10.0), _cell("Cell8_1", 24.0, 10.0)]
+        )
+        chain_rows = [
+            {"Index": 1, **{f"Frame{f}": (f"Cell{f}_1" if f in (1, 2) else None) for f in range(1, 9)}},
+            {"Index": 2, **{f"Frame{f}": (f"Cell{f}_1" if f in (4, 5) else None) for f in range(1, 9)}},
+            {"Index": 3, **{f"Frame{f}": (f"Cell{f}_1" if f in (7, 8) else None) for f in range(1, 9)}},
+        ]
+        survivors = set()
+        for order in ([0, 1, 2], [2, 1, 0], [1, 2, 0]):
+            table = pd.DataFrame([chain_rows[k] for k in order]).reset_index(drop=True)
+            closed, chain_joins = close_track_gaps(
+                table, chain_info, max_frame_gap=1, max_centroid_distance=20.0)
+            assert len(closed) == 1, closed.to_string()
+            held = sorted(int(c[len("Frame"):]) for c in closed.columns
+                          if c.startswith("Frame") and pd.notna(closed.iat[0, closed.columns.get_loc(c)]))
+            assert held == [1, 2, 4, 5, 7, 8], held
+            assert len(chain_joins) == 2, chain_joins
+            survivors.add(int(closed.iat[0, 0]))
+        assert survivors == {1}, survivors
+        print("\nA5: an A->B->C gap chain closes to ONE track (frames 1,2,4,5,7,8) under")
+        print("  every row order, and the surviving id is always the earliest segment's.")
+
+        # A2a: re-track refuses a mixed-sign leading_edge, as track_cells does.
+        mixed_edge = far.copy()
+        mixed_edge["leading_edge"] = [1.0] * 3 + [-1.0] * 4
+        try:
+            retrack_frame_range(mixed_edge, far_tracks.copy(deep=True), 1, 2)
+            raise AssertionError("retrack_frame_range must refuse a mixed-sign leading_edge")
+        except ValueError as exc:
+            assert "leading_edge" in str(exc), exc
+        print("  A2a: a mixed-sign leading_edge raises here too, not one mixed cost matrix.")
+
+        # A1 (R15, extended): a folder that exists but holds no .npy at all.
+        # `__bool__` passes on it, so the overlap term and drift both fell back
+        # to nothing with no sign that they had -- and a TIFF dataset's own
+        # masks/ folder is exactly that shape (the arrays are in the
+        # extractor's npy_converted/ subfolder beneath it).
+        empty_folder = tempfile.mkdtemp()
+        empty_loader = _FrameLabelLoader(empty_folder)
+        assert bool(empty_loader), "an existing folder is still 'configured'"
+        assert empty_loader.get(1) is None
+        print("  A1: an npy_folder with no segmentation in it warns instead of")
+        print("     silently tracking on centroids alone.")
+
+        # A4c: a frame with only `outlines` yields None, not 1-px boundaries.
+        # As a fallback those gave IoU ~0 for every pair, so the overlap term
+        # became a near-constant penalty that ranked exactly like centroids
+        # alone -- while reporting that the mask had been used.
+        holder = tempfile.mkdtemp()
+        ring = np.zeros((40, 40), dtype=int)
+        ring[10:30, 10] = 1; ring[10:30, 29] = 1; ring[10, 10:30] = 1; ring[29, 10:30] = 1
+        np.save(os.path.join(holder, "f001_seg.npy"), {"outlines": ring}, allow_pickle=True)
+        # ...but an older converter's FILLED array under the same key is a real
+        # label image and must still be accepted (see `_load_frame`'s docstring).
+        filled = np.zeros((40, 40), dtype=int)
+        filled[10:30, 10:30] = 1
+        np.save(os.path.join(holder, "f002_seg.npy"), {"outlines": filled}, allow_pickle=True)
+        loader = _FrameLabelLoader(holder)
+        assert loader.get(1) is None, "a 1-px boundary array must not pass as a label image"
+        assert loader.get(2) is not None, "a filled array under 'outlines' must still be used"
+        print("  A4c: a 1-px 'outlines' boundary loads as None (IoU over rings is ~0 for every")
+        print("     pair); an older converter's FILLED array under the same key still works.")
+
+        # --- A1 (R15): the four validations each refuse the bad value.
+        for label, call in (
+            ("drift_mode typo", lambda: _validate_drift_mode("Mask")),
+            ("no_link_ratio<=1", lambda: _no_match_sentinel(plain, 1.0, no_link_ratio=1.0)),
+            ("overlap_power=0", lambda: build_cost_matrix(frame1, frame2, overlap_power=0.0)),
+        ):
+            try:
+                call()
+            except ValueError:
+                continue
+            raise AssertionError("%s must raise" % label)
+        print("  A1: drift_mode typos, no_link_ratio<=1.0 and overlap_power=0 all raise.")
 
         print("All cell_tracking self-tests passed.")
         raise SystemExit(0)
