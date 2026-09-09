@@ -350,11 +350,7 @@ def render_tracking_overlay(
     # "wins" consistent between clicking a cell and reading its on-image
     # label, instead of one being first-match and the other silently being
     # last-match (a dict overwrite via `.iterrows()`).
-    matched_lookup: dict[str, object] = {}
-    if frame_col in tracking_data.columns:
-        for _, row in tracking_data[[id_col, frame_col]].dropna(subset=[frame_col]).iterrows():
-            if row[frame_col] not in matched_lookup:
-                matched_lookup[row[frame_col]] = row[id_col]
+    matched_lookup: dict = build_matched_lookup(tracking_data, frame_number)
 
     identity_color_by_track: dict[object, tuple[int, int, int]] = {}
     if track_color_mode == "identity":
@@ -387,7 +383,7 @@ def render_tracking_overlay(
             for state, hex_color in (lifecycle_colors or {}).items()
         }
 
-    labels: list[tuple[int, int, str]] = []
+    labels: list[tuple[int, int, str, bool]] = []
     for cell_id in np.unique(outlines):
         if cell_id == 0:
             continue
@@ -442,7 +438,7 @@ def render_tracking_overlay(
         if label_cells:
             positions = np.where(outlines == cell_id)
             cy, cx = int(np.mean(positions[0])), int(np.mean(positions[1]))
-            labels.append((cx, cy, str(track_id) if is_matched else str(cell_id)))
+            labels.append((cx, cy) + cell_label_text(cell_id, track_id if is_matched else None))
 
     pil_img = Image.fromarray(img)
     draw = ImageDraw.Draw(pil_img) if (label_cells or nematic_axes) else None
@@ -474,8 +470,12 @@ def render_tracking_overlay(
 
     if label_cells:
         font = ImageFont.load_default(size=label_font_size)
-        for cx, cy, text in labels:
-            draw.text((cx, cy), text, fill="white", font=font)
+        for cx, cy, text, is_track in labels:
+            # An unmatched cell's raw label is drawn in a different colour as
+            # well as prefixed: a number that is a track id for most cells and
+            # a raw label for a few, with no way to tell which, is worse than
+            # either alone.
+            draw.text((cx, cy), text, fill="white" if is_track else "#ff9f0a", font=font)
 
     return pil_img
 
@@ -554,14 +554,71 @@ def draw_cell_outlines(img: np.ndarray, fill_labels: np.ndarray, color: str = "#
     return img
 
 
+def build_matched_lookup(tracking_data, frame_number: int) -> dict:
+    """`{cell_index: track_id}` for one frame.
+
+    First-match wins, deliberately: two rows can still claim the same cell, and
+    resolving every lookup the same way keeps which track "wins" consistent
+    between clicking a cell and reading its on-image label -- instead of one
+    being first-match and the other silently last-match via a dict overwrite.
+    """
+    if tracking_data is None:
+        return {}
+    frame_col = f"Frame{frame_number}"
+    if frame_col not in tracking_data.columns:
+        return {}
+    id_col = tracking_data.columns[0]
+    lookup: dict = {}
+    for _, row in tracking_data[[id_col, frame_col]].dropna(subset=[frame_col]).iterrows():
+        if row[frame_col] not in lookup:
+            lookup[row[frame_col]] = row[id_col]
+    return lookup
+
+
+# A raw segmentation label shown where a track id was expected. Cellpose
+# renumbers raw labels every frame, so an unprefixed one looks exactly like a
+# track id while jumping between frames for no reason -- the mixing this marker
+# exists to prevent (Round 17 C2).
+RAW_LABEL_PREFIX = "#"
+
+
+def cell_label_text(cell_id: int, track_id=None) -> tuple:
+    """`(text, is_track_id)` for one cell.
+
+    **One resolver, used by the main overlay and the inset alike.** The inset
+    used to label with raw ids while the main view labelled with track ids, so
+    the same three cells read 284 / 281 / 282 in one panel and 65 / 72 / 76 in
+    the other -- two id spaces, no way to tell which you were looking at. That
+    defect *was* the duplication, which is why this is a function and not a
+    line repeated twice.
+    """
+    if track_id is None:
+        return f"{RAW_LABEL_PREFIX}{int(cell_id)}", False
+    return str(track_id), True
+
+
 def draw_cell_labels(
     pil_img: Image.Image, fill_labels: np.ndarray, font_size: int = 10, color: str = "#ffffff",
+    matched_lookup: Optional[dict] = None, frame_number: Optional[int] = None,
+    raw_color: str = "#ff9f0a",
 ) -> Image.Image:
-    """Draw each cell's raw ID at its centroid, at `font_size`."""
+    """Draw each cell's id at its centroid.
+
+    With `matched_lookup` and `frame_number`, labels are **track** ids -- the
+    same thing the main overlay draws -- and a cell no track claims falls back
+    to its raw label, prefixed and in `raw_color` so the two id spaces are
+    never silently mixed. Without them, raw labels, which is what the Extract
+    preview wants.
+    """
     draw = ImageDraw.Draw(pil_img)
     font = ImageFont.load_default(size=font_size)
     for label, (cx, cy) in _label_centroids(fill_labels).items():
-        draw.text((cx, cy), str(label), fill=color, font=font)
+        if matched_lookup is None or frame_number is None:
+            draw.text((cx, cy), str(label), fill=color, font=font)
+            continue
+        track_id = matched_lookup.get(f"Cell{frame_number}_{label}")
+        text, is_track = cell_label_text(label, track_id)
+        draw.text((cx, cy), text, fill=color if is_track else raw_color, font=font)
     return pil_img
 
 
@@ -603,12 +660,64 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Standalone debug entry for v2.rendering")
-    parser.add_argument("--npy-file", required=True, help="A single frame's .npy segmentation file")
-    parser.add_argument("--frame-number", type=int, required=True)
+    parser.add_argument("--npy-file", help="A single frame's .npy segmentation file")
+    parser.add_argument("--frame-number", type=int)
+    parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--image-folder", default=None)
     parser.add_argument("--clustering-data", default=None, help="cells_clustering_results.xlsx path (optional)")
     parser.add_argument("--output-png", default="rendering_debug_output.png")
     args = parser.parse_args()
+
+    if args.self_test:
+        import pandas as pd
+
+        # --- C2 (R17): the main overlay and the inset must resolve a label the
+        # same way. They did not -- the inset drew RAW segmentation labels,
+        # which Cellpose renumbers every frame, so the same three cells read
+        # 284/281/282 in the main view and 65/72/76 in the inset: two id spaces
+        # with no way to tell which you were looking at. One resolver now, and
+        # this asserts it across three consecutive frames.
+        tracking = pd.DataFrame({
+            "Index": [7, 8],
+            "Frame1": ["Cell1_65", "Cell1_72"],
+            "Frame2": ["Cell2_11", "Cell2_40"],   # raw labels change; tracks do not
+            "Frame3": ["Cell3_5", None],          # track 8 ends here
+        })
+        for frame, raws in ((1, (65, 72)), (2, (11, 40)), (3, (5, 99))):
+            lookup = build_matched_lookup(tracking, frame)
+            for raw in raws:
+                track = lookup.get(f"Cell{frame}_{raw}")
+                text, is_track = cell_label_text(raw, track)
+                if track is None:
+                    assert text == f"{RAW_LABEL_PREFIX}{raw}" and not is_track, (frame, raw, text)
+                else:
+                    assert text == str(track) and is_track, (frame, raw, text)
+        across = [cell_label_text(raw, build_matched_lookup(tracking, frame).get(f"Cell{frame}_{raw}"))[0]
+                  for frame, raw in ((1, 65), (2, 11), (3, 5))]
+        assert across == ["7", "7", "7"], across
+        print("C2: one cell reads '7' at frames 1, 2 and 3 though its raw id is 65 / 11 / 5,")
+        print("  and an unmatched cell falls back to '%s99' -- prefixed and drawn in a"
+              % RAW_LABEL_PREFIX)
+        print("  different colour, so the two id spaces are never silently mixed.")
+
+        # The inset and the overlay share this resolver by construction: both
+        # go through `build_matched_lookup` + `cell_label_text`.
+        canvas = Image.fromarray(np.zeros((30, 30, 3), dtype=np.uint8))
+        grid = np.zeros((30, 30), dtype=int)
+        grid[5:15, 5:15] = 65
+        drawn = draw_cell_labels(canvas.copy(), grid, matched_lookup=build_matched_lookup(tracking, 1),
+                                 frame_number=1)
+        assert np.asarray(drawn).any(), "a track label must actually be drawn"
+        plain = draw_cell_labels(canvas.copy(), grid)
+        assert not np.array_equal(np.asarray(drawn), np.asarray(plain)), \
+            "track labels and raw labels must render differently"
+        print("  draw_cell_labels renders track ids when given a lookup and raw ids without one.")
+
+        print("\nAll rendering self-tests passed.")
+        raise SystemExit(0)
+
+    if not args.npy_file or args.frame_number is None:
+        parser.error("--npy-file and --frame-number are required unless --self-test is given")
 
     dat = np.load(args.npy_file, allow_pickle=True).item()
     outlines = dat["outlines"]

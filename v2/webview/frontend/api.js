@@ -30,7 +30,7 @@
     trackingCost: { mode: "hybrid", overlap_weight: 1.0, centroid_weight: 1.0,
                     motion_compensation: false, max_frame_gap: 0, drift_mode: "none" },
     t1PersistFrames: 1,
-    t1Enter: null, t1Exit: null, t1AxisFilter: "all",
+    t1Enter: null, t1Exit: null, t1EventFilter: "persistent",
     registerReference: true,
     deadBand: 0.75,
     repairThreshold: 0.5,
@@ -42,6 +42,8 @@
     coverage: [],
     census: null,
     censusVerdicts: [],
+    trackingRunDriftMode: null,   // set when the mock "runs" tracking
+    minCellArea: 0,
   };
 
   // A tiny distinguishable PNG per key, so two census crops are not the same
@@ -57,6 +59,37 @@
     ctx.fillStyle = color; ctx.fillRect(8 + offset, 12, 24, 22);
     ctx.fillStyle = "#ffffff"; ctx.font = "9px sans-serif"; ctx.fillText(key, 3, 45);
     return canvas.toDataURL("image/png");
+  }
+
+  // Axis states mirror the real `annotate_persistence` output. With the
+  // persistence filter off, nothing is transient.
+  function t1MockAxes() {
+    const settled = mockState.t1PersistFrames === 0;
+    return [
+      { center: [20, 20], phi: 0.4, type: "gain", persistent: true, state: "persistent" },
+      { center: [40, 30], phi: 1.2, type: "loss", persistent: settled,
+        state: settled ? "persistent" : "transient" },
+      { center: [60, 45], phi: 0.9, type: "gain", persistent: false,
+        state: mockState.t1PersistFrames > 1 ? "unjudgeable" : "persistent" },
+    ];
+  }
+
+  const EVENT_FILTER_STATES = {
+    all: ["persistent", "transient", "unjudgeable"],
+    persistent: ["persistent"],
+    persistent_unjudgeable: ["persistent", "unjudgeable"],
+  };
+
+  function t1EventCounts(axes) {
+    const keep = EVENT_FILTER_STATES[mockState.t1EventFilter] || EVENT_FILTER_STATES.all;
+    const states = axes.map((a) => a.state || "persistent");
+    return {
+      filter: mockState.t1EventFilter,
+      shown: states.filter((st) => keep.includes(st)).length,
+      filtered: states.filter((st) => !keep.includes(st)).length,
+      unjudgeable: states.filter((st) => st === "unjudgeable").length,
+      total: states.length,
+    };
   }
 
   function delay(ms) {
@@ -77,6 +110,22 @@
           quantitative_analysis_output: outputBase + "/quantitative_analysis_output",
         },
       };
+    },
+    // Round 19 D. The mock reports a real removal so dev-mode click-through
+    // reaches the "N cells removed" branch, not only the silent one.
+    async set_min_cell_area(areaPx) {
+      mockState.minCellArea = Math.max(0, areaPx || 0);
+      return { min_cell_area_px: mockState.minCellArea, suggested: 19 };
+    },
+    async get_min_cell_area() {
+      return { min_cell_area_px: mockState.minCellArea, suggested: 19 };
+    },
+    async get_min_area_removals() {
+      if (!mockState.minCellArea) {
+        return { min_cell_area_px: 0, total: 0, by_frame: {}, unreadable_frames: [] };
+      }
+      return { min_cell_area_px: mockState.minCellArea, total: 3,
+               by_frame: { 19: 1, 24: 1, 29: 1 }, unreadable_frames: [] };
     },
     async get_existing_results() {
       return { extraction: false, classification: false, tracking: false, shape: false, tissue: false };
@@ -209,7 +258,7 @@
     },
     async get_t1_persistence() {
       return { value: mockState.t1PersistFrames, enter_px: mockState.t1Enter,
-               exit_px: mockState.t1Exit, axis_filter: mockState.t1AxisFilter };
+               exit_px: mockState.t1Exit, event_filter: mockState.t1EventFilter };
     },
     async set_t1_hysteresis(enterPx, exitPx) {
       if (enterPx == null || exitPx == null) { mockState.t1Enter = mockState.t1Exit = null; }
@@ -221,8 +270,9 @@
       }
       return mockApi.get_t1_persistence();
     },
-    async set_t1_axis_filter(mode) {
-      mockState.t1AxisFilter = mode;
+    async set_t1_event_filter(mode) {
+      if (!(mode in EVENT_FILTER_STATES)) throw new Error(`Unknown axis filter '${mode}'`);
+      mockState.t1EventFilter = mode;
       return mockApi.get_t1_persistence();
     },
     async set_t1_persistence(value) {
@@ -341,6 +391,7 @@
     async start_tracking(_mode) {
       (async () => {
         await delay(400);
+        mockState.trackingRunDriftMode = mockState.trackingCost.drift_mode;
         window.onTrackDone && window.onTrackDone({ track_count: mockState.trackNumbers.length });
       })();
       return true;
@@ -348,6 +399,35 @@
     async get_tracking_overlay(_frame, _renderMode, _showLabels, _colorMode, _identityPalette, _labelFontSize,
                                _environmentLut, _environmentDirection, _tintOthers) {
       return MOCK_PNG;
+    },
+    // Docked frame stepper (Round 16 E). The mock returns a track with a real
+    // GAP and crops that actually differ between frames -- a stepper whose
+    // frames all looked the same would make the shared-window/re-centre
+    // distinction untestable in dev mode, which is the subtle part.
+    async get_track_filmstrip(trackId) {
+      if (!mockState.trackNumbers.includes(trackId)) return { error: `Track ${trackId} not found.` };
+      const frames = mockState.frameNumbers;
+      return { track_id: trackId, frames, held: frames.filter((_, i) => i !== 2) };
+    },
+    async get_track_step_frame(trackId, anchorFrame, frame, showLabels, showOutline, labelSize,
+                               _pad, outlineColor) {
+      if (!mockState.trackNumbers.includes(trackId)) return { error: `Track ${trackId} not found.` };
+      const strip = await mockApi.get_track_filmstrip(trackId);
+      const held = strip.held.includes(frame);
+      const recentred = Math.abs(frame - anchorFrame) > 1;
+      return {
+        track_id: trackId, frame, anchor_frame: anchorFrame,
+        cell_index: held ? `Cell${frame}_3` : null, held, recentred,
+        window_note: recentred
+          ? "re-centred on this frame -- background moves, so this shows where the track goes, "
+            + "not whether it swapped"
+          : "shared window with the anchor frame -- background is fixed, so this is a true blink",
+        // Re-centred frames keep the cell still and shift the background;
+        // shared-window frames do the opposite. The mock reproduces that.
+        image: mockCrop(`f${frame}${showLabels ? "#" : ""}${showOutline ? "o" + (outlineColor || "") : ""}`,
+                        held ? "#00ff88" : "#555555",
+                        recentred ? 8 : Math.min(Math.max((frame - anchorFrame) * 6 + 8, 0), 20)),
+      };
     },
     async get_tracking_cell_at_pixel(frame, _x, _y) {
       return { cell_index: `Cell${frame}_1`, cell_id: 1, track_id: 1 };
@@ -357,30 +437,115 @@
     // the blink actually blinks in dev mode. A stub that returned one constant
     // image for both frames would make every link look correct -- which is the
     // failure the blink exists to expose.
-    async start_census(kind, frame, decoyRate, repeatRate, seed, labeller) {
+    async start_census(kind, frame, decoyRate, repeatRate, seed, labeller, mode) {
       if (!mockState.trackNumbers.length) return { error: "Track the movie before starting a census." };
       if (kind === "frame_pair" && (frame === null || frame === undefined)) {
         return { error: "A frame_pair census needs a frame number." };
       }
-      if (!["geometry_flagged", "frame_pair"].includes(kind)) {
+      if (!["geometry_flagged", "frame_pair", "environment_flagged"].includes(kind)) {
         return { error: `Unknown census kind '${kind}'.` };
       }
-      const real = kind === "frame_pair" ? 6 : 4;
+      const sessionMode = mode || "census";
+      if (!["census", "correct"].includes(sessionMode)) {
+        return { error: `Unknown census mode '${sessionMode}'; expected 'census' or 'correct'.` };
+      }
+      const real = kind === "frame_pair" ? 6 : (kind === "environment_flagged" ? 3 : 4);
+      const correcting = sessionMode === "correct";
       const queue = [];
       for (let i = 0; i < real; i += 1) {
         queue.push({ item_id: `i000${i}`, frame: mockState.frameNumbers[i % mockState.frameNumbers.length],
                      label: 10 + i, track_id: 100 + i, shown_label: 20 + i,
-                     is_decoy: i === 1, is_repeat: false, source_item_id: null });
+                     // Correction mode has NO decoys: accepting one would inject
+                     // a deliberate error into the tracking table.
+                     is_decoy: !correcting && i === 1, is_repeat: false, source_item_id: null });
       }
-      queue.push({ ...queue[0], item_id: "r0000", source_item_id: "i0000", is_repeat: true, is_decoy: false });
-      mockState.census = { queue, kind, register: mockState.trackingCost.drift_mode !== "none", labeller };
+      if (!correcting) {
+        queue.push({ ...queue[0], item_id: "r0000", source_item_id: "i0000", is_repeat: true, is_decoy: false });
+      }
+      mockState.census = { queue, kind, mode: sessionMode,
+                           register: mockState.trackingCost.drift_mode !== "none",
+                           labeller, edits: {}, undo: null };
       mockState.censusVerdicts = [];
       return { n: queue.length, n_real: real,
                n_decoys: queue.filter((e) => e.is_decoy).length,
                n_repeats: queue.filter((e) => e.is_repeat).length,
-               kind, register: mockState.census.register,
+               kind, mode: sessionMode, register: mockState.census.register,
+               // The mock reproduces the mismatch path: a session whose drift
+               // setting changed after tracking must warn, because reading the
+               // live setting to describe an existing run is how the status
+               // line came to claim a convention the run had not used.
+               tracking_drift_mode: mockState.trackingRunDriftMode ?? mockState.trackingCost.drift_mode,
+               convention_from_run: mockState.trackingRunDriftMode != null,
+               current_drift_setting: mockState.trackingCost.drift_mode,
+               setting_changed_since_tracking:
+                 mockState.trackingRunDriftMode != null
+                 && mockState.trackingRunDriftMode !== mockState.trackingCost.drift_mode,
                session_id: "devmodecensus",
-               path: "(dev mode: nothing is written to disk)" };
+               path: correcting ? null : "(dev mode: nothing is written to disk)" };
+    },
+    // The two write paths refuse each other in the mock exactly as they do in
+    // the backend. A mock that let either through would make dev-mode
+    // click-through unable to reach the constraint this whole design rests on.
+    async queue_census_edit(position, chosenLabel) {
+      const census = mockState.census;
+      if (!census) return { error: "Start a session first." };
+      if (census.mode !== "correct") {
+        return { error: "This is a census session; it cannot edit the tracking data. Its verdicts "
+                        + "judge the run as it stands -- start a correction session instead." };
+      }
+      if (position < 0 || position >= census.queue.length) {
+        return { error: `Position ${position} is outside the queue.` };
+      }
+      census.edits[position] = { chosen_label: chosenLabel === undefined ? null : chosenLabel };
+      return { pending: Object.keys(census.edits).length, position };
+    },
+    async clear_census_edit(position) {
+      const census = mockState.census;
+      if (!census) return { error: "Start a session first." };
+      delete census.edits[position];
+      return { pending: Object.keys(census.edits).length };
+    },
+    async preview_census_edits() {
+      const census = mockState.census;
+      if (!census || census.mode !== "correct") return { error: "Not a correction session." };
+      const pending = Object.keys(census.edits).length;
+      if (!pending) return { error: "No pending corrections." };
+      // A batch of 3 or more trips a check in dev mode, so the blocked path is
+      // reachable without needing real data to misbehave.
+      const messy = pending >= 3;
+      return {
+        pending,
+        double_claimed: messy ? [{ frame: 3, cell_index: "Cell3_7", tracks: [100, 101] }] : [],
+        truncated: [{ track_id: 101, lost_frames: [3], remaining: 5 }],
+        orphaned: [],
+        vanished_track_ids: [],
+        evicts: messy ? [{ evicted_track_id: 101, new_track_id: 98, from_frame: 3 }] : [],
+        takes_from: Object.entries(census.edits)
+          .filter(([, e]) => e.chosen_label !== null)
+          .map(([pos, e]) => ({ frame: Number(pos) + 1, track_id: 100, chosen_label: e.chosen_label })),
+        blocking: messy,
+      };
+    },
+    async apply_census_edits(force) {
+      const census = mockState.census;
+      if (!census) return { error: "Start a session first." };
+      if (census.mode !== "correct") return { error: "A census session cannot apply corrections." };
+      const preview = await mockApi.preview_census_edits();
+      if (preview.error) return preview;
+      if (preview.blocking && !force) {
+        return { error: "This batch would double-claim a cell or leave a track holding nothing. "
+                        + "Nothing was applied.", preview };
+      }
+      const applied = Object.keys(census.edits).length;
+      census.edits = {};
+      census.undo = true;
+      return { applied, displaced_list: [], undo_available: true, preview };
+    },
+    async undo_census_edits() {
+      const census = mockState.census;
+      if (!census || !census.undo) return { error: "Nothing to undo." };
+      census.undo = null;
+      return { restored: true };
     },
     async get_census_item(position, _pad) {
       const census = mockState.census;
@@ -398,18 +563,50 @@
         shown_label: item.shown_label, is_repeat: item.is_repeat,
         reference_iou: 0.37, tracker_iou: 0.05,
         before, after,
-        candidates: [40, 41, 42].map((label) => ({ label, image: mockCrop(`c${label}`, "#ff6b6b", 6) })),
+        // How far each source was actually searched. The real API returns it
+        // so a depth can be read from the product rather than only from a
+        // script -- Round 22 reported a list length as if it were this.
+        candidate_depth: { reference: 1, overlap: 2, coverage: 1, nearest: 1, pointed: 1 },
+        // Five candidates, so dev mode exercises PAGINATION (2 pages, not a
+        // padded 3) and the per-tile "why" labels. A three-candidate mock
+        // would leave both unreachable.
+        candidates: [
+          // Every basis spelled out the same way (Round 21 C3), and naming a
+          // PLACE rather than "the cell" / "the link" (Round 23 C3): a tile
+          // reading "12.4 px" next to one reading "18.1 px from the link"
+          // cannot be compared, because the two are measured from different
+          // origins and neither says which. `reason` and `rank` are what the
+          // real API records with the verdict (Round 23 D), so the mock must
+          // carry them or dev mode cannot exercise that path.
+          { label: 40, reason: "reference", why: "the overlap reference's pick" },
+          { label: 41, reason: "overlap", why: `IoU 0.42 with the anchor at frame ${item.frame}` },
+          { label: 42, reason: "coverage", why: `covers 61% of the anchor at frame ${item.frame}` },
+          { label: 43, reason: "nearest", why: `12.4 px from the anchor at frame ${item.frame}` },
+          { label: 44, reason: "pointed", why: "18.1 px from the tracker's answer" },
+        ].map((c, i) => ({ ...c, rank: i + 1,
+                           image: mockCrop(`c${c.label}`, "#ff6b6b", 4 + i * 3) })),
       };
     },
     async submit_census_verdict(position, verdict, chosenLabel, msElapsed) {
       const census = mockState.census;
       if (!census) return { error: "Start a census first." };
+      if (census.mode === "correct") {
+        return { error: "This is a correction session; it cannot write ground truth. Ground truth "
+                        + "collected against a tracking run is not valid for a run it corrected -- "
+                        + "start a census session instead." };
+      }
       if (!["correct", "wrong", "unjudgeable"].includes(verdict)) {
         return { error: `unknown verdict '${verdict}'; expected one of correct, wrong, unjudgeable` };
       }
+      const offered = (await mockApi.get_census_item(position)).candidates || [];
+      const picked = offered.find((c) => c.label === chosenLabel);
       mockState.censusVerdicts.push({ position, verdict, chosenLabel, msElapsed,
-                                      item: census.queue[position] });
-      return { saved: true, next: position + 1, total: census.queue.length };
+                                      item: census.queue[position],
+                                      chosen_reason: picked ? picked.reason : "",
+                                      chosen_rank: picked ? picked.rank : null });
+      return { saved: true, next: position + 1, total: census.queue.length,
+               chosen_reason: picked ? picked.reason : "",
+               chosen_rank: picked ? picked.rank : null };
     },
     async get_census_summary() {
       const rows = mockState.censusVerdicts || [];
@@ -542,6 +739,51 @@
       }
       return { stop_frame: frame + 3, reason: "settled", moves };
     },
+    // Round 16 B. The mock returns a plan that FAILS two of the three checks
+    // whenever the plan contains a take-from-another-track step, so dev-mode
+    // click-through exercises the warning path and the blocked-Apply wording.
+    // A mock that always came back clean would leave those branches unreached
+    // -- the exact way this mock has hidden two real bugs before.
+    async verify_confirmed_identity_moves(trackId, moves, gateMultiplier) {
+      if (!moves || !moves.length) return { error: "This plan has no moves to verify." };
+      const multiplier = gateMultiplier || 1.5;
+      const radius = 22.0;
+      const gate = multiplier * radius;
+      const annotated = moves.map((m) => ({
+        ...m,
+        gate_px: Math.round(gate * 100) / 100,
+        gate_fraction: m.distance == null ? null : Math.round((m.distance / gate) * 1000) / 1000,
+      }));
+      const takesFrom = moves.filter((m) => m.from_track_id !== null && m.from_track_id !== undefined);
+      const messy = takesFrom.length > 0;
+      return {
+        ok: true,
+        error: null,
+        moves: annotated,
+        double_claimed: messy
+          ? [{ frame: takesFrom[0].frame, cell_index: takesFrom[0].cell_index, tracks: [trackId, 12] }]
+          : [],
+        takes_from: takesFrom.map((m) => ({ frame: m.frame, cell_index: m.cell_index,
+                                            from_track_id: m.from_track_id, distance: m.distance })),
+        truncated: messy ? [{ track_id: 12, lost_frames: [takesFrom[0].frame], remaining: 4 }] : [],
+        orphaned: [],
+        evicts: messy ? [{ evicted_track_id: 12, new_track_id: 99, from_frame: takesFrom[0].frame }] : [],
+        vanished_track_ids: [],
+        would_apply: true,
+        blocking: messy,
+        consistency: {
+          before_unconfirmed: 6,
+          after_unconfirmed: messy ? 9 : 4,
+          delta: messy ? 3 : -2,
+          n: 240,
+          frames: moves.map((m) => m.frame - 1).concat(moves.map((m) => m.frame))
+            .filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b),
+          registered: mockState.registerReference,
+          judge: "table_link_consistency",
+          note: "Consistency under transposition -- NOT an accuracy.",
+        },
+      };
+    },
     async apply_confirmed_identity_moves(_trackId, _moves) {
       return { success: true, displaced_list: [] };
     },
@@ -570,16 +812,18 @@
           counts_persistent: mockState.t1PersistFrames > 0
             ? { 3: { gained: 1, lost: 0 } }
             : { 3: { gained: 1, lost: 0 }, 9: { gained: 1, lost: 0 } },
-          axes: [
-            { center: [20, 20], phi: 0.4, type: "gain", persistent: true },
-            { center: [40, 30], phi: 1.2, type: "loss", persistent: mockState.t1PersistFrames === 0 },
-          ],
+          // Every axis carries `state`, and one of each of the three states is
+          // present. The default filter is now `persistent` (Round 16 D), so a
+          // mock with only settled axes would make the filter look like it
+          // removes nothing -- exactly the thing the counts exist to show.
+          axes: t1MockAxes(),
           gained: 2, lost: 1,
           gained_persistent: mockState.t1PersistFrames > 0 ? 1 : 2,
           lost_persistent: 1,
           gained_unjudgeable: mockState.t1PersistFrames > 1 ? 1 : 0,
           lost_unjudgeable: 0,
           persist_frames: mockState.t1PersistFrames,
+          event_counts: t1EventCounts(t1MockAxes()),
         },
         confirmed: [], rejected: [], frame,
       };

@@ -271,16 +271,38 @@ def resolve_frame_numbers(filenames: list[str]) -> dict[str, int]:
 
 
 def list_segmentation_files(npy_folder: str) -> list[str]:
-    """List `.npy` segmentation filenames in `npy_folder`, ordered by frame
-    number and filtered to frame number >= 1. Returns filenames only (not
-    full paths), matching src/gui_main.py:970-980.
+    r"""List `.npy` segmentation filenames in `npy_folder`, ordered by frame
+    number. Returns filenames only (not full paths). **Every `.npy` in the
+    folder comes back** -- the `>= 0` test below filters nothing, because
+    `_extract_frame_number` reads its number with `re.findall(r"\d+")` and
+    can never return a negative one.
 
-    Digit-less filenames are kept (and numbered positionally by
-    `resolve_frame_numbers`) rather than dropped by the `>= 1` filter, which
-    `inf` used to pass by accident anyway."""
+    It used to read `>= 1`, copied from src/gui_main.py:970-980, where it
+    guarded against a digit-less filename falling back to `inf`. That case
+    has since been taken over by `resolve_frame_numbers`' all-or-nothing
+    positional numbering, and `inf >= 1` passed the guard anyway -- so the
+    only thing the filter still did was drop **frame 0**.
+
+    It dropped one on real data: `test_data/embryos_GBE_GAP43` numbers its
+    masks from `handCorrection0000.tif`, and `0 >= 1` is false, so that frame
+    never entered extraction, tracking or any downstream count. Silently: no
+    warning, and the frame count simply read one lower (30, not 31).
+
+    The comparison is kept rather than deleted so this docstring has
+    something to hang on, and the assertion below is the check that actually
+    matters -- all four consumers share this function, so they cannot
+    disagree with each other about a dropped frame; only the directory can."""
     npy_files = [f for f in os.listdir(npy_folder) if f.endswith(".npy")]
     frame_numbers = resolve_frame_numbers(npy_files)
-    return [f for f in frame_numbers if frame_numbers[f] >= 1]
+    kept = [f for f in frame_numbers if frame_numbers[f] >= 0]
+    if len(kept) != len(npy_files):
+        dropped = sorted(set(npy_files) - set(kept))
+        raise AssertionError(
+            "list_segmentation_files dropped %d of %d .npy file(s) in %s: %s"
+            % (len(npy_files) - len(kept), len(npy_files), npy_folder,
+               ", ".join(dropped))
+        )
+    return kept
 
 
 def detect_mask_format(mask_folder: str) -> str:
@@ -945,6 +967,128 @@ def convert_outline_coords_to_npy(
     return written_paths
 
 
+# --------------------------------------------------------------------------
+# The one place a label array is read (Round 19 D2)
+# --------------------------------------------------------------------------
+#
+# Six modules used to index `dat["masks"]` for themselves: this one,
+# `webview/api._load_frame`, `cell_tracking._FrameLabelLoader`,
+# `tracking_benchmark.load_masks`, `shape_features` and `tissue_features`.
+# Six readers is six chances to disagree about what a frame contains, and the
+# whole of Rounds 17-19 has been about inputs diverging from what a run thought
+# it read.
+#
+# A minimum-cell-area filter makes that concrete. `exclude_edge_cells` works by
+# `continue`-ing inside the per-cell loop -- it drops the ROW and leaves the
+# label in the mask, which is harmless for an edge cell. For a 1 px vertex
+# artefact it is not: every consumer downstream reads the MASK, so the label
+# survives as a fifth neighbour in `adjacency.build_neighbor_graph` (which can
+# stop the four real cells around a vertex being recorded as neighbours of one
+# another -- corrupting T1 detection exactly where T1s happen), is seen by
+# `mask_overlap_fractions`, and renders as a permanently unmatched cell.
+#
+# So the removal happens on the mask, here, once.
+
+#: Minimum area in pixels for a label to survive loading; 0 disables. Module
+#: state rather than a parameter threaded through six call sites: the property
+#: that matters is that every consumer sees the SAME labels, and six parameters
+#: would be six chances to pass a different one. Set once per project via
+#: `set_min_cell_area`.
+_MIN_CELL_AREA_PX = 0
+
+#: Chosen from the data, not from taste (Round 19 D3). On
+#: `embryos_GBE_GAP43` the three smallest labels are 2, 3 and 3 px and the next
+#: smallest is 119 px -- a 116 px gap with nothing in it. On
+#: `AS_dorsal view_E-cad` the smallest is 139 px and there are no artefacts at
+#: all. 19 is the geometric midpoint of that observed gap (sqrt(3 x 119) =
+#: 18.9): an order of magnitude above the artefacts, six times below the
+#: smallest real cell. It is a suggestion the UI offers, never a default --
+#: `_MIN_CELL_AREA_PX` ships 0.
+SUGGESTED_MIN_CELL_AREA_PX = 19
+
+
+def set_min_cell_area(area_px: int) -> int:
+    """Set the minimum label area every loader applies. 0 disables."""
+    global _MIN_CELL_AREA_PX
+    _MIN_CELL_AREA_PX = max(0, int(area_px or 0))
+    return _MIN_CELL_AREA_PX
+
+
+def get_min_cell_area() -> int:
+    return _MIN_CELL_AREA_PX
+
+
+def apply_min_cell_area(labels, area_px: Optional[int] = None):
+    """Zero out labels smaller than `area_px`. Returns `(labels, removed)`.
+
+    **Background, not a neighbour.** A 1 px vertex gap is not part of any cell,
+    and donating it to a neighbour would change that cell's measured area for
+    no gain. A background pocket this small is bridged by
+    `build_neighbor_graph`'s `dilation_px=2` anyway.
+    """
+    threshold = _MIN_CELL_AREA_PX if area_px is None else int(area_px or 0)
+    if threshold <= 0 or labels is None:
+        return labels, []
+    values, counts = np.unique(labels[labels > 0], return_counts=True)
+    small = [int(v) for v, c in zip(values, counts) if c < threshold]
+    if not small:
+        return labels, []
+    cleaned = labels.copy()
+    cleaned[np.isin(cleaned, small)] = 0
+    return cleaned, small
+
+
+def looks_filled(labels) -> bool:
+    """Is this a filled label image, or a 1-px boundary array?
+
+    Cellpose's `outlines` key is the boundary line; some older output of
+    `convert_tiff_masks_to_npy` wrote a filled array under the same name. They
+    cannot be told apart by key, so tell them apart by shape: a filled cell
+    occupies most of its bounding box, a ring occupies a thin fraction of it.
+    Checked on the largest label, which is the least noisy one.
+
+    Lived in `cell_tracking` until Round 22, where `load_label_array` needed
+    it to make its own docstring true -- it claimed the `outlines` fallback
+    was conditional on this test and did it unconditionally, so a ring array
+    could come back as if it were a label image.
+    """
+    if labels is None or not hasattr(labels, "shape") or labels.ndim != 2:
+        return False
+    values, counts = np.unique(labels[labels > 0], return_counts=True)
+    if not len(values):
+        return False
+    label = values[int(np.argmax(counts))]
+    ys, xs = np.nonzero(labels == label)
+    box = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
+    return box > 0 and (len(ys) / box) > 0.35
+
+
+def load_label_array(npy_path_or_dict, area_px: Optional[int] = None,
+                     with_removed: bool = False):
+    """**The** way to get a frame's filled label array. Every consumer goes
+    through here so they cannot disagree about what the frame contains.
+
+    Prefers `masks`; falls back to `outlines` only when that array passes
+    `looks_filled` (older `convert_tiff_masks_to_npy` output wrote a filled
+    array under that name). Returns `None` when neither key yields a filled
+    array -- a genuine boundary ring is not a label image, and filtering one
+    by area removes every label in it, which is exactly the mistake Round 21
+    made. Applies the minimum-area filter last, so the label set returned is
+    the label set every downstream step sees.
+
+    The `looks_filled` test used to be applied by `cell_tracking` only, so on
+    an old `outlines`-only file tracking filtered and extraction did not
+    (Round 22 D) -- the same split Round 21 §A fixed one branch of.
+    """
+    data = (npy_path_or_dict if isinstance(npy_path_or_dict, dict)
+            else np.load(npy_path_or_dict, allow_pickle=True).item())
+    labels = data.get("masks")
+    if labels is None and looks_filled(data.get("outlines")):
+        labels = data.get("outlines")
+    labels, removed = apply_min_cell_area(labels, area_px)
+    return (labels, removed) if with_removed else labels
+
+
 def prepare_segmentation_folder(
     mask_folder: str,
     npy_output_folder: Optional[str] = None,
@@ -1061,6 +1205,7 @@ def extract_cell_info(
     exclude_edge_cells: bool = False,
     progress_cb: Optional[Callable[[str, int], None]] = None,
     tracking_only: bool = False,
+    frames: Optional[set] = None,
 ) -> tuple[pd.DataFrame, int]:
     """Extract the 18-column geometric feature table for every cell across all
     frames in `npy_folder` (Cellpose `.npy` output, each a dict with an
@@ -1071,6 +1216,12 @@ def extract_cell_info(
     if `None`, only the DataFrame is returned (no filesystem writes).
 
     `progress_cb(message, percent)` is called once per frame if provided.
+
+    `frames`, when given, restricts extraction to those frame numbers. Every
+    column is a function of that frame's own mask alone, so the rows produced
+    are identical to the ones a whole-movie run would produce for them -- which
+    is what makes a partial re-extraction after a hand-correction exact rather
+    than approximate.
 
     `tracking_only=True` computes only the four columns
     `cell_tracking.build_cost_matrix` actually reads and leaves the rest `NaN`,
@@ -1091,9 +1242,15 @@ def extract_cell_info(
     fig_num = 0
 
     npy_files = list_segmentation_files(npy_folder)
+    frame_number_by_file = resolve_frame_numbers(npy_files)
+    # `frames` limits the work to a range without changing what is computed for
+    # the frames inside it: every column here depends only on that frame's own
+    # mask, so a range is exact rather than an approximation (Round 19 C3).
+    if frames is not None:
+        wanted = {int(f) for f in frames}
+        npy_files = [f for f in npy_files if frame_number_by_file.get(f) in wanted]
     total_files = len(npy_files)
     frame_number = 0
-    frame_number_by_file = resolve_frame_numbers(npy_files)
 
     for idx, filename in enumerate(npy_files):
         basename, ext = os.path.splitext(filename)
@@ -1105,7 +1262,38 @@ def extract_cell_info(
         # re-filling the outline ring with `cv2.fillPoly` is now measured on
         # this instead -- see `_MASK_DERIVED_NOTE`. Legacy `.npy` files written
         # before Cellpose stored `'masks'` fall back to the old reconstruction.
-        fill_labels = dat.get("masks")
+        # Through the shared loader (`load_label_array`), so extraction sees
+        # exactly the label set every other consumer sees (Round 19 D2). Round
+        # 19 wrote that comment and then called `apply_min_cell_area` directly,
+        # which is not the shared loader: on an old `outlines`-only file
+        # `dat.get("masks")` is None, so nothing was removed and nothing said
+        # so, while `cell_tracking` filtered the same file (Round 22 D).
+        #
+        # **Both arrays, and that is the whole point (Round 21 A1).** Round 19
+        # filtered only `masks` -- but the per-cell loop below enumerates
+        # `outlines`, so extraction kept emitting a row for every removed
+        # label: at a 200 px threshold on GBE the mask dropped to 261 labels
+        # while `Cells_info` still had 262 rows, and tracking, which is driven
+        # by `Cells_info`, then linked all 123 removed cells across the movie.
+        # Round 19's assertion missed it because it compared the four consumers
+        # that read `masks` and never checked extraction's own row set.
+        fill_labels, _removed_small = load_label_array(dat, with_removed=True)
+        if fill_labels is None and get_min_cell_area() > 0:
+            # Not "nothing to remove": nothing to decide ON. Say so rather
+            # than reporting a removal count of zero for this frame.
+            logger.warning(
+                "Frame %s (%s) has no filled label array (keys: %s); the "
+                "minimum-area filter of %d px could not be applied to it",
+                frame_number_by_file.get(filename), filename,
+                sorted(dat)[:6], get_min_cell_area(),
+            )
+        # The DECISION is made once, on the filled array, and then applied to
+        # both. `outlines` must not be filtered by its own pixel counts: it is
+        # a ~2-5%-of-pixels boundary ring, so an area threshold meant for
+        # filled cells removes every label (at 200 px on GBE it took all 262).
+        if _removed_small:
+            outlines = outlines.copy()
+            outlines[np.isin(outlines, _removed_small)] = 0
         height, width = outlines.shape
         fig_num += 1
         # Via `resolve_frame_numbers` rather than a private regex, so the
@@ -1404,6 +1592,141 @@ if __name__ == "__main__":
     print("  and differ by one digit, so the filename heuristic cannot see them. Only the shape")
     print("  check could, and only if the images differ in size. This informs; it is not a")
     print("  classifier, and it never blocks.")
+
+    # --- D (R19): the minimum-area filter, and its interaction with
+    # `_close_label_gaps`.
+    grid = np.zeros((40, 60), dtype=int)
+    grid[5:25, 5:25] = 1          # a real cell
+    grid[5:25, 30:50] = 2         # another
+    grid[30, 30] = 3              # a 1 px vertex artefact
+    kept, removed = apply_min_cell_area(grid, 19)
+    assert removed == [3], removed
+    assert sorted(set(kept.ravel()) - {0}) == [1, 2], sorted(set(kept.ravel()))
+    assert (kept[30, 30] == 0), "a removed label must become BACKGROUND"
+    assert int((kept == 1).sum()) == int((grid == 1).sum()), \
+        "removing an artefact must not donate its pixels to a neighbour"
+    print("\nD: a 1 px vertex artefact is removed to BACKGROUND, and the neighbouring")
+    print("  cells' areas are unchanged -- donating the pixel would move measured areas.")
+
+    # A1 (R21): the filter must remove the ROW too, not only the mask label.
+    # Round 19 filtered `masks` while the per-cell loop enumerated `outlines`,
+    # so extraction kept emitting a row for every removed label -- and tracking,
+    # which is driven by `Cells_info`, then linked all of them. And `outlines`
+    # must NOT be filtered by its own pixel counts: it is a boundary ring, so an
+    # area threshold meant for filled cells removes everything.
+    import tempfile as _tmp
+    holder = _tmp.mkdtemp()
+    filled = np.zeros((40, 90), dtype=int)
+    filled[5:25, 5:25] = 1          # 400 px
+    filled[5:25, 30:50] = 2         # 400 px
+    filled[30, 60] = 3              # 1 px artefact
+    rings = thin_label_outlines(filled)
+    np.save(os.path.join(holder, "f001_seg.npy"),
+            {"masks": filled, "outlines": rings}, allow_pickle=True)
+
+    set_min_cell_area(0)
+    all_rows, _ = extract_cell_info(holder, output_path=None)
+    set_min_cell_area(19)
+    filtered_rows, _ = extract_cell_info(holder, output_path=None)
+    set_min_cell_area(0)
+    assert len(all_rows) == 3, len(all_rows)
+    assert len(filtered_rows) == 2, (
+        "the filter must drop the ROW as well as the label: %d rows" % len(filtered_rows))
+    assert not any(str(i).endswith("_3") for i in filtered_rows.index), list(filtered_rows.index)
+    print("  the removed label loses its Cells_info ROW too, not just its mask pixels")
+    print("     (3 rows -> 2), so tracking cannot resurrect it.")
+
+    # An area threshold applied to the boundary ring would take every cell.
+    _, ring_removed = apply_min_cell_area(rings, 200)
+    assert len(ring_removed) == 3, ring_removed
+    set_min_cell_area(200)
+    survivors, _ = extract_cell_info(holder, output_path=None)
+    set_min_cell_area(0)
+    assert len(survivors) == 2, (
+        "the two 400 px cells must survive a 200 px threshold; filtering the boundary ring by "
+        "its own pixel counts would have removed all three")
+    print("     and the decision is made on the FILLED array, then applied to both:")
+    print("     at 200 px the two 400 px cells survive the ring test that would have")
+    print("     removed them (%d ring labels below 200 px)." % len(ring_removed))
+
+    off, none_removed = apply_min_cell_area(grid, 0)
+    assert off is grid and none_removed == [], "0 must be a true no-op"
+    print("  0 px is a no-op that returns the same array object, so 'off' cannot drift.")
+
+    # `_close_label_gaps` fills separator pixels up to `_MAX_GAP_FILL_PX`. It
+    # runs at TIFF->npy CONVERSION and the filter runs at LOAD, so the filter
+    # cannot be undone by it -- but assert the composition rather than argue it.
+    boundary = np.zeros_like(grid, dtype=bool)
+    boundary[:, 25:30] = True
+    closed = _close_label_gaps(kept.copy(), boundary)
+    assert closed[30, 30] == 0, (
+        "_close_label_gaps must not refill a removed artefact's pixel: that would silently "
+        "undo the removal and move a neighbour's measured area")
+    assert sorted(set(closed.ravel()) - {0}) == [1, 2], sorted(set(closed.ravel()))
+    print("  and _close_label_gaps does not refill the removed pixel afterwards.")
+
+    # --- E (R22): frame 0 enters the pipeline.
+    zero_based = _tmp.mkdtemp()
+    for f in (0, 1, 2):
+        one = np.zeros((30, 60), dtype=int)
+        one[5:20, 5:20] = 1
+        one[5:20, 30:45] = 2
+        np.save(os.path.join(zero_based, "f%04d_seg.npy" % f),
+                {"masks": one, "outlines": thin_label_outlines(one)}, allow_pickle=True)
+
+    # E1: a 0-numbered folder loses no frame.
+    listed = list_segmentation_files(zero_based)
+    assert len(listed) == 3, listed
+    assert set(resolve_frame_numbers(listed).values()) == {0, 1, 2}, \
+        resolve_frame_numbers(listed)
+    print("\nE1 (R22): a 0-numbered folder yields 3 files and frames {0, 1, 2}.")
+    print("  `>= 1` silently dropped frame 0 -- on `embryos_GBE_GAP43` that was")
+    print("  `handCorrection0000`, and the movie read as 30 frames instead of 31.")
+
+    # E2: the conservation assertion. This is the only check that can catch a
+    # dropped frame: all four consumers call `list_segmentation_files`, so they
+    # agree with each other no matter what it drops. Only the DIRECTORY
+    # disagrees. Assert it fires, and that it names the file it lost.
+    _real_resolve = resolve_frame_numbers
+    try:
+        globals()["resolve_frame_numbers"] = (
+            lambda names: {n: i for n, i in _real_resolve(names).items() if i >= 1})
+        try:
+            list_segmentation_files(zero_based)
+            raise SystemExit("E2: the conservation assertion did not fire")
+        except AssertionError as exc:
+            assert "f0000_seg.npy" in str(exc), str(exc)
+            assert "1 of 3" in str(exc), str(exc)
+    finally:
+        globals()["resolve_frame_numbers"] = _real_resolve
+    print("E2 (R22): dropping a frame raises, and the message NAMES f0000_seg.npy")
+    print("  rather than only reporting that the counts disagree.")
+
+    # E3: frame 0 really produces rows.
+    set_min_cell_area(0)
+    zero_rows, zero_frames = extract_cell_info(zero_based, output_path=None)
+    assert zero_frames == 3, zero_frames
+    assert any(str(i).startswith("Cell0_") for i in zero_rows.index), list(zero_rows.index)
+    assert len(zero_rows) == 6, len(zero_rows)
+    print("E3 (R22): extraction over that folder emits Cell0_* rows (3 frames, 6 cells).")
+
+    # E4 (R22 D): the shared loader is what decides, and a boundary ring is not
+    # a label array. Extraction used to read `dat.get("masks")` directly, so an
+    # old outlines-only file was silently left unfiltered while `cell_tracking`
+    # filtered it.
+    ring_only = _tmp.mkdtemp()
+    np.save(os.path.join(ring_only, "r0001_seg.npy"),
+            {"outlines": rings}, allow_pickle=True)
+    assert load_label_array(os.path.join(ring_only, "r0001_seg.npy")) is None, \
+        "a boundary ring must not be returned as a filled label array"
+    filled_only = _tmp.mkdtemp()
+    np.save(os.path.join(filled_only, "g0001_seg.npy"),
+            {"outlines": filled}, allow_pickle=True)
+    recovered, ring_removed_2 = load_label_array(
+        os.path.join(filled_only, "g0001_seg.npy"), 19, with_removed=True)
+    assert recovered is not None and ring_removed_2 == [3], ring_removed_2
+    print("E4 (R22 D): `load_label_array` falls back to `outlines` only when it is")
+    print("  filled -- a ring returns None, an old filled-under-outlines file filters.")
 
     print("\nAll data_input self-tests passed.")
 

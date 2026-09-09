@@ -138,24 +138,78 @@ def mask_overlap_fractions(labels1: np.ndarray, labels2: np.ndarray) -> dict:
     return overlaps
 
 
-def _looks_filled(labels) -> bool:
-    """Is this a filled label image, or a 1-px boundary array?
+def mask_coverage_fractions(labels1: np.ndarray, labels2: np.ndarray) -> dict:
+    """`{(label1, label2): |A n B| / |A|}` -- how much of each frame-1 cell each
+    frame-2 cell covers. The sibling of `mask_overlap_fractions`, normalised by
+    the FIRST cell's area only.
 
-    Cellpose's `outlines` key is the boundary line; some older output of
-    `convert_tiff_masks_to_npy` wrote a filled array under the same name. They
-    cannot be told apart by key, so tell them apart by shape: a filled cell
-    occupies most of its bounding box, a ring occupies a thin fraction of it.
-    Checked on the largest label, which is the least noisy one.
+    **Divided by `|A|`, deliberately, and not the raw intersection.** The raw
+    intersection favours big candidates: a large neighbour's absolute overlap
+    with the anchor can exceed the true successor's, purely because it has more
+    pixels to overlap with. Normalising by the anchor makes the score
+    insensitive to how big the candidate is, which is the one property IoU does
+    not have.
+
+    Where this differs from IoU, algebraically (`v2/docs/census.md` §8.8 has the
+    worked pair):
+
+    - the true successor is much **larger** than the anchor (it absorbed a
+      neighbour, or the anchor was under-segmented): IoU nearly loses the
+      ability to separate it from a same-size neighbour, coverage does not;
+    - the anchor **divides** into two smaller daughters: IoU separates the
+      daughter from a neighbour better than coverage does.
+
+    So the two fail in opposite directions, which is the argument for offering
+    both and not for replacing one with the other. It is an argument, not a
+    measurement -- which source a human actually picks is recorded per verdict
+    (`chosen_reason`), and that is what decides whether this one stays.
+
+    Only overlapping pairs appear; a missing key means 0.
     """
-    if labels is None or not hasattr(labels, "shape") or labels.ndim != 2:
-        return False
-    values, counts = np.unique(labels[labels > 0], return_counts=True)
-    if not len(values):
-        return False
-    label = values[int(np.argmax(counts))]
-    ys, xs = np.nonzero(labels == label)
-    box = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
-    return box > 0 and (len(ys) / box) > 0.35
+    stride = int(labels2.max()) + 1
+    both = (labels1 > 0) & (labels2 > 0)
+    if not both.any():
+        return {}
+    pair_key = labels1[both].astype(np.int64) * stride + labels2[both].astype(np.int64)
+    keys, counts = np.unique(pair_key, return_counts=True)
+    area1 = np.bincount(labels1.ravel())
+    coverage = {}
+    for key, intersection in zip(keys, counts):
+        a, b = int(key // stride), int(key % stride)
+        if area1[a] > 0:
+            coverage[(a, b)] = float(intersection / area1[a])
+    return coverage
+
+
+def _warn_if_overlap_unreachable(loader: "_FrameLabelLoader", npy_folder, overlap_weight,
+                                 drift_mode, entry: str) -> None:
+    """Say so when a weighted cost term has nothing to read.
+
+    The failure this exists for is not a crash: the run completes, reports
+    success, and is quietly a different tracking than the one that was asked
+    for. `CLAUDE.md` rule 7 -- check that the inputs were FOUND, not that a
+    path was supplied.
+    """
+    if loader:
+        return
+    wants_overlap = overlap_weight and overlap_weight > 0
+    wants_drift = drift_mode and drift_mode != "none"
+    if not (wants_overlap or wants_drift):
+        return
+    if npy_folder and os.path.isdir(npy_folder):
+        detail = ("%r exists but holds no .npy segmentation -- on a TIFF dataset the arrays are in "
+                  "its 'npy_converted' subfolder, not in the mask folder itself" % npy_folder)
+    else:
+        detail = "no npy_folder was given" if not npy_folder else "%r is not a directory" % npy_folder
+    wanted = []
+    if wants_overlap:
+        wanted.append("the mask-overlap term (overlap_weight=%s)" % overlap_weight)
+    if wants_drift:
+        wanted.append("drift estimation (drift_mode=%r)" % drift_mode)
+    logger.warning(
+        "%s: %s, so %s cannot be computed and this run is centroid-only. The result will differ "
+        "from the same call with the arrays reachable.", entry, detail, " and ".join(wanted),
+    )
 
 
 class _FrameLabelLoader:
@@ -174,49 +228,53 @@ class _FrameLabelLoader:
         self.npy_folder = npy_folder
         self._cache: dict = {}
         self._paths: Optional[dict] = None
+        # The minimum-area threshold this loader actually applied. Read from
+        # `data_input`'s process state at construction and REPORTED, so a run
+        # can say which threshold it used instead of leaving it to be inferred
+        # -- the dependence was previously invisible (Round 21 A2).
+        self.min_cell_area_px = data_input.get_min_cell_area()
+
+    def _resolve(self) -> dict:
+        """`{frame_number: path}`, resolved once. Empty when the folder holds
+        no segmentation arrays."""
+        if self._paths is None:
+            if not self.npy_folder or not os.path.isdir(self.npy_folder):
+                self._paths = {}
+            else:
+                files = data_input.list_segmentation_files(self.npy_folder)
+                self._paths = {
+                    number: os.path.join(self.npy_folder, name)
+                    for name, number in data_input.resolve_frame_numbers(files).items()
+                }
+        return self._paths
 
     def __bool__(self) -> bool:
-        return bool(self.npy_folder) and os.path.isdir(self.npy_folder)
+        """True when arrays were **found**, not when a path was supplied.
+
+        This used to be `isdir(npy_folder)`, and the difference has cost twice
+        (Round 15 §A1, Round 16's centroid-only baseline). A TIFF dataset's own
+        `masks/` folder holds only `.tif` -- the arrays live in
+        `masks/npy_converted/` beneath it -- so `isdir` passed, the loader then
+        found nothing, and a cost term weighted 1.0 contributed nothing while
+        the run reported success. `CLAUDE.md` rule 7 case 2.
+        """
+        return bool(self._resolve())
 
     def get(self, frame_number: int) -> Optional[np.ndarray]:
-        if not self:
-            return None
-        if frame_number in self._cache:
-            return self._cache[frame_number]
-        if self._paths is None:
-            files = data_input.list_segmentation_files(self.npy_folder)
-            self._paths = {
-                number: os.path.join(self.npy_folder, name)
-                for name, number in data_input.resolve_frame_numbers(files).items()
-            }
-            if not self._paths:
-                # A folder that EXISTS but holds no `.npy` segmentation. The
-                # `__bool__` check above passes, so the overlap term and drift
-                # estimation both silently fall back to nothing and tracking
-                # runs on centroids alone with no sign that it did. This is the
-                # real shape of it: a TIFF-mask dataset's own `masks/` folder
-                # looks exactly like a valid npy_folder from outside, and it is
-                # `npy_converted/` beneath it that actually holds the arrays.
-                logger.warning(
-                    "npy_folder %r contains no .npy segmentation, so the mask-overlap term and "
-                    "drift estimation have nothing to read and this run is centroid-only. For a "
-                    "TIFF-mask dataset the arrays live in the extractor's 'npy_converted' "
-                    "subfolder, not in the mask folder itself.", self.npy_folder,
-                )
-        path = self._paths.get(frame_number)
+        path = self._resolve().get(frame_number)
         labels = None
         if path is not None:
             try:
                 dat = np.load(path, allow_pickle=True).item()
-                if "masks" in dat:
-                    labels = dat["masks"]
-                elif _looks_filled(dat.get("outlines")):
-                    # Older output of `convert_tiff_masks_to_npy` stored one
-                    # FILLED array under 'outlines' (see `_load_frame`'s
-                    # docstring), and that array is a perfectly good label
-                    # image. Accept it only after checking it actually is one.
-                    labels = dat["outlines"]
-                else:
+                # Through the shared loader: it prefers 'masks', accepts an
+                # older `convert_tiff_masks_to_npy` file whose FILLED array sat
+                # under 'outlines' (see `_load_frame`'s docstring) only after
+                # `looks_filled` confirms it is one, and applies the same
+                # minimum-area filter extraction applies. The three-branch
+                # version that lived here was the only place that test was
+                # made, which is why extraction did not make it (Round 22 D).
+                labels = data_input.load_label_array(dat, self.min_cell_area_px)
+                if labels is None:
                     # A genuine 'outlines' array is the ~2-5%-of-pixels
                     # boundary line. Two boundary rings essentially never
                     # intersect, so every IoU came out ~0 and the overlap term
@@ -994,6 +1052,7 @@ def track_cells(
         return pd.DataFrame()
 
     label_loader = _FrameLabelLoader(npy_folder)
+    _warn_if_overlap_unreachable(label_loader, npy_folder, overlap_weight, drift_mode, "track_cells")
     # The value the old sentinel implicitly enforced as a displacement ceiling.
     radius_ceiling = cells_info["Circumscribed Circle Radius"].max()
 
@@ -1431,6 +1490,8 @@ def retrack_frame_range(
         )
 
     label_loader = _FrameLabelLoader(npy_folder)
+    _warn_if_overlap_unreachable(label_loader, npy_folder, overlap_weight, drift_mode,
+                                 "retrack_frame_range")
     links: dict[int, dict[str, str]] = {}
     previous_cells, previous_matches = None, None
     for frame in range(pair_start, pair_end + 1):
@@ -1705,6 +1766,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Standalone debug entry for v2.cell_tracking")
     parser.add_argument("--cells-info", help="Cells_info.xlsx path (omit to run the self-test)")
     parser.add_argument("--output-dir")
+    # Accepted so every module in v2/ answers the same flag. Here the self-test
+    # is what runs when `--cells-info` is omitted, so this is a no-op -- but a
+    # preflight checklist should not have to remember which modules take it and
+    # which reject it. Round 19 A1: the first real click-test lost its §0 step
+    # to exactly that.
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the self-test (the default when --cells-info is omitted)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -2150,17 +2218,31 @@ if __name__ == "__main__":
             assert "leading_edge" in str(exc), exc
         print("  A2a: a mixed-sign leading_edge raises here too, not one mixed cost matrix.")
 
-        # A1 (R15, extended): a folder that exists but holds no .npy at all.
-        # `__bool__` passes on it, so the overlap term and drift both fell back
-        # to nothing with no sign that they had -- and a TIFF dataset's own
-        # masks/ folder is exactly that shape (the arrays are in the
-        # extractor's npy_converted/ subfolder beneath it).
+        # B2 (R17): a folder that exists but holds no arrays is FALSE, not
+        # "configured". `__bool__` used to be `isdir(...)`, which passed on a
+        # TIFF dataset's own masks/ folder (the arrays are in npy_converted/
+        # beneath it) and then found nothing -- so a cost term weighted 1.0
+        # contributed nothing while the run reported success. It has cost twice.
         empty_folder = tempfile.mkdtemp()
-        empty_loader = _FrameLabelLoader(empty_folder)
-        assert bool(empty_loader), "an existing folder is still 'configured'"
-        assert empty_loader.get(1) is None
-        print("  A1: an npy_folder with no segmentation in it warns instead of")
-        print("     silently tracking on centroids alone.")
+        assert not _FrameLabelLoader(empty_folder), \
+            "a folder with no arrays must be falsy: 'path exists' is not 'inputs found'"
+        assert _FrameLabelLoader(empty_folder).get(1) is None
+        assert not _FrameLabelLoader(None), "no folder at all must be falsy"
+
+        # The exact TIFF-dataset shape: masks/ holds only .tif, and the arrays
+        # sit in masks/npy_converted/ beneath it.
+        tiff_root = tempfile.mkdtemp()
+        tiff_masks = os.path.join(tiff_root, "masks")
+        converted = os.path.join(tiff_masks, "npy_converted")
+        os.makedirs(converted)
+        open(os.path.join(tiff_masks, "frame001.tif"), "wb").close()
+        np.save(os.path.join(converted, "frame001_seg.npy"),
+                {"masks": np.ones((8, 8), dtype=int)}, allow_pickle=True)
+        assert not _FrameLabelLoader(tiff_masks), \
+            "the TIFF dataset's mask folder holds no arrays and must be falsy"
+        assert _FrameLabelLoader(converted), "npy_converted/ holds the arrays and must be truthy"
+        print("  B2: a folder that exists but holds no arrays is falsy -- including a TIFF")
+        print("     dataset's own masks/, whose arrays live in npy_converted/ beneath it.")
 
         # A4c: a frame with only `outlines` yields None, not 1-px boundaries.
         # As a fallback those gave IoU ~0 for every pair, so the overlap term
@@ -2178,6 +2260,49 @@ if __name__ == "__main__":
         loader = _FrameLabelLoader(holder)
         assert loader.get(1) is None, "a 1-px boundary array must not pass as a label image"
         assert loader.get(2) is not None, "a filled array under 'outlines' must still be used"
+        # --- B (R23): IoU and coverage fail in OPPOSITE directions.
+        # Two configurations, not one -- B and N cannot both sit over the same
+        # pixels of A in one label image, so each pair is scored on its own
+        # frame. These numbers are algebra, pinned here so the claim in
+        # `mask_coverage_fractions` and `docs/census.md` §8.8 cannot drift away
+        # from the code; they are NOT a measurement of anything.
+        anchor_a = np.zeros((60, 60), dtype=int)
+        anchor_a[10:30, 10:30] = 1                       # |A| = 400
+
+        divided = np.zeros((60, 60), dtype=int)
+        divided[10:30, 10:20] = 5                        # daughter, 200 px, inside A
+        neighbour = np.zeros((60, 60), dtype=int)
+        neighbour[10:30, 26:46] = 6                      # 400 px, overlaps A by 80
+
+        iou_d = mask_overlap_fractions(anchor_a, divided)[(1, 5)]
+        cov_d = mask_coverage_fractions(anchor_a, divided)[(1, 5)]
+        iou_n = mask_overlap_fractions(anchor_a, neighbour)[(1, 6)]
+        cov_n = mask_coverage_fractions(anchor_a, neighbour)[(1, 6)]
+        assert abs(iou_d - 0.50) < 1e-9 and abs(iou_n - 1 / 9) < 1e-9, (iou_d, iou_n)
+        assert abs(cov_d - 0.50) < 1e-9 and abs(cov_n - 0.20) < 1e-9, (cov_d, cov_n)
+        assert (iou_d / iou_n) > (cov_d / cov_n), "IoU must separate a DAUGHTER better"
+
+        small = np.zeros((60, 60), dtype=int)
+        small[10:20, 10:20] = 1                          # |A| = 100
+        grown = np.zeros((60, 60), dtype=int)
+        grown[8:23, 8:28] = 7                            # 300 px, contains A
+        side = np.zeros((60, 60), dtype=int)
+        side[10:20, 16:26] = 8                           # 100 px, overlaps A by 40
+
+        iou_g = mask_overlap_fractions(small, grown)[(1, 7)]
+        cov_g = mask_coverage_fractions(small, grown)[(1, 7)]
+        iou_s = mask_overlap_fractions(small, side)[(1, 8)]
+        cov_s = mask_coverage_fractions(small, side)[(1, 8)]
+        assert abs(iou_g - 1 / 3) < 1e-9 and abs(iou_s - 0.25) < 1e-9, (iou_g, iou_s)
+        assert abs(cov_g - 1.00) < 1e-9 and abs(cov_s - 0.40) < 1e-9, (cov_g, cov_s)
+        assert (cov_g / cov_s) > (iou_g / iou_s), "coverage must separate a GROWN successor better"
+        print("  B (R23): a daughter -- IoU %.2f vs %.2f (%.1fx), coverage %.2f vs %.2f (%.1fx);"
+              % (iou_d, iou_n, iou_d / iou_n, cov_d, cov_n, cov_d / cov_n))
+        print("     a successor 3x the anchor -- IoU %.2f vs %.2f (%.1fx), coverage %.2f vs %.2f (%.1fx)."
+              % (iou_g, iou_s, iou_g / iou_s, cov_g, cov_s, cov_g / cov_s))
+        print("     Opposite directions, which is the argument for offering BOTH.")
+        print("     Algebra, not a measurement -- `chosen_reason` is the measurement.")
+
         print("  A4c: a 1-px 'outlines' boundary loads as None (IoU over rings is ~0 for every")
         print("     pair); an older converter's FILLED array under the same key still works.")
 

@@ -887,6 +887,118 @@ def find_confirmed_identity_moves(
     return {"stop_frame": frame_number + max_frames_ahead, "reason": "reached_max_frames_ahead", "moves": moves}
 
 
+def _frames_held(tracking_data: pd.DataFrame, id_col: str) -> dict:
+    """`{track_id: [frame, ...]}` -- which frames each track actually holds."""
+    held: dict = {}
+    frame_cols = [(int(c[len("Frame"):]), c) for c in tracking_data.columns if c.startswith("Frame")]
+    for position in tracking_data.index:
+        track = int(tracking_data.at[position, id_col])
+        held[track] = sorted(
+            number for number, col in frame_cols if pd.notna(tracking_data.at[position, col])
+        )
+    return held
+
+
+def diff_report(before: pd.DataFrame, after: pd.DataFrame, protected_track_id: Optional[int] = None) -> dict:
+    """What a proposed table change would do to everything it did not intend to
+    touch: cells claimed twice, tracks that lose frames, tracks left holding
+    nothing.
+
+    Computed from a before/after pair rather than from the edit description, so
+    it applies equally to a `find_confirmed_identity_moves` plan and to a batch
+    of census corrections. `protected_track_id` is the track the change is
+    *about*, excluded from the truncation report because losing frames is what
+    it was asked to do.
+    """
+    id_col = before.columns[0]
+    before_frames = _frames_held(before, id_col)
+    after_frames = _frames_held(after, id_col)
+
+    double_claimed = []
+    for column in (c for c in after.columns if c.startswith("Frame")):
+        seen: dict = {}
+        for position in after.index:
+            value = after.at[position, column]
+            if pd.isna(value):
+                continue
+            seen.setdefault(str(value), []).append(int(after.at[position, id_col]))
+        for cell, owners in seen.items():
+            if len(owners) > 1:
+                double_claimed.append({"frame": int(column[len("Frame"):]),
+                                       "cell_index": cell, "tracks": sorted(owners)})
+
+    truncated, orphaned = [], []
+    for track, frames in before_frames.items():
+        if protected_track_id is not None and track == int(protected_track_id):
+            continue
+        now = after_frames.get(track, [])
+        if not now:
+            orphaned.append({"track_id": track, "lost_frames": frames})
+        elif len(now) < len(frames):
+            truncated.append({"track_id": track,
+                              "lost_frames": sorted(set(frames) - set(now)),
+                              "remaining": len(now)})
+
+    return {
+        "double_claimed": double_claimed,
+        "truncated": truncated,
+        "orphaned": orphaned,
+        "vanished_track_ids": sorted(set(before_frames) - set(after_frames)),
+    }
+
+
+def verify_moves_plan(tracking_data: pd.DataFrame, track_id: int, moves: list) -> dict:
+    """Would this plan double-claim a cell, truncate or orphan another track, or
+    trigger an eviction? Three yes/no answers, before `Apply` is offered.
+
+    **Answered by running the plan on a deep copy through the real writer**,
+    not by re-deriving what the writer would do. A second implementation of
+    those write semantics would drift from the first, and this module has
+    already shipped three data-destroying write paths -- a checker that models
+    the writer instead of running it would have agreed with every one of them.
+
+    - `double_claimed` -- cells held by two tracks at one frame afterwards.
+      `add_tracking_id` had no dedup until Round 15 §A3, and
+      `_claim_owners_at_frame` silently keeps whichever row it reaches last.
+    - `takes_from` -- every step with `from_track_id is not None`. This is the
+      only destructive action a plan can contain, and in the UI it currently
+      looks identical to a plain attach.
+    - `truncated` / `orphaned` -- tracks that lose frames, and tracks left
+      holding nothing at all.
+    - `evicts` -- steps that trigger `_evict_future_if_colliding`. It takes a
+      `to_frame` bound now, but it still **has no clean inverse**: it relocates
+      a third track's whole future onto a fresh id. Any plan that triggers it
+      must go through a whole-table snapshot.
+
+    Nothing is written: `tracking_data` is untouched, which the self-test
+    asserts.
+    """
+    trial = tracking_data.copy(deep=True)
+    try:
+        trial, displaced_list = apply_confirmed_identity_moves(trial, int(track_id), moves)
+    except ValueError as error:
+        return {"ok": False, "error": str(error), "double_claimed": [], "takes_from": [],
+                "truncated": [], "orphaned": [], "evicts": [], "vanished_track_ids": [],
+                "would_apply": False}
+
+    structural = diff_report(tracking_data, trial, protected_track_id=int(track_id))
+
+    takes_from = [
+        {"frame": int(m["frame"]), "cell_index": m["cell_index"],
+         "from_track_id": int(m["from_track_id"]), "distance": m.get("distance")}
+        for m in moves if m.get("from_track_id") is not None
+    ]
+
+    return {
+        "ok": True,
+        "error": None,
+        **structural,
+        "takes_from": takes_from,
+        "evicts": displaced_list,
+        "would_apply": True,
+    }
+
+
 def apply_confirmed_identity_moves(tracking_data: pd.DataFrame, track_id: int, moves: list) -> tuple:
     """Apply a `moves` plan from `find_confirmed_identity_moves`: for each
     move, writes its `cell_index` into `track_id`'s row at `frame`, clearing
@@ -1076,13 +1188,23 @@ def suggest_match_candidates(
     Raises `ValueError` if `selected_cell_index` doesn't belong to
     `frame_number`, or if its position can't be resolved at all (missing
     from both `cells_info` and the mask). Returns `[]` (not an error) if
-    `frame_number <= 1` (nothing precedes it) or no track is orphaned there.
+    nothing precedes `frame_number` in `tracking_data`, or if no track is
+    orphaned there.
+
+    "Nothing precedes it" is decided by asking `tracking_data` whether it
+    holds a `Frame{n-1}` column, not by comparing against a hardcoded first
+    frame. This read `frame_number <= 1` until Round 22 let frame 0 into the
+    pipeline: on a 0-numbered dataset frame 1 *does* have a predecessor, and
+    the old test silently reported every orphaned track there as "no
+    candidates" -- the one frame where a track first goes missing is exactly
+    where the correction UI is most needed. Writing it as `<= 0` would only
+    have moved the same assumption down by one.
     """
     if not selected_cell_index.startswith(f"Cell{frame_number}_"):
         raise ValueError(
             f"selected_cell_index {selected_cell_index!r} does not belong to frame {frame_number}."
         )
-    if frame_number <= 1:
+    if f"Frame{frame_number - 1}" not in tracking_data.columns:
         return []
 
     cells_info_indexed = cells_info.set_index("Cell Index")
@@ -1108,8 +1230,6 @@ def suggest_match_candidates(
 
     prev_frame = frame_number - 1
     prev_col, cur_col = f"Frame{prev_frame}", f"Frame{frame_number}"
-    if prev_col not in tracking_data.columns:
-        return []
 
     id_col = tracking_data.columns[0]
     has_prev = tracking_data[prev_col].notna()
@@ -1366,6 +1486,33 @@ if __name__ == "__main__":
         frame_number=1, selected_cell_index="Cell1_5", fill_labels_by_frame=lambda f: None,
     )
     assert empty_suggestions == [], empty_suggestions  # frame 1 has nothing preceding it
+
+    # R22: on a 0-numbered movie, frame 1 DOES have a predecessor. The old
+    # `frame_number <= 1` guard returned [] here, so every orphaned track at
+    # frame 1 looked like "no candidates" -- silently, and on the one frame
+    # where a track first goes missing.
+    zero_info = pd.DataFrame({
+        "Cell Index": ["Cell0_10", "Cell0_11", "Cell1_99"],
+        "Center X Coordinate": [1.0, 50.0, 2.0],
+        "Center Y Coordinate": [1.0, 50.0, 2.0],
+    })
+    zero_tracking = pd.DataFrame({
+        "Index": [1, 2],
+        "Frame0": ["Cell0_10", "Cell0_11"],
+        "Frame1": [None, None],
+    })
+    zero_suggestions = suggest_match_candidates(
+        zero_info, zero_tracking, frame_number=1, selected_cell_index="Cell1_99",
+        fill_labels_by_frame=lambda f: None,
+    )
+    assert [x["track_id"] for x in zero_suggestions] == [1, 2], zero_suggestions
+    print("R22: frame 1 of a 0-numbered movie offers its frame-0 orphans "
+          "(%d candidates); `frame_number <= 1` returned none." % len(zero_suggestions))
+    # And "nothing precedes it" is still answered by the table, one frame down.
+    assert suggest_match_candidates(
+        zero_info, zero_tracking[["Index", "Frame0"]], frame_number=0,
+        selected_cell_index="Cell0_10", fill_labels_by_frame=lambda f: None,
+    ) == [], "frame 0 itself still has nothing before it"
 
     try:
         suggest_match_candidates(
@@ -1837,6 +1984,59 @@ if __name__ == "__main__":
     assert settled == "Cell5_A", out.to_string()
     print("B1: the frame the walk settled on survives the moves:", settled)
     print("  -> all three went through `_evict_future_if_colliding`, which has no inverse.")
+
+    # --- B1 (R16): verify a moves plan BEFORE Apply. One constructed plan of
+    # each kind, and the live table must be untouched by the check itself.
+    def _plan_table():
+        return pd.DataFrame({
+            "Index": [1, 2, 3],
+            "Frame1": ["Cell1_1", "Cell1_2", "Cell1_3"],
+            "Frame2": [None, "Cell2_2", "Cell2_3"],
+            "Frame3": [None, "Cell3_2", None],
+        })
+
+    # (a) double claim: track 3 keeps Cell2_3 because the plan does not name it
+    #     as the source, so two rows end up holding it at frame 2.
+    table = _plan_table()
+    before = table.copy(deep=True)
+    report = verify_moves_plan(table, 1, [{"frame": 2, "cell_index": "Cell2_3",
+                                           "from_track_id": None, "distance": 3.1}])
+    assert report["double_claimed"], report
+    assert report["double_claimed"][0]["tracks"] == [1, 3], report["double_claimed"]
+    assert table.astype(str).equals(before.astype(str)), "verifying must not mutate the table"
+    print("\nB1 (R16): a plan that would leave Cell2_3 claimed by tracks %s is flagged,"
+          % report["double_claimed"][0]["tracks"])
+    print("  and the live table is byte-identical afterwards.")
+
+    # (b) orphan: naming track 3 as the source takes its only remaining frame.
+    table = _plan_table()
+    table.at[2, "Frame1"] = None          # track 3 now holds frame 2 only
+    report = verify_moves_plan(table, 1, [{"frame": 2, "cell_index": "Cell2_3",
+                                           "from_track_id": 3, "distance": 3.1}])
+    assert not report["double_claimed"], report
+    assert [o["track_id"] for o in report["orphaned"]] == [3], report["orphaned"]
+    assert [t["from_track_id"] for t in report["takes_from"]] == [3], report["takes_from"]
+    print("  a step that takes track 3's last cell is reported as orphaning it,")
+    print("  and as the plan's only destructive step.")
+
+    # (c) eviction: track 1 already holds a DIFFERENT cell at the move's frame,
+    #     so `_evict_future_if_colliding` fires -- and it has no clean inverse.
+    table = _plan_table()
+    table.at[0, "Frame2"] = "Cell2_9"
+    report = verify_moves_plan(table, 1, [{"frame": 2, "cell_index": "Cell2_2",
+                                           "from_track_id": 2, "distance": 2.0}])
+    assert report["evicts"], report
+    print("  a step that collides with track 1's own claim reports the eviction")
+    print("     (%d relocation(s)) rather than letting Apply discover it."
+          % len(report["evicts"]))
+
+    # (d) a clean plan flags nothing.
+    table = _plan_table()
+    report = verify_moves_plan(table, 1, [{"frame": 2, "cell_index": "Cell2_2",
+                                           "from_track_id": 2, "distance": 2.0}])
+    assert not report["double_claimed"] and not report["orphaned"] and not report["evicts"], report
+    assert report["truncated"] and report["truncated"][0]["track_id"] == 2, report["truncated"]
+    print("  a clean plan flags nothing but still reports that track 2 loses a frame.")
 
     # --- A4 (R15): a mask that will not load is not a track that ended.
     ma_tracks = pd.DataFrame({"Index": [1, 2],

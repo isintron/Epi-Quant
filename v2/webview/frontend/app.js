@@ -278,6 +278,10 @@ async function handleStartExtraction() {
   document.getElementById("extract-progress-bar").style.display = "block";
   setStatus("extract-status", "Starting extraction…");
 
+  // Applied on `data_input` before extraction starts, so every loader in the
+  // run sees the same label set (Round 19 D2).
+  const minArea = parseInt(document.getElementById("min-cell-area-input").value, 10) || 0;
+  await window.EpiQuantAPI.set_min_cell_area(minArea);
   await window.EpiQuantAPI.start_extraction(maskType, bgRatio, excludeEdge);
 }
 
@@ -300,7 +304,26 @@ async function onExtractDone(data) {
   state.frameCount = data.frame_count;
   state.frameNumbers = await window.EpiQuantAPI.get_frame_numbers();
   state.extractFrame = state.frameNumbers[0] ?? 1;
-  setStatus("extract-status", `Done: ${data.frame_count} frames, ${data.cell_count} cells extracted.`, "success");
+  // Report the removals, per frame and as a total. A filter whose removals
+  // cannot be seen cannot be judged too aggressive (Round 19 D4) — the same
+  // rule as the T1 event filter and the junction-length minimum.
+  let removalNote = "";
+  const removed = await window.EpiQuantAPI.get_min_area_removals();
+  if (removed && removed.total > 0) {
+    const perFrame = Object.entries(removed.by_frame)
+      .map(([f, n]) => `frame ${f}: ${n}`).join(", ");
+    removalNote = ` ${removed.total} cell(s) below ${removed.min_cell_area_px} px removed `
+      + `from the masks (${perFrame}).`;
+  } else if (removed && removed.min_cell_area_px > 0) {
+    removalNote = ` No cell fell below ${removed.min_cell_area_px} px.`;
+  }
+  // "Not measured" is not "nothing removed" (Round 22 §D).
+  if (removed && (removed.unreadable_frames || []).length) {
+    removalNote += ` Frame(s) ${removed.unreadable_frames.join(", ")} hold no filled`
+      + ` label array, so the filter could not be applied there.`;
+  }
+  setStatus("extract-status",
+    `Done: ${data.frame_count} frames, ${data.cell_count} cells extracted.${removalNote}`, "success");
   document.getElementById("start-extraction-btn").disabled = false;
   document.getElementById("extract-preview").style.display = "block";
   document.getElementById("extract-next-choices").style.display = "flex";
@@ -1106,12 +1129,32 @@ async function refreshRegistrationStatus() {
   if (!el) return;
   const r = await window.EpiQuantAPI.get_registration_status();
   if (!r) { el.textContent = ""; return; }
+  // Lead with the DECISION in plain terms; the arithmetic goes in the popover.
+  // `ratio` and `threshold` are internals of `registration_decision` — a user
+  // reading them cannot tell whether anything is wrong or what to do about it
+  // (Round 19 B3).
+  const px = Math.round(r.median_drift_px);
+  const share = r.median_cell_radius_px
+    ? r.median_drift_px / (2 * r.median_cell_radius_px) : 0;
+  const size = share >= 0.5 ? "more than half a cell width"
+    : share >= 0.25 ? "about a quarter of a cell width"
+    : "a small fraction of a cell width";
   el.textContent = r.register
-    ? `Tissue drift ${r.median_drift_px} px per frame against a ${r.median_cell_radius_px} px cell radius `
-      + `(ratio ${r.ratio}, threshold ${r.threshold}) — the agreement reference `
-      + `${r.applied ? "is" : "would be"} computed on registered masks.`
-    : `Tissue drift ${r.median_drift_px} px per frame against a ${r.median_cell_radius_px} px cell radius `
-      + `(ratio ${r.ratio}, below the ${r.threshold} threshold) — no registration needed.`;
+    ? `The tissue drifts about ${px} px per frame — ${size} — so registration is on, `
+      + `and the agreement reference ${r.applied ? "is" : "would be"} measured on registered masks too.`
+    : `The tissue drifts about ${px} px per frame — ${size} — small enough that registration `
+      + `is not needed here.`;
+  const help = document.getElementById("drift-help-btn");
+  if (help) {
+    help.style.display = "inline-block";
+    const body = document.getElementById("drift-help-numbers");
+    if (body) {
+      body.textContent =
+        `Measured: ${r.median_drift_px} px median drift / ${r.median_cell_radius_px} px median cell `
+        + `radius = ${r.ratio}, against a threshold of ${r.threshold}. Registration is `
+        + `${r.register ? "on" : "off"} and ${r.applied ? "applied" : "not applied"}.`;
+    }
+  }
 }
 
 // Both totals, always. The persistence filter never hides an event, so the
@@ -1132,14 +1175,24 @@ async function refreshT1Counts() {
   // enough movie left to check -- folding it into either of the other two
   // would claim a verdict that was never reached.
   const hold = events.persist_frames;
+  // What the filter removes from the drawing, always shown next to it. The
+  // default is `persistent` (Round 16 D), and since Round 17 C3 the filter
+  // hides the cell FILL as well as the axis -- so this line has to say "T1s
+  // shown", not "axes drawn", or it understates what disappeared.
+  const shownCounts = events.event_counts;
+  const axisNote = shownCounts
+    ? ` T1s drawn ${shownCounts.shown} of ${shownCounts.total} ` +
+      `(${shownCounts.filtered} hidden by "${shownCounts.filter}", ` +
+      `${shownCounts.unjudgeable} can't judge) — cell and axis together.`
+    : "";
   if (hold > 0) {
     readout.textContent =
       `T1 this frame: raw ${events.gained} gained / ${events.lost} lost; ` +
       `settled ${events.gained_persistent} / ${events.lost_persistent} after ${hold} frame(s); ` +
-      `can't judge ${events.gained_unjudgeable || 0} / ${events.lost_unjudgeable || 0}.`;
+      `can't judge ${events.gained_unjudgeable || 0} / ${events.lost_unjudgeable || 0}.` + axisNote;
   } else {
     readout.textContent =
-      `T1 this frame: ${events.gained} gained / ${events.lost} lost (no persistence filter).`;
+      `T1 this frame: ${events.gained} gained / ${events.lost} lost (no persistence filter).` + axisNote;
   }
 }
 
@@ -1191,6 +1244,7 @@ async function showCorrectTrackFrame(frame) {
   // Same shape as the `_qc_scores` / `_qc_display` clobber from an earlier
   // round: two paths writing one piece of state, ordering decided by timing.
   flushCorrectTrackDwell();
+  closeTrackStepper();
   state.correctTrackFrame = frame;
   state.correctTrackShownFrame = frame;
   state.correctTrackShownAt = Date.now();
@@ -1206,6 +1260,123 @@ async function showCorrectTrackFrame(frame) {
   await refreshCorrectTrackImage();
 }
 
+// --- Docked frame stepper (Round 16 E) ------------------------------------
+//
+// The reported problem: after clicking a cell to edit it, the UI could only
+// render that frame -- stepping forward or back lost the selection. This panel
+// walks the selected track's frames on its own. It never writes
+// `state.correctTrackFrame` and never touches `state.selectedTrackCell`, which
+// is the whole point and is asserted in the click-through.
+const stepperState = { trackId: null, anchor: null, frame: null, held: [], frames: [] };
+
+function stepperVisible() {
+  return !document.getElementById("track-stepper").hidden;
+}
+
+// C2c (R17): the inset can be switched off without deselecting the cell.
+// Default on; the choice survives re-selection for the rest of the session
+// (deliberately not persisted to disk -- it is a view preference, not a
+// setting anything downstream reads).
+function insetEnabled() {
+  const box = document.getElementById("enable-inset-checkbox");
+  return !box || box.checked;
+}
+
+async function openTrackStepper(trackId, anchorFrame) {
+  if (!insetEnabled()) {
+    closeTrackStepper();
+    return;
+  }
+  stepperState.trackId = trackId;
+  stepperState.anchor = anchorFrame;
+  stepperState.frame = anchorFrame;
+  // Both toggles start from the main view's current setting, so the panel
+  // opens showing what the user is already looking at.
+  document.getElementById("track-stepper-labels").checked =
+    document.getElementById("correct-track-show-labels").checked;
+  // Deliberately NOT synced from the main view's render mode: the inset's
+  // outlines start off regardless (Round 19 B2a).
+  const strip = await window.EpiQuantAPI.get_track_filmstrip(trackId);
+  if (strip && strip.error) {
+    closeTrackStepper();
+    return;
+  }
+  stepperState.frames = strip.frames || [];
+  stepperState.held = strip.held || [];
+  document.getElementById("track-stepper").hidden = false;
+  document.getElementById("track-stepper-title").textContent =
+    `Track #${trackId} — ${stepperState.held.length} of ${stepperState.frames.length} frames`;
+  renderFilmstrip();
+  await showStepperFrame(anchorFrame);
+}
+
+function closeTrackStepper() {
+  document.getElementById("track-stepper").hidden = true;
+  stepperState.trackId = null;
+}
+
+function renderFilmstrip() {
+  const strip = document.getElementById("track-stepper-filmstrip");
+  strip.innerHTML = "";
+  const held = new Set(stepperState.held);
+  stepperState.frames.forEach((frame) => {
+    const tick = document.createElement("span");
+    if (held.has(frame)) tick.classList.add("held");
+    if (frame === stepperState.frame) tick.classList.add("current");
+    tick.title = `Frame ${frame}${held.has(frame) ? "" : " — no cell"}`;
+    tick.addEventListener("click", () => showStepperFrame(frame));
+    strip.appendChild(tick);
+  });
+}
+
+async function showStepperFrame(frame) {
+  if (stepperState.trackId === null) return;
+  const mainFrameBefore = state.correctTrackFrame;
+  const result = await window.EpiQuantAPI.get_track_step_frame(
+    stepperState.trackId, stepperState.anchor, frame,
+    document.getElementById("track-stepper-labels").checked,
+    document.getElementById("track-stepper-outline").checked,
+    parseInt(document.getElementById("correct-track-label-size-input").value, 10) || 10,
+    28,
+    document.getElementById("track-stepper-outline-color").value);
+  if (result && result.error) {
+    document.getElementById("track-stepper-window-note").textContent = result.error;
+    return;
+  }
+  stepperState.frame = frame;
+  document.getElementById("track-stepper-img").src = result.image;
+  document.getElementById("track-stepper-frame").textContent =
+    `${frameLabel(frame)}${result.held ? "" : " — no cell"}`;
+  // Which of the two questions this crop is answering. Never silent: a
+  // re-centred crop holds the cell still and moves the background, which is
+  // right for "where does this track go" and wrong for "did it swap".
+  document.getElementById("track-stepper-window-note").textContent =
+    (result.recentred ? "⤢ " : "▣ ") + result.window_note;
+  renderFilmstrip();
+  // The main view must not have moved. Kept as an assertion in the code
+  // because "stepping loses the selection" is the bug this panel exists for.
+  if (state.correctTrackFrame !== mainFrameBefore) {
+    console.error("the stepper moved the main view; that is the bug it exists to avoid");
+  }
+}
+
+function stepTrackStepper(delta) {
+  const frames = stepperState.frames;
+  const index = frames.indexOf(stepperState.frame);
+  const next = frames[Math.min(Math.max(index + delta, 0), frames.length - 1)];
+  if (next !== undefined && next !== stepperState.frame) showStepperFrame(next);
+}
+
+// Returns true when it consumed the key. See `dispatchKey` for the ownership
+// rule -- this function no longer decides for itself whether it is allowed to
+// run, which is what used to make the arrows die (Round 19 B2b).
+function stepperKeyDown(event) {
+  if (event.key === "Escape") { closeTrackStepper(); return true; }
+  if (event.key === "ArrowLeft") { stepTrackStepper(-1); return true; }
+  if (event.key === "ArrowRight") { stepTrackStepper(1); return true; }
+  return false;
+}
+
 // --- Ground-truth census (Round 15 C1/C2) ---------------------------------
 //
 // One link per judgment, keyboard-driven, auto-advancing. The blink is the
@@ -1216,6 +1387,10 @@ async function showCorrectTrackFrame(frame) {
 const censusState = {
   active: false, position: 0, total: 0, item: null,
   shownAt: 0, blinking: false, awaitingCandidate: false,
+  // "census" records verdicts and never touches the tracking data;
+  // "correct" queues edits and never writes ground truth (Round 16 C2).
+  mode: "census", pending: 0,
+  candidatePage: 0,
 };
 
 function censusShow(which) {
@@ -1244,35 +1419,80 @@ async function loadCensusItem(position) {
   censusState.position = position;
   censusState.total = item.total;
   censusState.awaitingCandidate = false;
+  censusState.candidatePage = 0;
   censusState.shownAt = Date.now();
   document.getElementById("census-candidates").style.display = "none";
   document.getElementById("census-candidates").innerHTML = "";
   censusShow("before");
   const ious = (item.reference_iou === null || item.reference_iou === undefined)
     ? "" : ` (this link overlaps ${item.tracker_iou}; the reference's pick overlaps ${item.reference_iou})`;
+  const pendingNote = censusState.mode === "correct" && censusState.pending
+    ? ` — ${censusState.pending} correction(s) pending` : "";
   setStatus("census-progress",
     `${position + 1} of ${item.total} — frame ${item.frame} cell ${item.label}` +
-    `${item.track_id === null ? "" : `, track #${item.track_id}`}${ious}`, "");
+    `${item.track_id === null ? "" : `, track #${item.track_id}`}${ious}${pendingNote}`, "");
 }
 
 async function handleStartCensus() {
   const kind = document.getElementById("census-kind-select").value;
+  const mode = document.getElementById("census-mode-select").value;
   const frame = parseInt(document.getElementById("census-frame-input").value, 10);
   const labeller = document.getElementById("census-labeller-input").value;
   setStatus("census-status", "Building the queue…", "");
   const started = await window.EpiQuantAPI.start_census(
-    kind, kind === "frame_pair" ? frame : null, 0.15, 0.10, 0, labeller);
+    kind, kind === "frame_pair" ? frame : null, 0.15, 0.10, 0, labeller, mode);
   if (started && started.error) {
     setStatus("census-status", started.error, "error");
     return;
   }
   censusState.active = true;
+  censusState.mode = started.mode || mode;
+  censusState.pending = 0;
   document.getElementById("census-panel").style.display = "block";
-  setStatus("census-status",
-    `${started.n_real} links to judge (${started.n} items including the hidden checks). ` +
-    `Overlap reference computed on ${started.register ? "registered" : "unregistered"} masks — ` +
-    `the same convention this tracking used. Saving to ${started.path}`, "success");
+  document.getElementById("census-apply-report").innerHTML = "";
+  // Undo `finishCensusPanel`: a new queue gets the per-item controls back.
+  for (const id of ["census-correct-btn", "census-wrong-btn", "census-unjudgeable-btn"]) {
+    document.getElementById(id).style.display = "inline-block";
+  }
+  document.getElementById("census-image").style.display = "block";
+  const correcting = censusState.mode === "correct";
+  document.getElementById("census-apply-btn").style.display = correcting ? "inline-block" : "none";
+  document.getElementById("census-undo-btn").style.display = "none";
+  document.getElementById("census-summary-btn").style.display = correcting ? "none" : "inline-block";
+  document.getElementById("census-correct-btn").textContent =
+    correcting ? "J — leave as is" : "J — correct";
+  // The convention, and what it costs. The queue size is a property of the
+  // tracking run, not of the UI: on GBE, both sides unregistered gives 255
+  // items and both registered gives 25 — the same movie, 10x apart. Say why
+  // the number is what it is instead of shrinking it (Round 18 D1).
+  const conv = started.register ? "registered" : "unregistered";
+  const comparison = started.register
+    ? ""
+    : ` This tracking ran without registration; with drift_mode="mask" the same set is far smaller` +
+      ` (measured on GBE: 255 items unregistered vs 25 registered).`;
+  const drifted = started.setting_changed_since_tracking
+    ? ` ⚠ The drift setting is now "${started.current_drift_setting}" but this tracking ran` +
+      ` "${started.tracking_drift_mode}" — the queue follows the run, not the setting.`
+    : "";
+  setStatus("census-status", correcting
+    ? `${started.n_real} links to review. Corrections are held as pending and applied in one ` +
+      `batch — nothing is written to ground truth in this mode. Reference computed on ` +
+      `${conv} masks, matching the tracking run.${comparison}${drifted}`
+    : `${started.n_real} links to judge (${started.n} items including the hidden checks). ` +
+      `Overlap reference computed on ${conv} masks — the convention this tracking run used.` +
+      `${comparison}${drifted} Saving to ${started.path}`, "success");
   await loadCensusItem(0);
+}
+
+// Pages of three (Round 20 C2). Even with a correct ranking the answer is
+// sometimes fourth, so `4` cycles. Digits mean THE TILE IN THAT POSITION, not
+// an absolute index — the tiles are labelled 1–3 on every page.
+const CANDIDATES_PER_PAGE = 3;
+
+function censusPageCount() {
+  const n = ((censusState.item && censusState.item.candidates) || []).length;
+  // ceil(n / 3) on the REAL length: 5 candidates is two pages, not a padded three.
+  return Math.max(1, Math.ceil(n / CANDIDATES_PER_PAGE));
 }
 
 function beginCensusWrong() {
@@ -1282,74 +1502,284 @@ function beginCensusWrong() {
     return;
   }
   censusState.awaitingCandidate = true;
+  censusState.candidatePage = 0;
+  renderCensusCandidates();
+}
+
+function renderCensusCandidates() {
+  const candidates = (censusState.item && censusState.item.candidates) || [];
+  const pages = censusPageCount();
+  const page = ((censusState.candidatePage % pages) + pages) % pages;
+  censusState.candidatePage = page;
+  const start = page * CANDIDATES_PER_PAGE;
+  const shown = candidates.slice(start, start + CANDIDATES_PER_PAGE);
+
   const box = document.getElementById("census-candidates");
-  box.innerHTML = "<span class=\"hint\">Which cell is it? 1–3, or 0 for none of these.</span>";
-  candidates.forEach((candidate, i) => {
+  box.innerHTML = "";
+  const hint = document.createElement("span");
+  hint.className = "hint";
+  // Round 20 read the list LENGTH as a signal — short meant the rankings
+  // agreed, long meant they disagreed. That reading died with Round 22 §F:
+  // the two hardcoded depths of 4 were what made the length vary (3–6), and
+  // with `limit=12` actually binding, GBE's environment queue is 11 or 12 long
+  // on 109 of 109 items and `AS_dorsal`'s on 54 of 55. A phrase that fires on
+  // every item is not a signal, so it is gone rather than always-on.
+  hint.textContent =
+    `Which cell is it? 1–${shown.length}` +
+    (pages > 1 ? `, 4 for the next page` : "") + ", or 0 for none of these. " +
+    `Showing ${start + 1}–${start + shown.length} of ${candidates.length}.`;
+  box.appendChild(hint);
+
+  // Tiles in their own row, so the question above them and the buttons below
+  // them are not flex siblings of the tiles (Round 21 B).
+  const tiles = document.createElement("div");
+  tiles.className = "census-tiles";
+  shown.forEach((candidate, i) => {
     const wrap = document.createElement("div");
     wrap.className = "census-candidate";
     const img = document.createElement("img");
     img.src = candidate.image;
     const caption = document.createElement("span");
     caption.textContent = `${i + 1} — cell ${candidate.label}`;
+    // The evidence on its OWN line (Round 23 C1): `1 — cell 40 (44.6 px from
+    // the tracker's answer)` on one line puts the choice and its justification
+    // in one run of text, and the tile is narrow, so it wrapped mid-phrase.
+    // Why it was offered still matters — three implausible tiles should tell
+    // the user whether the ranking is off or the cell genuinely left the field.
+    const why = document.createElement("span");
+    why.className = "census-candidate-why";
+    why.textContent = candidate.why || "";
     wrap.appendChild(img); wrap.appendChild(caption);
+    if (candidate.why) wrap.appendChild(why);
     wrap.addEventListener("click", () => submitCensus("wrong", candidate.label));
-    box.appendChild(wrap);
+    tiles.appendChild(wrap);
   });
+  box.appendChild(tiles);
+
+  const actions = document.createElement("div");
+  actions.className = "census-candidate-actions";
+  if (pages > 1) {
+    const more = document.createElement("button");
+    more.className = "secondary-btn";
+    more.textContent = `4 — more (page ${page + 1} of ${pages})`;
+    more.addEventListener("click", () => { censusState.candidatePage += 1; renderCensusCandidates(); });
+    actions.appendChild(more);
+  }
   const none = document.createElement("button");
   none.className = "secondary-btn";
   none.textContent = "0 — none of these";
   none.addEventListener("click", () => submitCensus("wrong", null));
-  box.appendChild(none);
+  actions.appendChild(none);
+  box.appendChild(actions);
   box.style.display = "flex";
 }
 
 async function submitCensus(verdict, chosenLabel = null) {
   if (!censusState.active || !censusState.item) return;
   const elapsed = Date.now() - censusState.shownAt;
+  const position = censusState.position;
+
+  // Correction mode never calls `submit_census_verdict` — the backend refuses
+  // it, and relying on that refusal rather than on this branch is the point:
+  // the two write paths must not depend on the UI to stay apart.
+  if (censusState.mode === "correct") {
+    if (verdict === "wrong") {
+      const queued = await window.EpiQuantAPI.queue_census_edit(position, chosenLabel);
+      if (queued && queued.error) {
+        setStatus("census-status", queued.error, "error");
+        return;
+      }
+      censusState.pending = queued.pending;
+    }
+    await advanceCensus(position + 1);
+    return;
+  }
+
   const result = await window.EpiQuantAPI.submit_census_verdict(
-    censusState.position, verdict, chosenLabel, elapsed);
+    position, verdict, chosenLabel, elapsed);
   if (result && result.error) {
     setStatus("census-status", result.error, "error");
     return;
   }
-  if (result.next >= result.total) {
-    censusState.active = false;
-    document.getElementById("census-panel").style.display = "none";
-    setStatus("census-status", `Census complete — ${result.total} items.`, "success");
-    await handleCensusSummary();
-    return;
-  }
-  await loadCensusItem(result.next);
+  await advanceCensus(result.next);
 }
 
-function handleCensusKeyDown(event) {
-  if (!censusState.active) return;
-  const tag = (event.target.tagName || "").toLowerCase();
-  if (tag === "input" || tag === "textarea" || tag === "select") return;
+async function advanceCensus(next) {
+  if (next >= censusState.total) {
+    // A COMPLETED state, not a hidden panel. `#census-apply-btn` lives inside
+    // `#census-panel`, so hiding the panel at the end of a correction queue
+    // took the Apply button with it: the work was done and there was no way to
+    // commit it (Round 19 C1). A correction session must end at the control
+    // that commits it.
+    censusState.active = false;
+    finishCensusPanel();
+    if (censusState.mode === "correct") {
+      setStatus("census-status",
+        `Reviewed all ${censusState.total} items — ${censusState.pending} correction(s) pending. ` +
+        "Nothing has been written yet — press Apply to commit them.", "success");
+      if (censusState.pending) await handlePreviewCensusEdits();
+    } else {
+      setStatus("census-status", `Census complete — ${censusState.total} items.`, "success");
+      await handleCensusSummary();
+    }
+    return;
+  }
+  await loadCensusItem(next);
+}
+
+// The queue is done: hide the per-item controls, keep the panel and the
+// controls that COMMIT the work.
+function finishCensusPanel() {
+  document.getElementById("census-panel").style.display = "block";
+  for (const id of ["census-correct-btn", "census-wrong-btn", "census-unjudgeable-btn"]) {
+    document.getElementById(id).style.display = "none";
+  }
+  document.getElementById("census-image").style.display = "none";
+  document.getElementById("census-frame-tag").textContent = "";
+  document.getElementById("census-candidates").style.display = "none";
+  const correcting = censusState.mode === "correct";
+  const apply = document.getElementById("census-apply-btn");
+  apply.style.display = correcting ? "inline-block" : "none";
+  apply.disabled = correcting && censusState.pending === 0;
+  document.getElementById("census-summary-btn").style.display = correcting ? "none" : "inline-block";
+  setStatus("census-progress",
+    `${censusState.total} of ${censusState.total} reviewed` +
+    (correcting ? ` — ${censusState.pending} pending correction(s)` : ""), "success");
+}
+
+function censusKeyDown(event) {
   const key = event.key.toLowerCase();
   if (key === " " || event.code === "Space") {
-    event.preventDefault();
     if (!censusState.blinking) { censusState.blinking = true; censusShow("after"); }
-    return;
+    return true;
   }
-  if (censusState.awaitingCandidate && "0123".includes(event.key)) {
-    event.preventDefault();
+  if (censusState.awaitingCandidate && "01234".includes(event.key)) {
     const candidates = censusState.item.candidates || [];
     const index = parseInt(event.key, 10);
-    submitCensus("wrong", index === 0 ? null : (candidates[index - 1] || {}).label ?? null);
-    return;
+    if (index === 4) {
+      // Next page, wrapping. `0` stays available on every page.
+      if (censusPageCount() > 1) { censusState.candidatePage += 1; renderCensusCandidates(); }
+      return true;
+    }
+    if (index === 0) { submitCensus("wrong", null); return true; }
+    const offset = (censusState.candidatePage || 0) * CANDIDATES_PER_PAGE;
+    submitCensus("wrong", (candidates[offset + index - 1] || {}).label ?? null);
+    return true;
   }
-  if (key === "j") { event.preventDefault(); submitCensus("correct"); }
-  else if (key === "k") { event.preventDefault(); beginCensusWrong(); }
-  else if (key === "l") { event.preventDefault(); submitCensus("unjudgeable"); }
+  if (key === "j") { submitCensus("correct"); return true; }
+  if (key === "k") { beginCensusWrong(); return true; }
+  if (key === "l") { submitCensus("unjudgeable"); return true; }
+  return false;
 }
 
-function handleCensusKeyUp(event) {
-  if (!censusState.active) return;
+function censusKeyUp(event) {
   if (event.key === " " || event.code === "Space") {
     censusState.blinking = false;
     censusShow("before");
+    return true;
   }
+  return false;
+}
+
+// --- One keyboard dispatcher (Round 19 B2b) --------------------------------
+//
+// There used to be two independent global `keydown` listeners with no
+// ownership rule between them, and the stepper's handler defended itself with
+// `if (censusState.active) return`. That flag stays true when a queue is
+// abandoned rather than finished, so the arrow keys died for the rest of the
+// session and nothing said why.
+//
+// The fix is not a better guard inside one of them. It is having ONE place
+// that answers "who owns this key right now": owners are tried in priority
+// order, each returns whether it consumed the key, and an unconsumed key falls
+// through to the next owner. So the census owns J/K/L/space/digits while its
+// queue is up, and the arrows still reach the stepper underneath it.
+const KEY_OWNERS = [
+  { name: "census", active: () => censusState.active, down: censusKeyDown, up: censusKeyUp },
+  { name: "stepper", active: () => stepperVisible(), down: stepperKeyDown, up: null },
+];
+
+function typingInAField(target) {
+  const tag = (target && target.tagName || "").toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select" || (target && target.isContentEditable);
+}
+
+function dispatchKey(event, phase) {
+  if (typingInAField(event.target)) return;
+  for (const owner of KEY_OWNERS) {
+    if (!owner.active()) continue;
+    const handler = phase === "down" ? owner.down : owner.up;
+    if (handler && handler(event)) { event.preventDefault(); return; }
+  }
+}
+
+async function handlePreviewCensusEdits() {
+  const box = document.getElementById("census-apply-report");
+  const preview = await window.EpiQuantAPI.preview_census_edits();
+  box.innerHTML = "";
+  if (preview && preview.error) {
+    setStatus("census-summary", preview.error, "error");
+    return null;
+  }
+  const line = (text, kind) => {
+    const el = document.createElement("div");
+    el.className = "status-line" + (kind ? " " + kind : "");
+    el.textContent = text;
+    box.appendChild(el);
+  };
+  line(`${preview.pending} pending correction(s), applied as one batch with one undo.`, "");
+  line(preview.double_claimed.length
+    ? `⚠ ${preview.double_claimed.length} cell(s) would be claimed by two tracks.`
+    : "✓ No cell would be claimed by two tracks.",
+    preview.double_claimed.length ? "error" : "success");
+  line(preview.orphaned.length
+    ? `⚠ ${preview.orphaned.length} track(s) would be left holding nothing.`
+    : preview.truncated.length
+      ? `${preview.truncated.length} track(s) would lose frames.`
+      : "✓ No track would be truncated or orphaned.",
+    preview.orphaned.length ? "error" : "");
+  line(preview.evicts.length
+    ? `⚠ ${preview.evicts.length} step(s) would relocate another track's future onto a new id ` +
+      "(no clean inverse — the batch undo restores a snapshot instead)."
+    : "✓ No step would relocate another track's future.",
+    preview.evicts.length ? "error" : "success");
+  if (preview.blocking) {
+    line("Apply is blocked by the checks above.", "error");
+  }
+  return preview;
+}
+
+async function handleApplyCensusEdits() {
+  const preview = await handlePreviewCensusEdits();
+  if (!preview) return;
+  if (preview.blocking) {
+    setStatus("census-summary",
+      "Not applied: the batch fails a structural check. Fix or drop the offending corrections.",
+      "error");
+    return;
+  }
+  const result = await window.EpiQuantAPI.apply_census_edits(false);
+  if (result && result.error) {
+    setStatus("census-summary", result.error, "error");
+    return;
+  }
+  censusState.pending = 0;
+  document.getElementById("census-undo-btn").style.display = "inline-block";
+  const notes = (result.displaced_list || []).map(describeDisplacement).join("");
+  setStatus("census-summary", `Applied ${result.applied} correction(s) in one batch.${notes}`, "success");
+  await refreshCorrectTrackImage();
+}
+
+async function handleUndoCensusEdits() {
+  const result = await window.EpiQuantAPI.undo_census_edits();
+  if (result && result.error) {
+    setStatus("census-summary", result.error, "error");
+    return;
+  }
+  document.getElementById("census-undo-btn").style.display = "none";
+  document.getElementById("census-apply-report").innerHTML = "";
+  setStatus("census-summary", "Restored the tracking table to the snapshot taken before Apply.", "success");
+  await refreshCorrectTrackImage();
 }
 
 async function handleCensusSummary() {
@@ -1481,6 +1911,7 @@ async function handleCorrectTrackImageClick(event) {
   if (!result) {
     document.getElementById("correct-track-selected-cell").textContent = "No cell at that position.";
     state.selectedTrackCell = null;
+    closeTrackStepper();
     document.getElementById("correct-track-reassign").style.display = "none";
     document.getElementById("correct-track-suggest").style.display = "none";
     document.getElementById("correct-track-suggest-list").style.display = "none";
@@ -1516,12 +1947,24 @@ async function handleCorrectTrackImageClick(event) {
 
   resetSmartStopPanel();
   resetSuggestCheckButton();
-  document.getElementById("compute-stop-frame-btn").style.display = isMatched ? "inline-block" : "none";
+  // Smart-stop propagate is retired (Round 16 A): its line search never
+  // discriminated (all three candidates scored 2.155% on the tested merge) and
+  // its stop rule overshoots by one frame by construction. The button stays in
+  // the DOM inside `#smart-stop-retired[hidden]` so the handlers below keep
+  // working, but nothing shows it any more.
 
   document.getElementById("correct-track-suggest").style.display = "flex";
   document.getElementById("correct-track-suggest-list").style.display = "none";
   document.getElementById("correct-track-suggest-list").innerHTML = "";
   document.getElementById("correct-track-suggest-hint").textContent = "";
+
+  // Round 16 E: the stepper opens on a matched cell, anchored at the frame the
+  // user is on. An unmatched cell has no track to walk, so it closes instead.
+  if (isMatched) {
+    await openTrackStepper(result.track_id, state.correctTrackFrame);
+  } else {
+    closeTrackStepper();
+  }
 }
 
 async function handleApplyTrackCorrection() {
@@ -1690,6 +2133,7 @@ function resetSuggestCheckButton() {
   document.getElementById("suggest-check-moves-list").style.display = "none";
   document.getElementById("suggest-check-moves-list").innerHTML = "";
   document.getElementById("apply-confirmed-moves-btn").style.display = "none";
+  document.getElementById("plan-checks").innerHTML = "";
 }
 
 async function handleCheckSuggestHolds() {
@@ -1725,22 +2169,106 @@ async function handleCheckSuggestHolds() {
 
   setStatus(
     "suggest-check-result",
-    `Found ${moves.length} correction(s) needed through frame ${result.stop_frame} (${result.reason}):`,
+    `Found ${moves.length} correction(s) needed through frame ${result.stop_frame} (${result.reason}). Verifying…`,
     "success"
   );
-  moves.forEach((move) => {
+
+  // Round 16 B: nothing is offered for Apply until the plan has been run
+  // through the structural checks and scored. Verification runs on a deep
+  // copy; the live table is asserted unchanged on the Python side.
+  const check = await window.EpiQuantAPI.verify_confirmed_identity_moves(trackId, moves, 1.5);
+  if (check && check.error) {
+    setStatus("suggest-check-result", `Cannot verify this plan: ${check.error}`, "error");
+    list.style.display = "none";
+    applyBtn.style.display = "none";
+    state.confirmedMovesPending = null;
+    return;
+  }
+  const verified = check.moves || moves;
+
+  verified.forEach((move) => {
     const item = document.createElement("li");
-    const fromText = move.from_track_id === null || move.from_track_id === undefined
-      ? "unmatched" : `track #${move.from_track_id}`;
-    const distanceText = move.distance === undefined || move.distance === null ? "" : `, ${move.distance}px`;
-    item.textContent = `Frame ${move.frame}: currently ${fromText} → would become track #${trackId} (${move.cell_index}${distanceText})`;
+    const takes = move.from_track_id !== null && move.from_track_id !== undefined;
+    const fromText = takes ? `track #${move.from_track_id}` : "unmatched";
+    // The gate is what admitted the step; the fraction of it used is the
+    // readable number, and a step near 1.0 is the one most likely to be wrong.
+    const gateText = move.gate_fraction === null || move.gate_fraction === undefined
+      ? (move.distance == null ? "" : `, ${move.distance}px`)
+      : `, ${move.distance}px of a ${move.gate_px}px gate (${Math.round(move.gate_fraction * 100)}%)`;
+    item.textContent =
+      `Frame ${move.frame}: currently ${fromText} → would become track #${trackId} (${move.cell_index}${gateText})`;
+    // Taking a cell from another track is the only destructive action a plan
+    // contains, and it used to look identical to a plain attach.
+    if (takes) item.classList.add("move-takes-cell");
+    if (move.gate_fraction !== null && move.gate_fraction !== undefined && move.gate_fraction > 0.8) {
+      item.classList.add("move-near-gate");
+      item.title = "This step only just fits inside the displacement gate.";
+    }
     list.appendChild(item);
   });
   list.style.display = "block";
+  renderPlanChecks(check);
 
   state.confirmedMovesPending = { trackId, moves };
-  applyBtn.textContent = `Apply ${moves.length} correction(s)`;
+  applyBtn.textContent = check.blocking
+    ? `Apply anyway (${moves.length} correction(s))`
+    : `Apply ${moves.length} correction(s)`;
   applyBtn.style.display = "inline-block";
+}
+
+// The three structural checks and the consistency delta, beside the moves.
+// Shown, never auto-applied: TA's accept-and-revert is a batch repairer where
+// a wrong revert is invisible; this is interactive, so the score assists the
+// decision rather than making it.
+function renderPlanChecks(check) {
+  const box = document.getElementById("plan-checks");
+  box.innerHTML = "";
+  const line = (text, kind) => {
+    const el = document.createElement("div");
+    el.className = "status-line" + (kind ? " " + kind : "");
+    el.textContent = text;
+    box.appendChild(el);
+  };
+
+  line(check.double_claimed.length
+    ? `⚠ Would leave ${check.double_claimed.length} cell(s) claimed by two tracks: ` +
+      check.double_claimed.map((d) => `${d.cell_index} (tracks ${d.tracks.join(", ")})`).join("; ")
+    : "✓ No cell would be claimed by two tracks.",
+    check.double_claimed.length ? "error" : "success");
+
+  const orphan = check.orphaned.length, truncate = check.truncated.length;
+  line(orphan
+    ? `⚠ Would leave ${orphan} track(s) holding nothing: ` +
+      check.orphaned.map((o) => `#${o.track_id}`).join(", ")
+    : truncate
+      ? `${truncate} track(s) would lose frames: ` +
+        check.truncated.map((t) => `#${t.track_id} (−${t.lost_frames.length})`).join(", ")
+      : "✓ No track would be truncated or orphaned.",
+    orphan ? "error" : "");
+
+  line(check.evicts.length
+    ? `⚠ ${check.evicts.length} step(s) would relocate another track's future onto a new id. ` +
+      "That has no clean inverse — Save Corrections before applying."
+    : "✓ No step would relocate another track's future.",
+    check.evicts.length ? "error" : "success");
+
+  if (check.takes_from.length) {
+    line(`${check.takes_from.length} step(s) take a cell from another track (marked in red above).`, "");
+  }
+
+  const c = check.consistency;
+  if (c) {
+    const sign = c.delta > 0 ? "+" : "";
+    line(
+      `Consistency under transposition over frames ${c.frames[0]}–${c.frames[c.frames.length - 1]}: ` +
+      `${c.before_unconfirmed} → ${c.after_unconfirmed} of ${c.n} links unconfirmed (${sign}${c.delta}). ` +
+      `Masks ${c.registered ? "registered" : "unregistered"}, same convention both sides. ` +
+      `This is a consistency delta, not an accuracy — it re-solves with the same cost function the ` +
+      `tracker used, so it says whether the result is self-consistent, not whether it is right.`,
+      c.delta > 0 ? "error" : "");
+  } else {
+    line("Consistency delta not computed: fewer than two of the affected frames have masks.", "");
+  }
 }
 
 async function handleApplyConfirmedMoves() {
@@ -1755,6 +2283,7 @@ async function handleApplyConfirmedMoves() {
   document.getElementById("suggest-check-moves-list").style.display = "none";
   document.getElementById("suggest-check-moves-list").innerHTML = "";
   document.getElementById("apply-confirmed-moves-btn").style.display = "none";
+  document.getElementById("plan-checks").innerHTML = "";
   state.confirmedMovesPending = null;
   await refreshCorrectTrackImage();
   setStatus("suggest-check-result", `Applied ${moves.length} correction(s).${notes}`, "success");
@@ -2189,8 +2718,9 @@ function init() {
   document.getElementById("lifecycle-tint-others-checkbox").addEventListener("change", refreshCorrectTrackImage);
   document.getElementById("dynamics-axes-checkbox").addEventListener("change",
     () => showTrajectoryFrame(state.trajectoryFrame));
-  document.getElementById("t1-axis-filter-select").addEventListener("change", async (e) => {
-    await window.EpiQuantAPI.set_t1_axis_filter(e.target.value);
+  document.getElementById("t1-event-filter-select").addEventListener("change", async (e) => {
+    await window.EpiQuantAPI.set_t1_event_filter(e.target.value);
+    await refreshT1Counts();
     await showTrajectoryFrame(state.trajectoryFrame);
   });
   ["t1-enter-input", "t1-exit-input"].forEach((id) => {
@@ -2249,6 +2779,20 @@ function init() {
   document.getElementById("apply-smart-stop-btn").addEventListener("click", handleApplySmartStop);
   document.getElementById("track-swap-mode-checkbox").addEventListener("change", resetTrackSwapSelection);
   document.getElementById("apply-track-swap-btn").addEventListener("click", handleApplyTrackSwap);
+  document.getElementById("enable-inset-checkbox").addEventListener("change", async (e) => {
+    if (!e.target.checked) {
+      closeTrackStepper();
+    } else if (state.selectedTrackCell && state.selectedTrackCell.track_id != null) {
+      await openTrackStepper(state.selectedTrackCell.track_id, state.correctTrackFrame);
+    }
+  });
+  document.getElementById("track-stepper-close").addEventListener("click", closeTrackStepper);
+  document.getElementById("track-stepper-prev").addEventListener("click", () => stepTrackStepper(-1));
+  document.getElementById("track-stepper-next").addEventListener("click", () => stepTrackStepper(1));
+  ["track-stepper-labels", "track-stepper-outline", "track-stepper-outline-color"].forEach((id) => {
+    document.getElementById(id).addEventListener("change", () => showStepperFrame(stepperState.frame));
+  });
+
   document.getElementById("census-start-btn").addEventListener("click", handleStartCensus);
   document.getElementById("census-kind-select").addEventListener("change", (e) => {
     document.getElementById("census-frame-wrap").style.display =
@@ -2258,8 +2802,11 @@ function init() {
   document.getElementById("census-wrong-btn").addEventListener("click", () => beginCensusWrong());
   document.getElementById("census-unjudgeable-btn").addEventListener("click", () => submitCensus("unjudgeable"));
   document.getElementById("census-summary-btn").addEventListener("click", handleCensusSummary);
-  document.addEventListener("keydown", handleCensusKeyDown);
-  document.addEventListener("keyup", handleCensusKeyUp);
+  document.getElementById("census-apply-btn").addEventListener("click", handleApplyCensusEdits);
+  document.getElementById("census-undo-btn").addEventListener("click", handleUndoCensusEdits);
+  // Exactly two global key listeners, both going through the one dispatcher.
+  document.addEventListener("keydown", (event) => dispatchKey(event, "down"));
+  document.addEventListener("keyup", (event) => dispatchKey(event, "up"));
   document.getElementById("coverage-summary-btn").addEventListener("click", handleShowCoverageSummary);
   document.getElementById("save-tracking-btn").addEventListener("click", handleSaveTrackingCorrections);
   document.getElementById("done-correcting-tracking").addEventListener("click", enterTrajectoryStep);
@@ -2284,6 +2831,8 @@ function init() {
     el.addEventListener("change", () => showTrajectoryFrame(state.trajectoryFrame));
   });
   wirePopover("agreement-help-btn", "agreement-help-close", "agreement-help-popover");
+  wirePopover("census-help-btn", "census-help-close", "census-help-popover");
+  wirePopover("drift-help-btn", "drift-help-close", "drift-help-popover");
   document.getElementById("agreement-register-input").addEventListener("change", async (e) => {
     await window.EpiQuantAPI.set_register_reference(e.target.checked);
     await refreshRegistrationStatus();
@@ -2336,7 +2885,7 @@ function init() {
     document.getElementById("t1-persist-input").value = p.value;
     if (p.enter_px != null) document.getElementById("t1-enter-input").value = p.enter_px;
     if (p.exit_px != null) document.getElementById("t1-exit-input").value = p.exit_px;
-    if (p.axis_filter) document.getElementById("t1-axis-filter-select").value = p.axis_filter;
+    if (p.event_filter) document.getElementById("t1-event-filter-select").value = p.event_filter;
   });
   window.EpiQuantAPI.get_environment_thresholds().then((t) => {
     if (!t) return;

@@ -37,6 +37,7 @@ credible.** Never use either as a sole judge, and never as an optimisation
 objective.
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -74,7 +75,7 @@ def load_masks(npy_folder: str) -> dict:
     masks = {}
     for name, number in data_input.resolve_frame_numbers(files).items():
         dat = np.load(os.path.join(npy_folder, name), allow_pickle=True).item()
-        masks[number] = dat["masks"] if "masks" in dat else dat["outlines"]
+        masks[number] = data_input.load_label_array(dat)
     return masks
 
 
@@ -1149,6 +1150,77 @@ def save_link_csv(links: Mapping[int, Mapping[int, int]], path: str) -> str:
 # Per-link classification, for the Correct Tracking overlay
 # --------------------------------------------------------------------------
 
+def table_link_consistency(
+    tracking_data: pd.DataFrame,
+    cells_info: pd.DataFrame,
+    masks_by_frame: Mapping[int, np.ndarray],
+    frames: Optional[list] = None,
+    drift_mode: str = "none",
+    drift_by_frame: Optional[Mapping[int, tuple]] = None,
+    **cost_kwargs,
+) -> dict:
+    """How many of the links the TRACKING TABLE asserts are not confirmed when
+    the frame pair is solved backwards.
+
+    **This is not `forward_backward_consistency`, and the difference is the
+    whole point.** That function re-solves both directions from `cells_info`
+    and the masks and never looks at `tracking_data` at all -- measured on
+    `AS_dorsal view_E-cad`, a fully SCRAMBLED tracking table scores identically
+    (48 / 2,634, 1.822% both ways). It judges the cost function on this data,
+    not the table. Using it to score a manual correction would return a delta
+    of exactly zero for every plan, endorsing a destructive one as readily as a
+    good one -- a judge that cannot fail.
+
+    This one takes each link the table holds (`label at f` -> `label at f+1`
+    for the same track) and asks whether the backward solve of that pair says
+    `b -> a`. Edit the table and the number moves, which is the property an
+    accept-and-revert loop needs.
+
+    `frames` limits the work to the pairs a plan touches; `None` means every
+    pair.
+
+    **Still a consistency measure, never an accuracy.** It uses the same cost
+    function the tracker used, so it answers "is this solution self-consistent
+    under transposition", not "is it right". Its degenerate case is shared with
+    `environment_dice` and with `forward_backward_consistency`: a coherent
+    identity permutation is perfectly self-consistent and scores 0. And both
+    sides of any delta must share one registration convention -- Round 15
+    measured that switch alone moving the flagged count on GBE from 955 to 24.
+    """
+    backward = _solve_pairs(cells_info, masks_by_frame, drift_mode=drift_mode,
+                            drift_by_frame=drift_by_frame, reverse=True, **cost_kwargs)
+    pairs = sorted(backward) if frames is None else sorted(
+        f for f in backward if f in set(int(x) for x in frames))
+
+    total = unconfirmed = 0
+    per_frame: dict = {}
+    for frame in pairs:
+        here = label_to_track(tracking_data, frame)
+        there = {track: label for label, track in label_to_track(tracking_data, frame + 1).items()}
+        back = backward.get(frame, {})
+        broken = []
+        for label, track in here.items():
+            partner = there.get(track)
+            if partner is None:
+                continue  # the track ends here; there is no link to confirm
+            total += 1
+            if back.get(partner) != label:
+                unconfirmed += 1
+                broken.append((int(label), int(partner)))
+        if broken:
+            per_frame[frame] = broken
+
+    return {
+        "judge": "table_link_consistency",
+        "unconfirmed": unconfirmed,
+        "n": total,
+        "rate": 100.0 * unconfirmed / total if total else float("nan"),
+        "frames": pairs,
+        "broken_by_frame": per_frame,
+        "drift_mode": drift_mode,
+    }
+
+
 def classify_links(
     tracking_data: pd.DataFrame,
     masks_by_frame: Mapping[int, np.ndarray],
@@ -1220,6 +1292,10 @@ if __name__ == "__main__":
     parser.add_argument("--npy-folder")
     parser.add_argument("--ctc-tra", help="a Cell Tracking Challenge TRA folder")
     parser.add_argument("--diagnostics", action="store_true")
+    # A no-op: omitting --project runs the self-test. Accepted so the flag means
+    # the same thing everywhere (Round 19 A1).
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the self-test (the default when --project is omitted)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -1235,8 +1311,22 @@ if __name__ == "__main__":
     if not os.path.isdir(npy_folder):
         npy_folder = os.path.join(project, "masks")
 
-    cells_info = pd.read_excel(os.path.join(project, "cell_classification_output", "Cells_info.xlsx"),
-                               index_col=0)
+    # Read the PINNED extraction, not the dataset's `cell_classification_output/`
+    # -- that folder is where the app writes on every Extract run, so a normal
+    # day's work replaced the inputs these constants were measured against and
+    # the first symptom was an assertion failing like a cost regression
+    # (`CLAUDE.md` rule 7 case 1). `v2/baseline_data/<slug>/` is a tree the
+    # application never writes to.
+    import baselines
+    extraction_source = baselines.cells_info_path(project)
+    if not os.path.exists(extraction_source):
+        raise SystemExit(
+            "no pinned extraction at %s -- run:\n"
+            "  python3 v2/baselines.py --adopt %r\n"
+            "A pinned number is only pinned against the data it was measured on."
+            % (extraction_source, project)
+        )
+    cells_info = pd.read_excel(extraction_source, index_col=0)
     cells_info.index = cells_info.index.map(str)
     masks = load_masks(npy_folder)
     print("loaded %d frames of masks from %s" % (len(masks), npy_folder))
@@ -1260,15 +1350,90 @@ if __name__ == "__main__":
     print("  median margin       %.3f -> %.3f" % (plain["median_margin"], fixed["median_margin"]))
     print("  judgeable           %d -> %d" % (plain["judgeable"], fixed["judgeable"]))
 
+    # Round 16 B3: `forward_backward_consistency` never reads the tracking
+    # table -- a fact that only shows up when you change the table. Scoring a
+    # manual correction with it would return the same number whatever the plan
+    # did, so the two judges are asserted apart here rather than left to be
+    # re-discovered. Deliberately ABOVE the pinned-numbers block, which exits
+    # early when the stored table is no longer a baseline: this property is
+    # about the judges, not about any particular table, so it must still run.
+    blind_base = forward_backward_consistency(cells_info=cells_info, masks_by_frame=masks)
+    scrambled = tracking.copy(deep=True)
+    rng = np.random.default_rng(0)
+    for column in (c for c in scrambled.columns if c.startswith("Frame")):
+        scrambled[column] = rng.permutation(scrambled[column].values)
+    blind = forward_backward_consistency(scrambled, masks, cells_info)
+    assert blind["inconsistent"] == blind_base["inconsistent"], (blind, blind_base)
+
+    intact = table_link_consistency(tracking, cells_info, masks)
+    broken = table_link_consistency(scrambled, cells_info, masks)
+    assert broken["rate"] > intact["rate"] + 50, (intact, broken)
+    print("\ntransposition judges, on the same table scrambled:")
+    print("  forward_backward_consistency: %.2f%% -> %.2f%%  (BLIND to the table)"
+          % (blind_base["inconsistency_rate"], blind["inconsistency_rate"]))
+    print("  table_link_consistency:       %.2f%% -> %.2f%%  (reads the table)"
+          % (intact["rate"], broken["rate"]))
+
+    # The pinned numbers below are a statement about ONE extraction of this
+    # dataset. `cell_classification_output/Cells_info.xlsx` is also where the
+    # app writes when someone re-runs Extract, so a normal day's use silently
+    # replaces the inputs these constants were measured against -- and the
+    # first symptom is an assertion failure that reads exactly like a cost
+    # regression. That happened on 2026-09-05: a re-extraction took GBE to
+    # 7,456 cells and `wrong_rate` from 4.89% to 4.83%, with nothing in the
+    # tracker changed.
+    #
+    # So fingerprint the inputs and say which of the two it is. A number is
+    # only pinned against the data it was measured on.
+    # 7,457 cells, re-extracted 2026-09-06 from HAND-CORRECTED masks. The
+    # previous pin (396ce2945598632c, 7,456 cells) described the segmentation
+    # that preceded them. This is the third re-pin in three rounds and every
+    # one has been an INPUT change, never the code -- verified each time by
+    # running HEAD against the same inputs.
+    # The SEGMENTATION these numbers describe. Hand-corrected 2026-09-07
+    # (7,452 labels, down from 7,457).
+    GBE_MASKS = "2a0a819abe94a52b15a8c22943960ee4"
+    GBE_EXTRACTION = "73fd7dedb97f3bc7"
+    extraction = hashlib.sha256(cells_info.to_csv().encode()).hexdigest()[:16]
+
     if "embryos_GBE_GAP43" in project:
         # Pin the shipped-default numbers so a silent change to the cost, the
         # merge or a judge is caught here rather than in a later argument about
         # what a benchmark meant.
-        assert abs(a["wrong_rate"] - 4.89) < 0.05, a
-        assert abs(a["correct_rate"] - 94.84) < 0.05, a
-        assert abs(a["broken_rate"] - 0.27) < 0.05, a
-        assert abs(a["n_judged"] - 5480) < 25, a
-        assert abs(a["n_total"] - 7229) < 25, a
+        if extraction != GBE_EXTRACTION:
+            print("\nSKIPPING the pinned GBE numbers -- the EXTRACTION changed, so this is not a")
+            print("  regression: %s, expected %s." % (extraction, GBE_EXTRACTION))
+            print("  Re-run Extract, adopt and regenerate, then re-pin these deliberately.")
+            raise SystemExit(0)
+        # And the masks. Round 18 added this check to `baselines`; leaving it out
+        # here meant a hand-correction to the segmentation still surfaced as a
+        # cost regression -- which is exactly what happened in the first real
+        # click-test's preflight (Round 19 A1). These numbers describe ONE
+        # segmentation as much as one extraction.
+        import baselines
+        current_masks = baselines.mask_fingerprint(npy_folder)
+        if current_masks and current_masks["sha256"] != GBE_MASKS:
+            print("\nSKIPPING the pinned GBE numbers -- the SEGMENTATION changed, so this is not")
+            print("  a regression: %d frames / %d labels now, pinned against %s."
+                  % (current_masks["frames"], current_masks["labels"], GBE_MASKS[:12]))
+            print("  Hand-correcting masks is normal work; re-run Extract, adopt and regenerate.")
+            raise SystemExit(0)
+        # Re-pinned 2026-09-07. Superseded values, kept so the sequence stays
+        # legible rather than being silently overwritten -- each describes a
+        # different SEGMENTATION of the same movie, and every move was verified
+        # to be the inputs and not the code:
+        #   pre-2026-09-05 : 4.89 / 94.84 / 0.27, judged 5480, total 7229
+        #   2026-09-05     : 4.83 / 94.92 / 0.26, judged 5487, total 7221
+        #   2026-09-06     : 4.64 / 95.10 / 0.25, judged 5492, total 7233  (7,457 labels)
+        #   2026-09-07a    : 4.73 / 95.01 / 0.25, judged 5492, total 7229  (7,452 labels)
+        # Now 7,449 labels. Five re-segmentations in four days; the two guards
+        # above are what keep each of these from reading as a code regression.
+        # Both guards above now cover this: the extraction AND the masks.
+        assert abs(a["wrong_rate"] - 4.66) < 0.05, a
+        assert abs(a["correct_rate"] - 95.08) < 0.05, a
+        assert abs(a["broken_rate"] - 0.25) < 0.05, a
+        assert abs(a["n_judged"] - 5492) < 25, a
+        assert abs(a["n_total"] - 7226) < 25, a
         # 0.9015, not the 0.9094 the Round 10 plan quoted. Every definition
         # tried lands in 0.897-0.903 (per-frame mean 0.8992, keeping untracked
         # neighbours 0.8999, dilation_px 1 and 3 giving 0.9007 and 0.9025), so
@@ -1286,21 +1451,26 @@ if __name__ == "__main__":
         assert abs(fixed["median_best_iou"] - 0.709) < 0.01, fixed
         assert abs(plain["median_margin"] - 0.224) < 0.01, plain
         assert abs(fixed["median_margin"] - 0.661) < 0.01, fixed
-        assert plain["judgeable"] == 5483 and abs(fixed["judgeable"] - 6818) < 10, (plain, fixed)
+        # Also re-pinned 2026-09-05 with the rest of this block; previously
+        # 5483 / 6818 on the extraction that was replaced.
+        assert plain["judgeable"] == 5489 and abs(fixed["judgeable"] - 6821) < 10, (plain, fixed)
 
         registered_score = iou_agreement(tracking, masks, register=True, drift_by_frame=drift)
         print("\nsame tracking, registered reference: %.2f%% wrong (was %.2f%%), n=%d judged"
               % (registered_score["wrong_rate"], a["wrong_rate"], registered_score["n_judged"]))
-        assert abs(registered_score["wrong_rate"] - 14.01) < 0.2, registered_score
-        print("  -> the SAME tracking scores 4.89%% or 14.01%% depending only on the")
+        # Re-pinned 2026-09-07 (14.01 -> 13.99 -> 13.75 -> 13.88 across four
+        # segmentations of the same movie).
+        assert abs(registered_score["wrong_rate"] - 13.77) < 0.2, registered_score
+        print("  -> the SAME tracking scores 4.66%% or 13.77%% depending only on the")
         print("     registration convention of the reference. Never report one alone.")
 
         consistency = forward_backward_consistency(cells_info=cells_info, masks_by_frame=masks)
         margin_score = assignment_margin(cells_info=cells_info, masks_by_frame=masks)
         print("\nreference-free: forward-backward %.2f%% inconsistent | assignment margin %.2f px"
               % (consistency["inconsistency_rate"], margin_score["median_margin"]))
-        assert abs(consistency["inconsistency_rate"] - 1.98) < 0.1, consistency
-        assert abs(margin_score["median_margin"] - 11.38) < 0.2, margin_score
+        # Re-pinned 2026-09-07 (1.98 -> 2.55 -> 2.41 -> 2.17 across four).
+        assert abs(consistency["inconsistency_rate"] - 1.83) < 0.1, consistency
+        assert abs(margin_score["median_margin"] - 11.35) < 0.2, margin_score
 
     if args.diagnostics:
         print("\ngap growth along chained mutual-best-IoU links:")

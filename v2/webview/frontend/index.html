@@ -63,6 +63,16 @@
     <h2>Extract Cell Features</h2>
     <div class="field-row">
       <label class="checkbox-label"><input type="checkbox" id="exclude-edge-cells"> Exclude edge cells</label>
+      <!-- Round 19 D. Default 0 = off, so existing results stay reproducible.
+           Unlike "Exclude edge cells" this removes the label from the MASK,
+           because every consumer downstream reads the mask, not the table. -->
+      <label>Minimum cell area
+        <input type="number" id="min-cell-area-input" class="small-input" value="0" min="0" max="500" step="1">px
+      </label>
+      <span class="hint" id="min-cell-area-hint"><b>Exclude edge cells</b> drops cells touching the
+        image border, whose geometry is truncated. <b>Minimum cell area</b> drops labels below the
+        given size &mdash; segmentation can leave a few-pixel gap at a cell vertex that would
+        otherwise be read as a cell. <code>0</code> = off.</span>
     </div>
     <details>
       <summary>Advanced options</summary>
@@ -357,8 +367,21 @@
       <label><input type="checkbox" id="motion-compensation-input"> Motion compensation</label>
       <label><input type="checkbox" id="gap-closing-input"> Close 1-frame gaps</label>
       <label><input type="checkbox" id="drift-register-input"> Register masks (drift)</label>
+      <button id="drift-help-btn" class="help-btn" aria-label="How is this decided?" style="display:none">?</button>
     </div>
     <div id="registration-status" class="status-line"></div>
+    <div id="drift-help-popover" class="popover" style="display:none">
+      <div class="popover-head">
+        <strong>Why registration, and why the reference must match</strong>
+        <button id="drift-help-close" class="help-btn" aria-label="Close">&times;</button>
+      </div>
+      <p id="drift-help-numbers"></p>
+      <p><b>The agreement reference has to share the tracker&rsquo;s convention.</b> It is computed
+        from mask overlap, so it inherits whatever registration its masks had. Scoring a registered
+        tracking with an unregistered reference &mdash; or the reverse &mdash; compares two
+        different problems.</p>
+      <p>It is a property of this movie, not a law</p>
+    </div>
     <div id="overlap-help-popover" class="popover" style="display:none">
       <div class="popover-head">
         <strong>How cells are matched between frames</strong>
@@ -391,8 +414,8 @@
       range are left alone, and the seam at End+1 is reconciled automatically rather than orphaned.
     </p>
     <div class="field-row">
-      <label>Start <input type="number" id="retrack-start-input" class="track-id-input" min="1"></label>
-      <label>End <input type="number" id="retrack-end-input" class="track-id-input" min="1"></label>
+      <label>Start <input type="number" id="retrack-start-input" class="track-id-input" min="0"></label>
+      <label>End <input type="number" id="retrack-end-input" class="track-id-input" min="0"></label>
       <button id="detect-stale-btn" class="secondary-btn">Detect changed frames</button>
       <button id="start-retrack-btn" class="secondary-btn">Re-track range</button>
     </div>
@@ -458,7 +481,7 @@
       (unmatched, or the track is absent in the compared frame).
     </p>
     <div class="field-row" id="correct-track-agreement" style="display:none">
-      <span class="control-group-label">Disagrees with overlap</span>
+      <span class="control-group-label">vs overlap reference</span>
       <label>Agrees <input type="color" id="agreement-agrees-color-input" value="#4a90d9"></label>
       <label>Disagrees <input type="color" id="agreement-disagrees-color-input" value="#ff3b30"></label>
       <label>Can't judge <input type="color" id="agreement-unjudgeable-color-input" value="#a06bd4"></label>
@@ -509,10 +532,38 @@
     <div class="render-mode-controls">
       <label class="radio-label"><input type="radio" name="correct-track-render-mode" value="mask" checked> Filled mask</label>
       <label class="radio-label"><input type="radio" name="correct-track-render-mode" value="outline"> Outlines</label>
-      <label class="checkbox-label"><input type="checkbox" id="correct-track-show-labels" checked> Show cell labels</label>
+      <!-- These are TRACK ids, not cell ids: rendering.cell_label_text draws
+           the track a cell belongs to, falling back to a "#"-prefixed raw
+           label in orange where no track claims it (Round 17 C2a). -->
+      <label class="checkbox-label"><input type="checkbox" id="correct-track-show-labels" checked> Show track labels</label>
       <label>Label size <input type="number" id="correct-track-label-size-input" class="small-input" value="10" min="6" max="30"></label>
+      <label class="checkbox-label"><input type="checkbox" id="enable-inset-checkbox" checked> Enable inset view</label>
     </div>
-    <div class="image-click-wrap"><img id="correct-track-overlay-img" class="frame-preview"></div>
+    <div class="image-click-wrap">
+      <img id="correct-track-overlay-img" class="frame-preview">
+      <!-- Round 16 E: a docked stepper that walks the SELECTED track's frames
+           without moving the main view or clearing the selection. -->
+      <div id="track-stepper" hidden>
+        <div class="track-stepper-head">
+          <span id="track-stepper-title"></span>
+          <button id="track-stepper-close" class="secondary-btn" title="Esc">&times;</button>
+        </div>
+        <img id="track-stepper-img" class="census-crop">
+        <div id="track-stepper-window-note" class="hint"></div>
+        <div id="track-stepper-filmstrip" class="track-filmstrip"></div>
+        <div class="track-stepper-controls">
+          <button id="track-stepper-prev" class="secondary-btn">&larr;</button>
+          <span id="track-stepper-frame"></span>
+          <button id="track-stepper-next" class="secondary-btn">&rarr;</button>
+          <label class="checkbox-label"><input type="checkbox" id="track-stepper-labels"> Track IDs</label>
+          <!-- Off by default (Round 19 B2a): the maintainer wants the raw
+               membrane signal unless outlines are asked for. -->
+          <label class="checkbox-label"><input type="checkbox" id="track-stepper-outline"> Outline</label>
+          <input type="color" id="track-stepper-outline-color" value="#ff0000"
+                 title="Outline colour — red by default: the membrane signal is grey-white and the cell fills are green, so green outlines separate least.">
+        </div>
+      </div>
+    </div>
     <div id="correct-track-selected-cell" class="status-line"></div>
 
     <div id="correct-track-suggest" class="field-row" style="display:none">
@@ -526,6 +577,9 @@
     </div>
     <div id="suggest-check-result" class="status-line"></div>
     <ul id="suggest-check-moves-list" class="status-line" style="display:none"></ul>
+    <!-- Round 16 B: the three structural checks and the consistency delta,
+         shown beside the moves. Never auto-applied -- the human decides. -->
+    <div id="plan-checks"></div>
     <div class="field-row">
       <button id="apply-confirmed-moves-btn" class="secondary-btn" style="display:none">Apply corrections</button>
     </div>
@@ -535,10 +589,16 @@
       <input type="number" id="new-track-id-input" class="track-id-input">
       <label class="checkbox-label"><input type="checkbox" id="propagate-correction-checkbox"> Propagate to later</label>
       <button id="apply-track-correction-btn" class="secondary-btn">Apply</button>
-      <button id="compute-stop-frame-btn" class="secondary-btn" style="display:none">Smart-stop propagate</button>
     </div>
-    <div id="smart-stop-result" class="status-line"></div>
-    <div class="field-row">
+    <!-- Smart-stop propagate is RETIRED from the UI (Round 16 A). The backend
+         (`compute_propagation_stop_frame`, `score_propagation_stop_frames`,
+         `apply_smart_stop_merge`) and its tests are deliberately kept as the
+         record of what was tried; these three elements stay in the DOM, hidden,
+         so `resetSmartStopPanel` and the handlers keep working unchanged rather
+         than being half-removed. See v2/README.md Round 16 for why. -->
+    <div id="smart-stop-retired" hidden>
+      <button id="compute-stop-frame-btn" class="secondary-btn" style="display:none">Smart-stop propagate</button>
+      <div id="smart-stop-result" class="status-line"></div>
       <button id="apply-smart-stop-btn" class="secondary-btn" style="display:none">Merge through frame</button>
     </div>
 
@@ -553,23 +613,48 @@
     </div>
     <div id="correct-track-swap-status" class="status-line"></div>
 
-    <h3>Ground-truth census</h3>
-    <p class="hint">Labels one link at a time: <em>is the cell at frame f the same cell as the one
-      this link points to at f+1?</em> Hold <b>space</b> to blink between the two frames &mdash; a
-      correct link shifts slightly, a swap jumps. Then <b>J</b> correct, <b>K</b> wrong,
-      <b>L</b> can&rsquo;t tell; after K, press <b>1</b>&ndash;<b>3</b> to pick the right cell or
-      <b>0</b> for none of them. Some items are checks: a few show a deliberately wrong link, and a
-      few silently repeat an earlier one. You are not told which, and that is the point &mdash; the
-      pass-rate on those is what makes the labels quotable.</p>
+    <h3>Census: Correction / Ground-truth Collection</h3>
+    <p class="hint">Label one link at a time &mdash; <b>J</b> correct, <b>K</b> wrong,
+      <b>L</b> can&rsquo;t tell. Hold <b>space</b> to blink.
+      <button id="census-help-btn" class="help-btn" aria-label="How this works">?</button></p>
+    <div id="census-help-popover" class="popover" style="display:none">
+      <div class="popover-head">
+        <strong>How the census works</strong>
+        <button id="census-help-close" class="help-btn" aria-label="Close">&times;</button>
+      </div>
+      <p>The question is always the same: <em>is the cell at frame f the same cell as the one this
+        link points to at f+1?</em> Hold <b>space</b> to blink between the two frames &mdash; a
+        correct link shifts slightly, a swap jumps. After <b>K</b>, press <b>1</b>&ndash;<b>3</b> to
+        pick the right cell or <b>0</b> for none of them.</p>
+      <p><b>&ldquo;Can&rsquo;t tell&rdquo; is a first-class answer, not a skip.</b> A link an expert
+        genuinely cannot resolve is a limit of the data, not a tracker error.</p>
+      <p><b>In census mode a few items are checks.</b> Some show a deliberately wrong link; some
+        silently repeat an earlier one. You are not told which, and that is the point &mdash; the
+        decoy pass-rate and your own self-consistency are what make the labels quotable.
+        <b>No accuracy can exceed your self-consistency</b>, so it is reported beside every rate.</p>
+      <p><b>The two modes never mix.</b> Ground truth collected against a tracking run is not valid
+        for a run it corrected, so a census session cannot touch the tracking data and a correction
+        session cannot write ground truth &mdash; both refusals are enforced in the backend, not by
+        this panel. Correction mode has no decoys (accepting one would inject a deliberate error)
+        and applies every pending fix in one batch with one undo. If you want both, run the census
+        first, then correct.</p>
+    </div>
     <div class="field-row">
+      <label>Session
+        <select id="census-mode-select">
+          <option value="census" selected>Census &mdash; record verdicts (never edits tracking)</option>
+          <option value="correct">Correct &mdash; fix links (never writes ground truth)</option>
+        </select>
+      </label>
       <label>Set
         <select id="census-kind-select">
           <option value="geometry_flagged">Every link the overlap reference disagrees with</option>
           <option value="frame_pair">Every link in one frame pair</option>
+          <option value="environment_flagged">Cells the environment score flags for repair</option>
         </select>
       </label>
       <label id="census-frame-wrap" style="display:none">Frame
-        <input type="number" id="census-frame-input" class="small-input" min="1" value="1"></label>
+        <input type="number" id="census-frame-input" class="small-input" min="0" value="1"></label>
       <label>Your name <input type="text" id="census-labeller-input" class="small-input" placeholder="optional"></label>
       <button id="census-start-btn" class="secondary-btn">Start census →</button>
     </div>
@@ -579,16 +664,23 @@
         <img id="census-image" class="frame-preview census-crop">
         <div id="census-frame-tag" class="hint"></div>
       </div>
-      <div id="census-candidates" class="field-row" style="display:none"></div>
+      <!-- Round 21 B: a COLUMN, not a `.field-row`. As a field-row the hint,
+           the tiles and the buttons were all flex siblings on one line, so the
+           question floated level with the tiles and tile 3 wrapped to its own
+           row below the text -- which is what made the panel too tall to fit. -->
+      <div id="census-candidates" style="display:none"></div>
       <div class="field-row">
         <button id="census-correct-btn" class="secondary-btn">J &mdash; correct</button>
         <button id="census-wrong-btn" class="secondary-btn">K &mdash; wrong</button>
         <button id="census-unjudgeable-btn" class="secondary-btn">L &mdash; can&rsquo;t tell</button>
         <button id="census-summary-btn" class="secondary-btn">Show session numbers</button>
+        <button id="census-apply-btn" class="secondary-btn" style="display:none">Preview &amp; apply corrections</button>
+        <button id="census-undo-btn" class="secondary-btn" style="display:none">Undo last apply</button>
       </div>
       <div id="census-progress" class="status-line"></div>
     </div>
     <div id="census-summary" class="status-line"></div>
+    <div id="census-apply-report"></div>
 
     <h3>Review coverage</h3>
     <p class="hint">Records which frames were displayed and which cells were clicked, so a
@@ -648,11 +740,11 @@
       <label>Delamination <input type="color" id="dynamics-delamination-color-input" value="#ff3b30"></label>
       <label>Rearrangement (T1) <input type="color" id="dynamics-t1-color-input" value="#ffd633"></label>
       <label class="checkbox-label"><input type="checkbox" id="dynamics-axes-checkbox" checked> T1 axes</label>
-      <label>Show
-        <select id="t1-axis-filter-select">
-          <option value="all" selected>all</option>
+      <label>T1 events shown
+        <select id="t1-event-filter-select">
+          <option value="all">all</option>
           <option value="persistent_unjudgeable">settled + can't judge</option>
-          <option value="persistent">settled only</option>
+          <option value="persistent" selected>settled only</option>
         </select>
       </label>
       <label>Hysteresis

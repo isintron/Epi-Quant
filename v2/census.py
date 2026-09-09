@@ -36,6 +36,7 @@ folding it into either bucket invents a number.
 from __future__ import annotations
 
 import csv
+import json
 import os
 import random
 import statistics
@@ -45,15 +46,29 @@ from typing import Mapping, Optional
 import numpy as np
 import pandas as pd
 
+import re
+
 import cell_tracking
 import tracking_benchmark
 
 VERDICTS = ("correct", "wrong", "unjudgeable")
 
+#: `chosen_reason` / `chosen_rank` are what settle whether a candidate source
+#: earns its slot, and they are **reference-free**: they record which ranking
+#: first proposed the cell a HUMAN picked, and where in the list it sat. No
+#: tracking table is consulted, so no unvalidated table can bias them -- which
+#: is the trap Rounds 19-21 fell into three times.
+#:
+#: `register` and `environment_threshold` are the settings half. Without them a
+#: verdict file cannot say afterwards what it was collected under, and two files
+#: cannot be told apart: the maintainer's 18 hand-classified GBE items and this
+#: repository's 109-item queue for the same set differ because the tracking
+#: behind them differed, and nothing in either file recorded that.
 FIELDS = (
     "session_id", "item_id", "source_item_id", "frame", "label", "track_id",
     "shown_label", "true_label", "is_decoy", "is_repeat", "verdict",
-    "chosen_label", "ms_elapsed", "labeller", "timestamp_utc",
+    "chosen_label", "chosen_reason", "chosen_rank", "ms_elapsed", "labeller",
+    "source", "register", "environment_threshold", "timestamp_utc",
 )
 
 DEFAULT_DECOY_RATE = 0.15
@@ -124,6 +139,62 @@ def geometry_flagged_items(
                 "reference_iou": entry.get("reference_iou"),
                 "tracker_iou": entry.get("tracker_iou"),
                 "source": "geometry_flagged",
+            })
+    return items
+
+
+# The sets a queue can be drawn from. `frame_pair` is the only one that gives
+# an unbiased rate; the other two are chosen BY a criterion, so a rate computed
+# over them is a rate over that criterion's blind spots.
+SOURCES = ("geometry_flagged", "frame_pair", "environment_flagged")
+UNBIASED_SOURCES = ("frame_pair",)
+
+
+def environment_flagged_items(
+    tracking_data: pd.DataFrame,
+    scores_by_frame: Mapping[int, Mapping[int, float]],
+    masks_by_frame: Mapping[int, np.ndarray],
+    threshold: float = 0.5,
+) -> list:
+    """Links whose cell scores at or below the environment repair tier.
+
+    Users correct what the visualisation flags, and the environment overlay is
+    one of the two things they look at, so this makes that queue explicit
+    rather than leaving it to clicking around. `threshold` defaults to TA's
+    **repair** tier (0.5), not its **look** tier (0.75) -- the look tier flags
+    several times as many cells, which is the wrong size for a census.
+
+    **This set is stratified by a biased criterion, and the bias is known.**
+    `environment_dice` is invariant under a coherent permutation of identities,
+    so it rewards exactly the systematic mislabelling a drift-compensated cost
+    can introduce. That is fine for a QUEUE -- choosing what to look at judges
+    nothing -- but a rate computed over labels collected from it is a rate over
+    the cells this metric happens to flag. Only `frame_pair` gives an unbiased
+    rate, and `summarise` refuses to pool across sources rather than leaving
+    that to a footnote.
+    """
+    items = []
+    for frame in sorted(scores_by_frame):
+        if frame not in masks_by_frame or frame + 1 not in masks_by_frame:
+            continue
+        here = tracking_benchmark.label_to_track(tracking_data, frame)
+        there = tracking_benchmark.label_to_track(tracking_data, frame + 1)
+        inverse = {track: label for label, track in there.items()}
+        centres = _centroids(masks_by_frame[frame])
+        flagged = [(int(label), float(value))
+                   for label, value in scores_by_frame[frame].items()
+                   if value <= threshold and int(label) in here]
+        flagged.sort(key=lambda pair: (round(centres.get(pair[0], (0.0, 0.0))[1] / 50.0),
+                                       centres.get(pair[0], (0.0, 0.0))[0]))
+        for label, score in flagged:
+            track = here.get(label)
+            items.append({
+                "frame": frame, "label": label,
+                "track_id": None if track is None else int(track),
+                "tracker_label": inverse.get(track),
+                "reference_label": None, "reference_iou": None, "tracker_iou": None,
+                "environment_score": round(score, 3),
+                "source": "environment_flagged",
             })
     return items
 
@@ -241,9 +312,108 @@ def _nearest_other(masks_by_frame, frame, true_label, others, rng):
     return int(candidates[0][1])
 
 
+# --------------------------------------------------------------------------
+# Ground-truth storage (Round 18 E)
+# --------------------------------------------------------------------------
+#
+# Laid out the way the Cell Tracking Challenge pairs a result folder with its
+# `TRA` ground truth: two sibling directories under `cell_track_output/`, the
+# GT one prefixed so nothing mistakes it for a result.
+#
+#     cell_track_output/
+#         All_cell_tracking/                            the pipeline's result
+#         GT_All_cell_tracking/                         the human ground truth
+#             GT_All_cell_merged_tracking_results.xlsx  same schema
+#             provenance.json                           the run it was collected against
+#
+# **This lives inside a directory the app writes to, which looks like the
+# pattern `CLAUDE.md` rule 7 forbids. It is not.** Rule 7 governs test
+# fixtures -- artefacts a test compares against, which a normal day's work must
+# not be able to overwrite. This is the USER'S OWN DATA, and it belongs with
+# their outputs. The distinction is who owns the file, not where it sits.
+
+GT_FOLDER_NAME = "GT_All_cell_tracking"
+GT_TABLE_NAME = "GT_All_cell_merged_tracking_results.xlsx"
+GT_PROVENANCE_NAME = "provenance.json"
+GT_SESSION_CSV = "ground_truth_links.csv"
+
+
+def gt_dir(cell_track_output: str) -> str:
+    return os.path.join(cell_track_output, GT_FOLDER_NAME)
+
+
+def gt_table_path(cell_track_output: str) -> str:
+    return os.path.join(gt_dir(cell_track_output), GT_TABLE_NAME)
+
+
+def gt_provenance_path(cell_track_output: str) -> str:
+    return os.path.join(gt_dir(cell_track_output), GT_PROVENANCE_NAME)
+
+
+def _table_fingerprint(table: pd.DataFrame) -> str:
+    import hashlib
+    return hashlib.sha256(
+        table.fillna("\x00").astype(str).to_csv(index=False).encode("utf-8")
+    ).hexdigest()
+
+
+def save_ground_truth(cell_track_output: str, table: pd.DataFrame,
+                      collected_against: pd.DataFrame, **provenance) -> dict:
+    """Write the ground-truth table and the provenance that makes it usable.
+
+    `collected_against` is the tracking table this ground truth was collected
+    on. **Ground truth collected against one run is not valid for a run it
+    corrected** -- the link set itself changes -- and without the stamp that is
+    undetectable, so the hash is not optional.
+    """
+    os.makedirs(gt_dir(cell_track_output), exist_ok=True)
+    table.to_excel(gt_table_path(cell_track_output), index=False)
+    record = {
+        "written_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "table": GT_TABLE_NAME,
+        "rows": int(len(table)),
+        "gt_table_sha256": _table_fingerprint(table),
+        "collected_against": {
+            "rows": int(len(collected_against)),
+            "tracking_table_sha256": _table_fingerprint(collected_against),
+        },
+        "session_record": GT_SESSION_CSV,
+        **provenance,
+    }
+    with open(gt_provenance_path(cell_track_output), "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True, default=str)
+        handle.write("\n")
+    return record
+
+
+def load_ground_truth(cell_track_output: str, against: Optional[pd.DataFrame] = None) -> dict:
+    """`{table, provenance, matches_current_tracking}`.
+
+    `against` is the tracking table now in memory. When given, the answer says
+    whether the ground truth was collected on it -- stated, never assumed,
+    because a correction applied since is exactly what invalidates it.
+    """
+    path = gt_table_path(cell_track_output)
+    if not os.path.exists(path):
+        return {"error": f"No ground truth at {path}"}
+    table = pd.read_excel(path)
+    record = {}
+    if os.path.exists(gt_provenance_path(cell_track_output)):
+        with open(gt_provenance_path(cell_track_output), encoding="utf-8") as handle:
+            record = json.load(handle)
+    matches = None
+    if against is not None and record:
+        stamped = record.get("collected_against", {}).get("tracking_table_sha256")
+        matches = bool(stamped) and stamped == _table_fingerprint(against)
+    return {"table": table, "provenance": record, "matches_current_tracking": matches,
+            "path": path}
+
+
 def append_verdict(path: str, session_id: str, item: dict, verdict: str,
                    chosen_label: Optional[int], ms_elapsed: float,
-                   labeller: str = "") -> dict:
+                   labeller: str = "", chosen_reason: str = "",
+                   chosen_rank: Optional[int] = None, register: Optional[bool] = None,
+                   environment_threshold: Optional[float] = None) -> dict:
     if verdict not in VERDICTS:
         raise ValueError(f"unknown verdict {verdict!r}; expected one of {VERDICTS}")
     row = {
@@ -259,8 +429,28 @@ def append_verdict(path: str, session_id: str, item: dict, verdict: str,
         "is_repeat": int(bool(item.get("is_repeat"))),
         "verdict": verdict,
         "chosen_label": "" if chosen_label is None else int(chosen_label),
+        # Which SOURCE first proposed the chosen cell, and its 1-based place in
+        # the offered list. This is the measurement that decides whether
+        # `pointed` amplifies a wrong link (it spends its whole quota inside the
+        # neighbourhood of an answer this very set is questioning) or finds the
+        # commonest error fastest (an adjacent-pair swap puts the truth right
+        # beside the wrong answer). Both readings are plausible; neither is
+        # settled by argument. Same for `coverage`, added Round 23 on algebra
+        # alone.
+        "chosen_reason": chosen_reason or "",
+        "chosen_rank": "" if chosen_rank is None else int(chosen_rank),
         "ms_elapsed": round(float(ms_elapsed), 1),
         "labeller": labeller,
+        # Which SET this item was drawn from. Without it a file of verdicts is
+        # a pile of labels with no way to know which were chosen by a biased
+        # criterion, and `summarise` could not refuse to pool them.
+        "source": item.get("source", ""),
+        # The settings this verdict was collected under. A registered judge and
+        # an unregistered one disagree about the same tracking by more than any
+        # change measured on this project, so a verdict that does not say which
+        # it was cannot be compared with one that does.
+        "register": "" if register is None else int(bool(register)),
+        "environment_threshold": "" if environment_threshold is None else float(environment_threshold),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
     }
     directory = os.path.dirname(os.path.abspath(path))
@@ -282,7 +472,22 @@ def read_verdicts(path: str) -> list:
         return list(csv.DictReader(handle))
 
 
-def summarise(path: str, session_id: Optional[str] = None) -> dict:
+class MixedSources(Exception):
+    """Raised rather than pooling verdicts drawn from different sets.
+
+    `geometry_flagged` and `environment_flagged` are chosen BY a criterion, so
+    a rate over them is a rate over that criterion's blind spots -- and
+    `environment_dice`'s blind spot is invariance under a coherent identity
+    permutation, exactly the systematic error a drift-compensated cost can
+    introduce. Pooling them with `frame_pair` produces a number that means
+    nothing and looks like it means something. Round 15 §C1 called the mirror
+    of this "the stratification error in reverse"; making it raise is the
+    difference between a rule and a footnote.
+    """
+
+
+def summarise(path: str, session_id: Optional[str] = None,
+              source: Optional[str] = None) -> dict:
     """Counts, decoy pass-rate, intra-rater agreement, and the median seconds
     per judgment -- the three numbers that qualify every figure derived from
     these labels.
@@ -293,6 +498,16 @@ def summarise(path: str, session_id: Optional[str] = None) -> dict:
     """
     rows = [r for r in read_verdicts(path)
             if session_id is None or r["session_id"] == session_id]
+    if source is not None:
+        rows = [r for r in rows if r.get("source", "") == source]
+    present = {r.get("source", "") for r in rows}
+    if len(present) > 1:
+        raise MixedSources(
+            "these verdicts come from %d different sets (%s) and must not be pooled: only "
+            "`frame_pair` gives an unbiased rate, the others are stratified by the criterion "
+            "that chose them. Pass source=... to summarise one set."
+            % (len(present), ", ".join(sorted(repr(p) for p in present)))
+        )
     real = [r for r in rows if r["is_decoy"] == "0" and r["is_repeat"] == "0"]
     decoys = [r for r in rows if r["is_decoy"] == "1"]
     repeats = [r for r in rows if r["is_repeat"] == "1"]
@@ -314,7 +529,10 @@ def summarise(path: str, session_id: Optional[str] = None) -> dict:
         agree += int(original["verdict"] == r["verdict"])
 
     times = sorted(float(r["ms_elapsed"]) for r in rows if r["ms_elapsed"])
+    only = next(iter(present), "")
     return {
+        "source": only,
+        "unbiased": only in UNBIASED_SOURCES,
         "path": path,
         "n_total": len(rows),
         "n_real": len(real),
@@ -420,5 +638,102 @@ if __name__ == "__main__":
         print("an unknown verdict is refused: three states, not a free-text field.")
     else:
         raise AssertionError("unknown verdicts must raise")
+
+    # --- D (R23): which SOURCE the chosen cell came from, and the settings.
+    # Without `chosen_reason`/`chosen_rank` the question "does `pointed` find
+    # the answer or amplify the wrong one?" can only be argued; with them a few
+    # dozen clicks answer it, and reference-free -- the input is a human's
+    # choice, not a tracking table.
+    src_path = os.path.join(tempfile.mkdtemp(), "ground_truth_links.csv")
+    append_verdict(src_path, "s1", queue[0], "wrong", 7, 1200.0,
+                   chosen_reason="pointed", chosen_rank=5,
+                   register=True, environment_threshold=0.5)
+    append_verdict(src_path, "s1", queue[1], "correct", None, 800.0,
+                   register=True, environment_threshold=0.5)
+    saved = read_verdicts(src_path)
+    assert saved[0]["chosen_reason"] == "pointed" and saved[0]["chosen_rank"] == "5", saved[0]
+    assert saved[0]["register"] == "1" and saved[0]["environment_threshold"] == "0.5", saved[0]
+    # A verdict with nothing chosen leaves both blank rather than inventing a 0,
+    # which would read as "rank 0" -- the top of the list.
+    assert saved[1]["chosen_reason"] == "" and saved[1]["chosen_rank"] == "", saved[1]
+    assert all(f in saved[0] for f in FIELDS), set(FIELDS) - set(saved[0])
+    print("D (R23): a verdict records which source proposed the chosen cell "
+          "(%s, rank %s) and the settings it was collected under "
+          "(register=%s, environment_threshold=%s)."
+          % (saved[0]["chosen_reason"], saved[0]["chosen_rank"],
+             saved[0]["register"], saved[0]["environment_threshold"]))
+
+    # --- D3 (R18): the environment-flagged set, and the refusal to pool.
+    env_scores = {1: {1: 0.9, 2: 0.4, 3: 0.2, 4: 0.55, 5: 1.0}}
+    env_items = environment_flagged_items(tracks, env_scores, masks, threshold=0.5)
+    assert [i["label"] for i in env_items] == [2, 3], env_items
+    assert all(i["source"] == "environment_flagged" for i in env_items), env_items
+    print("\nD3: the repair tier (0.5) flags %s; the look tier would flag more, which is"
+          % [i["label"] for i in env_items])
+    print("  the wrong size for a census. Every item carries its source.")
+
+    mixed_path = os.path.join(tempfile.mkdtemp(), "ground_truth_links.csv")
+    env_queue = build_queue(env_items, masks, decoy_rate=0.0, repeat_rate=0.0, seed=0)
+    geom_queue = build_queue(flagged, masks, decoy_rate=0.0, repeat_rate=0.0, seed=0)
+    for entry in env_queue + geom_queue:
+        append_verdict(mixed_path, "s1", entry, "correct", None, 1000.0)
+    try:
+        summarise(mixed_path)
+    except MixedSources as error:
+        assert "must not be pooled" in str(error), error
+        print("  pooling two sets RAISES rather than returning a number:")
+        print("   ", str(error).split(":")[0])
+    else:
+        raise AssertionError("pooling across sources must raise")
+
+    one = summarise(mixed_path, source="environment_flagged")
+    assert one["source"] == "environment_flagged" and one["unbiased"] is False, one
+    unbiased = summarise(mixed_path, source="frame_pair") if False else None
+    pair_path = os.path.join(tempfile.mkdtemp(), "ground_truth_links.csv")
+    for entry in build_queue(everything, masks, decoy_rate=0.0, repeat_rate=0.0, seed=0):
+        append_verdict(pair_path, "s1", entry, "correct", None, 1000.0)
+    assert summarise(pair_path)["unbiased"] is True
+    print("  one set at a time summarises, and only `frame_pair` reports unbiased=True.")
+
+    # --- E (R18): the CTC-style ground-truth layout, and the assertion that
+    # a GT sibling is invisible to the pipeline.
+    import shutil
+    project = tempfile.mkdtemp()
+    track_out = os.path.join(project, "cell_track_output")
+    result_dir = os.path.join(track_out, "All_cell_tracking")
+    os.makedirs(result_dir)
+    tracks.to_excel(os.path.join(result_dir, "All_cell_merged_tracking_results.xlsx"), index=False)
+
+    gt_table = tracks.copy()
+    gt_table.loc[0, "Frame2"] = "Cell2_9"          # a human's correction
+    record = save_ground_truth(track_out, gt_table, tracks,
+                               labeller="self-test", source="frame_pair")
+    assert os.path.isdir(gt_dir(track_out))
+    assert os.path.exists(gt_table_path(track_out))
+    loaded = load_ground_truth(track_out, against=tracks)
+    assert loaded["matches_current_tracking"] is True, loaded["provenance"]
+    print("\nE: ground truth written to %s/ beside the result folder, and its provenance"
+          % GT_FOLDER_NAME)
+    print("  identifies the tracking run it was collected against.")
+
+    # Apply a correction to the tracking table: the SAME ground truth must now
+    # report that it no longer matches. Silence here is the failure mode.
+    corrected = tracks.copy()
+    corrected.loc[1, "Frame2"] = "Cell2_7"
+    assert load_ground_truth(track_out, against=corrected)["matches_current_tracking"] is False
+    print("  after a correction to the tracking table it reports matches=False, not silence.")
+
+    # --- Nothing in the pipeline may enumerate the parent and pick GT up.
+    # `track_cells` lists its OWN subfolder by a prefixed regex; a sibling is
+    # invisible to it, and so is a GT-prefixed file dropped inside the result
+    # folder. Asserted rather than argued.
+    shutil.copy(gt_table_path(track_out),
+                os.path.join(result_dir, "GT_All_cell_Matching_Results_new_1_2.xlsx"))
+    listed = [f for f in os.listdir(result_dir)
+              if re.match(r"All_cell_Matching_Results_new_\d+_\d+\.xlsx", f)]
+    assert not [f for f in listed if f.startswith("GT_")], listed
+    assert GT_FOLDER_NAME not in os.listdir(result_dir), os.listdir(result_dir)
+    print("  a GT_-prefixed file inside the result folder is not matched by the pipeline's")
+    print("  own regex, and the GT folder is a sibling the pipeline never lists.")
 
     print("\nAll census self-tests passed.")

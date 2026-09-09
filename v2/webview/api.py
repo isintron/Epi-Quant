@@ -32,6 +32,8 @@ needs). Per-frame `outlines`/base-image arrays are deliberately NOT cached
 isn't, and re-reading avoids ever serving a stale frame after a correction.
 """
 
+import base64
+import csv
 import datetime
 import json
 import logging
@@ -185,6 +187,16 @@ class EpiQuantAPI:
         # reference). Default "none" so the published baseline stays
         # byte-reproducible; "mask" is Tissue Analyzer's convention.
         self.drift_mode: str = "none"
+        # The drift_mode that actually produced `self.tracking_data`, recorded
+        # when tracking completes. `self.drift_mode` is a live UI setting the
+        # user can change afterwards, so reading it to describe an existing
+        # tracking run is a claim, not a fact -- and Round 18 §D1 caught it
+        # making a false one: a session reported "523 links, reference computed
+        # on unregistered masks, matching this tracking", but 523 is the count
+        # for REGISTERED tracking judged unregistered (measured 518); the
+        # unregistered/unregistered cell is 255. The tracking had drift on and
+        # the setting had since been changed back.
+        self.tracking_drift_mode: Optional[str] = None
         self._registration_cache: Optional[dict] = None
         self.environment_dead_band: float = 0.75
         self.environment_repair_threshold: float = 0.5
@@ -197,13 +209,26 @@ class EpiQuantAPI:
         self.t1_enter_px: Optional[float] = None
         self.t1_exit_px: Optional[float] = None
         self._hysteresis_cache: dict = {}
-        # Which T1 axes to draw: "all" | "persistent" | "persistent_unjudgeable".
+        # Which T1 events to DRAW AT ALL: "all" | "persistent" |
+        # "persistent_unjudgeable". Gates the cell fill and the nematic axis
+        # together -- Round 17 C3 found it gated only the axis, so `settled
+        # only` hid 10 axes and left 10 faded olive cells painted underneath
+        # them. It was named `t1_axis_filter` then, accurately; the name moved
+        # with the behaviour.
         # Three-way rather than a checkbox because `annotate_persistence`
         # produces three states, and a toggle would silently fold "unjudgeable"
-        # into one of the other two. Defaults to ALL: the standing position is
-        # "annotate, never drop", and a filter whose removals cannot be seen
-        # cannot be judged too aggressive.
-        self.t1_axis_filter: str = "all"
+        # into one of the other two.
+        #
+        # Round 16 D: default changed from "all" to "persistent", on the user's
+        # report from real use that the faded transient axes interfere with
+        # reading the frame -- 21% of raw events on `embryos_GBE_GAP43` reverse
+        # within one frame, and at ~1,500 gains per movie that is a lot of
+        # flicker drawn over the tissue. This is a RENDERING default only; no
+        # count changes and nothing is dropped from the data. `all` stays one
+        # click away, and `get_t1_events` now reports how many axes the current
+        # filter removes, because a filter whose removals cannot be seen cannot
+        # be judged too aggressive (`v2/docs/schmitt-trigger.md` section 6).
+        self.t1_event_filter: str = "persistent"
         # Frames a neighbour exchange must hold before it counts as settled.
         # 21% of raw events on `embryos_GBE_GAP43` reverse within one frame.
         self.t1_persist_frames: int = 1
@@ -293,7 +318,7 @@ class EpiQuantAPI:
             return None
         dat = np.load(npy_path, allow_pickle=True).item()
         base_image = rendering.load_base_image(dat, self.image_folder, frame_number)
-        fill_labels = dat["masks"] if "masks" in dat else dat["outlines"]
+        fill_labels = data_input.load_label_array(dat)
         boundary_labels = dat["outlines"]
         return fill_labels, boundary_labels, base_image
 
@@ -319,7 +344,48 @@ class EpiQuantAPI:
         self._junction_min_px_auto = None
         self.output_dirs = common.setup_output_dirs(output_base_dir)
         fmt = data_input.detect_mask_format(mask_folder)
-        return {"format": fmt, "output_dirs": self.output_dirs}
+        # Restore the Extract settings this project was last used with. The
+        # minimum-area threshold is process state -- one source of truth for a
+        # running process, which is right -- but a process ends: set it,
+        # Extract, close the app, reopen, Track, and every loader silently read
+        # the unfiltered masks (Round 21 A2).
+        restored = self._load_project_settings()
+        return {"format": fmt, "output_dirs": self.output_dirs, "settings": restored}
+
+    def _settings_path(self) -> Optional[str]:
+        if not self.output_dirs:
+            return None
+        return os.path.join(self.output_dirs["cell_classification_output"],
+                            "extract_settings.json")
+
+    def _load_project_settings(self) -> dict:
+        """Restore what a previous session set for this project, and apply it."""
+        path = self._settings_path()
+        if not path or not os.path.exists(path):
+            data_input.set_min_cell_area(0)
+            return {"min_cell_area_px": 0, "restored": False}
+        try:
+            with open(path, encoding="utf-8") as handle:
+                stored = json.load(handle)
+        except (OSError, ValueError) as error:
+            logger.warning("could not read %s: %s", path, error)
+            return {"min_cell_area_px": data_input.get_min_cell_area(), "restored": False}
+        area = int(stored.get("min_cell_area_px", 0) or 0)
+        data_input.set_min_cell_area(area)
+        return {"min_cell_area_px": area, "restored": True}
+
+    def _save_project_settings(self) -> None:
+        path = self._settings_path()
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"min_cell_area_px": data_input.get_min_cell_area()},
+                          handle, indent=2, sort_keys=True)
+                handle.write("\n")
+        except OSError as error:
+            logger.warning("could not write %s: %s", path, error)
 
     def get_existing_results(self) -> dict:
         """Which pipeline stages already have on-disk output under the
@@ -408,6 +474,61 @@ class EpiQuantAPI:
         )
         thread.start()
         return True
+
+    def set_min_cell_area(self, area_px: int = 0) -> dict:
+        """Minimum label area, in pixels, applied by every mask loader.
+
+        **Default 0 (off)**, so existing baselines stay byte-reproducible. It
+        exists because Tissue Analyzer's segmentation regularly leaves a 1 px
+        gap at four-cell vertices and Epi-Quant reads each one as a cell -- and
+        such a label is not merely a spurious row: it becomes a fifth neighbour
+        in the adjacency graph and can stop the four real cells around that
+        vertex being recorded as neighbours of one another, which corrupts T1
+        detection precisely where T1s occur.
+
+        Set on `data_input` rather than carried here, because the property that
+        matters is that *every* consumer sees the same labels.
+        """
+        data_input.set_min_cell_area(area_px)
+        self._save_project_settings()
+        return {"min_cell_area_px": data_input.get_min_cell_area(),
+                "suggested": data_input.SUGGESTED_MIN_CELL_AREA_PX}
+
+    def get_min_cell_area(self) -> dict:
+        return {"min_cell_area_px": data_input.get_min_cell_area(),
+                "suggested": data_input.SUGGESTED_MIN_CELL_AREA_PX}
+
+    def get_min_area_removals(self) -> dict:
+        """Which labels the current minimum-area setting removes, per frame.
+
+        A filter whose removals cannot be seen cannot be judged too aggressive
+        -- the same rule that governs the T1 event filter and the junction
+        length minimum. This is its third application.
+
+        `unreadable_frames` names the frames whose `.npy` holds no filled label
+        array, so the count below them is understood as "not measured" rather
+        than "nothing removed". Until Round 22 this read `raw.get("masks")` and
+        `continue`d past such a frame in silence, so the UI's removal count came
+        out low with nothing saying which frames it had skipped.
+        """
+        threshold = data_input.get_min_cell_area()
+        if not threshold or not self.npy_folder:
+            return {"min_cell_area_px": threshold, "total": 0, "by_frame": {},
+                    "unreadable_frames": []}
+        by_frame, total, unreadable = {}, 0, []
+        files = data_input.list_segmentation_files(self.npy_folder)
+        for name, number in data_input.resolve_frame_numbers(files).items():
+            raw = np.load(os.path.join(self.npy_folder, name), allow_pickle=True).item()
+            labels, removed = data_input.load_label_array(
+                raw, threshold, with_removed=True)
+            if labels is None:
+                unreadable.append(int(number))
+                continue
+            if removed:
+                by_frame[int(number)] = len(removed)
+                total += len(removed)
+        return {"min_cell_area_px": threshold, "total": total, "by_frame": by_frame,
+                "unreadable_frames": sorted(unreadable)}
 
     def _run_extraction(self, mask_type: str, background_area_ratio: float, exclude_edge_cells: bool) -> None:
         try:
@@ -965,6 +1086,10 @@ class EpiQuantAPI:
             "gained_persistent": len(settled["gained"]), "lost_persistent": len(settled["lost"]),
             "gained_unjudgeable": len(unjudgeable["gained"]), "lost_unjudgeable": len(unjudgeable["lost"]),
             "persist_frames": int(self.t1_persist_frames),
+            # How much the filter removes from what is drawn -- fill and axis
+            # alike. Reported alongside the RAW counts so turning it on cannot
+            # hide its own effect (Round 16 D, corrected in Round 17 C3).
+            "event_counts": self._event_filter_counts(axes),
             # Provenance travels with every count. `25 / 15` is a statement
             # about one objective and one binning: on a dataset at half the
             # pixel size the same physical junction has roughly twice the
@@ -973,6 +1098,30 @@ class EpiQuantAPI:
             # this stamp no T1 count in this project is reproducible outside
             # the session that produced it.
             "parameters": self.t1_parameters(),
+        }
+
+    # The three filter modes, as the set of states each keeps. ONE definition,
+    # read by the axis path, the cell-fill path and the counts alike, so the
+    # readout can never describe a different filter than the one that drew the
+    # frame -- which is exactly what C3 was: two code paths, one filter.
+    _EVENT_FILTER_STATES = {
+        "all": ("persistent", "transient", "unjudgeable"),
+        "persistent": ("persistent",),
+        "persistent_unjudgeable": ("persistent", "unjudgeable"),
+    }
+
+    def _event_filter_counts(self, axes: list) -> dict:
+        """How many T1 events the current filter draws, removes, and cannot
+        judge. Counts EVENTS, not axes: the filter now hides the cell fill as
+        well, so a removed event leaves nothing on the frame at all."""
+        keep = self._EVENT_FILTER_STATES[self.t1_event_filter]
+        states = [axis.get("state", "persistent") for axis in axes]
+        return {
+            "filter": self.t1_event_filter,
+            "shown": sum(1 for state in states if state in keep),
+            "filtered": sum(1 for state in states if state not in keep),
+            "unjudgeable": sum(1 for state in states if state == "unjudgeable"),
+            "total": len(states),
         }
 
     def t1_parameters(self) -> dict:
@@ -984,7 +1133,7 @@ class EpiQuantAPI:
             "exit_px": self.t1_exit_px,
             "dilation_px": adjacency.DEFAULT_DILATION_PX,
             "persist_frames": int(self.t1_persist_frames),
-            "axis_filter": self.t1_axis_filter,
+            "event_filter": self.t1_event_filter,
         }
 
     # The three named modes the UI offers. `centroid_weight` and
@@ -1093,7 +1242,7 @@ class EpiQuantAPI:
         return {
             "value": int(self.t1_persist_frames),
             "enter_px": self.t1_enter_px, "exit_px": self.t1_exit_px,
-            "axis_filter": self.t1_axis_filter,
+            "event_filter": self.t1_event_filter,
         }
 
     def set_t1_hysteresis(self, enter_px: float = None, exit_px: float = None) -> dict:
@@ -1117,12 +1266,12 @@ class EpiQuantAPI:
         self._hysteresis_cache.clear()
         return self.get_t1_persistence()
 
-    def set_t1_axis_filter(self, mode: str = "all") -> dict:
+    def set_t1_event_filter(self, mode: str = "all") -> dict:
         """Which T1 orientation axes to draw: all / persistent /
         persistent_unjudgeable."""
-        if mode not in ("all", "persistent", "persistent_unjudgeable"):
+        if mode not in self._EVENT_FILTER_STATES:
             raise ValueError(f"Unknown axis filter {mode!r}")
-        self.t1_axis_filter = mode
+        self.t1_event_filter = mode
         return self.get_t1_persistence()
 
     def set_t1_persistence(self, value: int = None) -> dict:
@@ -1736,6 +1885,7 @@ class EpiQuantAPI:
             )
             self.tracking_data = result
             self.original_tracking_data = result.copy()
+            self.tracking_drift_mode = self.drift_mode
             self._notify("onTrackDone", {"track_count": int(len(result))})
         except Exception as e:
             logger.exception("Tracking failed")
@@ -1835,25 +1985,118 @@ class EpiQuantAPI:
         thread.start()
         return True
 
+    # --- Re-extract the range a re-track is about to re-track (Round 19 C3) --
+    #
+    # `re-track 的前提应该是 re-extract edited cell features`. Round 13 made
+    # re-track REFUSE when `Cells_info` was stale, which stops the corruption
+    # but leaves the user to fix it by hand and leaves a window in which the two
+    # can diverge again. Closing it: re-tracking a range re-extracts that same
+    # range first, so the geometry the tracker reads is by construction the
+    # geometry of the masks on disk.
+
+    #: Sidecar file -> (attribute, extractor). Which families to recompute is
+    #: decided by WHICH FILES EXIST, not by inspecting columns -- the
+    #: descriptors are separate files, not extra columns in `Cells_info.xlsx`.
+    FEATURE_SIDECARS = ("Cells_shape.xlsx", "Cells_tissue.xlsx")
+
+    def _computed_feature_families(self) -> list:
+        """Which optional feature families this project has actually computed."""
+        folder = self.output_dirs["cell_classification_output"] if self.output_dirs else None
+        if not folder:
+            return []
+        return [name for name in self.FEATURE_SIDECARS
+                if os.path.exists(os.path.join(folder, name))]
+
+    def _reextract_frames(self, frames) -> dict:
+        """Recompute every per-cell family for `frames`, splicing the new rows
+        into the existing tables. Returns a report naming what was recomputed
+        and what is now out of date.
+
+        All three families are **per-cell**: each value depends only on that
+        cell's mask and its own frame's neighbours, so recomputing a frame range
+        is exact rather than an approximation.
+        """
+        frames = sorted({int(f) for f in frames})
+        folder = self.output_dirs["cell_classification_output"]
+        report = {"frames": frames, "recomputed": [], "stale_after": []}
+
+        def with_index_column(table):
+            """These tables come back with `Cell Index` sometimes as a column and
+            sometimes as the index, depending on which loader produced them."""
+            if table is None or "Cell Index" in table.columns:
+                return table
+            return table.reset_index().rename(columns={table.index.name or "index": "Cell Index"})
+
+        def splice(existing, fresh):
+            """Replace the rows for `frames`, keep every other row untouched."""
+            fresh = with_index_column(fresh)
+            existing = with_index_column(existing)
+            if existing is None:
+                return fresh
+            frame_of = existing["Cell Index"].astype(str).str.extract(r"Cell(\d+)_", expand=False)
+            keep = ~frame_of.astype(float).isin(frames)
+            return pd.concat([existing[keep], fresh], ignore_index=True)
+
+        fresh_info, _ = data_input.extract_cell_info(
+            self.npy_folder, output_path=None, exclude_edge_cells=False, frames=set(frames))
+        self.cells_info = splice(self.cells_info, fresh_info)
+        self.cells_info.to_excel(os.path.join(folder, "Cells_info.xlsx"),
+                                 sheet_name="Cell", index=False)
+        self._geometry_lookup = None
+        report["recomputed"].append("geometry")
+
+        present = self._computed_feature_families()
+        if "Cells_shape.xlsx" in present:
+            fresh_shape = shape_features.extract_shape_features(
+                self.npy_folder, output_path=None, frames=set(frames))
+            self.cells_shape = splice(self.cells_shape, fresh_shape)
+            self.cells_shape.to_excel(os.path.join(folder, "Cells_shape.xlsx"), index=False)
+            report["recomputed"].append("shape")
+        if "Cells_tissue.xlsx" in present:
+            fresh_tissue = tissue_features.extract_tissue_features(
+                self.npy_folder, output_path=None, frames=set(frames))
+            self.cells_tissue = splice(self.cells_tissue, fresh_tissue)
+            self.cells_tissue.to_excel(os.path.join(folder, "Cells_tissue.xlsx"), index=False)
+            report["recomputed"].append("tissue")
+
+        # C3a: the dataset-fitted tier CANNOT follow. The PCA basis is fit over
+        # every cell in the movie and k-means over that basis, so recomputing a
+        # few rows would score them against a model fit on the OLD feature
+        # distribution -- and refitting moves labels EVERYWHERE, not only in the
+        # range the user asked about. There is no correct local recomputation,
+        # so these are reported out of date and left alone. Refitting is the
+        # user's decision because its blast radius is the whole movie.
+        for name in ("Cells_info_PCA.xlsx", "cells_clustering_results.xlsx"):
+            if os.path.exists(os.path.join(folder, name)):
+                report["stale_after"].append(name)
+        if report["stale_after"]:
+            report["note"] = (
+                "Frames %s re-extracted (%s). PCA and cluster labels were fit on the previous "
+                "features and are now out of date for those frames -- re-run Classify to refit. "
+                "Refitting changes labels outside this range too, which is why it is not automatic."
+                % (", ".join(str(f) for f in frames), " + ".join(report["recomputed"]))
+            )
+        else:
+            report["note"] = ("Frames %s re-extracted (%s)."
+                              % (", ".join(str(f) for f in frames), " + ".join(report["recomputed"])))
+        return report
+
     def _run_local_retrack(self, start_frame: int, end_frame: int) -> None:
         try:
             if self.cells_info is None or self.tracking_data is None:
                 raise ValueError("Extract and track the movie before re-tracking a range.")
             cb = self._progress_cb("retrack")
 
-            # A5: refuse rather than silently mixing old features with new
-            # masks. The whole point of this feature is "you hand-corrected the
-            # segmentation", and that is exactly the state in which
-            # `Cells_info` no longer describes those masks.
-            stale = self.get_stale_frames().get("cells_info_stale_frames") or []
-            affected = [f for f in stale if start_frame - 1 <= f <= end_frame + 1]
-            if affected:
-                raise ValueError(
-                    "Frame(s) %s changed after the last Extract, so Cells_info no longer describes "
-                    "these masks. Re-run Extract first -- re-tracking now would combine old centroids "
-                    "and radii with new masks, and the overlap term would be keyed by labels that may "
-                    "no longer exist." % ", ".join(str(f) for f in affected)
-                )
+            # Round 13 §A5 REFUSED here when `Cells_info` was stale. That
+            # stopped the corruption but left the user to fix it by hand, and
+            # left a window in which the two could diverge again. Round 19 C3
+            # closes it: re-track re-extracts the range it is about to
+            # re-track, including the seam frames the cost actually reads, so
+            # the geometry the tracker sees is by construction the geometry of
+            # the masks on disk.
+            span = set(range(start_frame - 1, end_frame + 2)) & set(self.get_frame_numbers())
+            cb(f"Re-extracting frames {min(span)}-{max(span)}...", 5)
+            extraction = self._reextract_frames(span)
 
             cb(f"Re-tracking frames {start_frame}-{end_frame}...", 10)
             registration = self._registration() if self.drift_mode != "none" else {}
@@ -1902,7 +2145,8 @@ class EpiQuantAPI:
                 self.tracking_data = result.pop("tracking_data")
 
             cb("Re-track complete.", 100)
-            self._notify("onRetrackDone", {**result, "track_count": int(len(self.tracking_data))})
+            self._notify("onRetrackDone", {**result, "track_count": int(len(self.tracking_data)),
+                                           "extraction": extraction})
         except Exception as e:
             logger.exception("Local re-track failed")
             self._notify("onRetrackError", {"message": str(e)})
@@ -1927,13 +2171,37 @@ class EpiQuantAPI:
         label_of = {t: l for l, t in self._label_to_track(frame_number).items() if t is not None}
         states: dict = {}
 
-        # A T1 needs no human confirmation, but it does need to have settled:
-        # a cell whose exchange reverses next frame renders faded, the same
-        # treatment an unconfirmed division candidate gets.
+        # A T1 needs no human confirmation, but it does need to have settled --
+        # and `t1_event_filter` decides whether an unsettled one is DRAWN AT
+        # ALL, not merely dimmed (Round 17 C3).
+        #
+        # It used to be applied only to the nematic axes, in
+        # `get_trajectory_overlay`, so `settled only` hid ten axes and left ten
+        # faded olive cells painted under them: the filter and the fill were
+        # two code paths and only one of them had heard of it. Applying it here
+        # means every consumer of `_dynamics_states` gets the same answer.
+        #
+        # **Deliberately T1-only.** Divisions and delaminations run through the
+        # same `confirmed -> dim` rendering path, but the decision is not the
+        # same one: an unconfirmed division CANDIDATE has to stay visible or it
+        # can never be confirmed, whereas an unsettled T1 is noise the user
+        # asked to stop seeing. Same mechanism, different answers, on purpose.
         t1 = found.get("t1", {})
         settled_labels = {int(label) for label in t1.get("counts_persistent", {})}
+        unjudgeable_labels = {int(label) for label in t1.get("counts_unjudgeable", {})}
+        keep = self._EVENT_FILTER_STATES[self.t1_event_filter]
         for entry in t1.get("counts", {}):
-            states[int(entry)] = {"event": "t1", "confirmed": int(entry) in settled_labels}
+            label = int(entry)
+            if label in settled_labels:
+                state = "persistent"
+            elif label in unjudgeable_labels:
+                state = "unjudgeable"
+            else:
+                state = "transient"
+            if state not in keep:
+                continue
+            states[label] = {"event": "t1", "confirmed": state == "persistent",
+                             "t1_state": state}
         for cand in found["delaminations"]:
             label = label_of.get(cand["track"])
             if label is not None:
@@ -1995,6 +2263,143 @@ class EpiQuantAPI:
             "n": len(scores),
         }
 
+    # --- Docked frame stepper (Round 16 E) -----------------------------------
+    #
+    # After clicking a cell to edit it, the main view could only render that
+    # frame: stepping forward or back lost the selection. This panel steps
+    # independently, so the selection is never touched.
+
+    def get_track_filmstrip(self, track_id: int) -> dict:
+        """Which frames the track actually holds a cell in, so gaps are visible
+        at a glance rather than discovered by stepping into them."""
+        if self.tracking_data is None:
+            return {"error": "No tracking data loaded."}
+        id_col = self.tracking_data.columns[0]
+        rows = self.tracking_data.index[self.tracking_data[id_col] == int(track_id)]
+        if not len(rows):
+            return {"error": f"Track {track_id} not found."}
+        row = rows[0]
+        frames = self.get_frame_numbers()
+        held = [f for f in frames
+                if f"Frame{f}" in self.tracking_data.columns
+                and pd.notna(self.tracking_data.at[row, f"Frame{f}"])]
+        return {"track_id": int(track_id), "frames": frames, "held": held}
+
+    def _anchor_window(self, track_id: int, anchor_frame: int, pad: int):
+        """The one window shared by `anchor_frame` and its two neighbours."""
+        id_col = self.tracking_data.columns[0]
+        rows = self.tracking_data.index[self.tracking_data[id_col] == int(track_id)]
+        if not len(rows):
+            return None
+        row = rows[0]
+        boxes = []
+        for number in (anchor_frame - 1, anchor_frame, anchor_frame + 1):
+            column = f"Frame{number}"
+            if column not in self.tracking_data.columns:
+                continue
+            value = self.tracking_data.at[row, column]
+            if pd.isna(value):
+                continue
+            loaded = self._load_frame(int(number))
+            if loaded is None or loaded[0] is None:
+                continue
+            box = self._cell_window(loaded[0], int(str(value).rsplit("_", 1)[1]), pad=pad)
+            if box is not None:
+                boxes.append(box)
+        if not boxes:
+            return None
+        return (min(b[0] for b in boxes), max(b[1] for b in boxes),
+                min(b[2] for b in boxes), max(b[3] for b in boxes))
+
+    def get_track_step_frame(self, track_id: int, anchor_frame: int, frame: int,
+                             show_labels: bool = False, show_outline: bool = False,
+                             label_size: int = 10, pad: int = 28,
+                             outline_color: str = "#ff0000") -> dict:
+        """One crop of `track_id` at `frame`, anchored at `anchor_frame`.
+
+        **The window rule is explicit, and the answer says which one is in
+        force** (Round 16 E2), because the two are answering different
+        questions and silently picking one would make the panel lie:
+
+        - **within one frame of the anchor**: the SHARED window, unioned over
+          the anchor cell and this frame's cell, so the immediate before/after
+          is a true blink -- the cell moves and the background does not;
+        - **beyond that**: re-centred on this frame's own cell, because under
+          `embryos_GBE_GAP43`'s ~6.5 px/frame drift a fixed window loses the
+          cell entirely within a few steps. `recentred` is True and the caller
+          must show it.
+
+        Returns `{"image", "recentred", "cell_index", "held", ...}`. `held` is
+        False when the track has no cell at that frame -- the panel still
+        renders the neighbourhood so the gap can be seen, rather than going
+        blank.
+        """
+        if self.tracking_data is None:
+            return {"error": "No tracking data loaded."}
+        id_col = self.tracking_data.columns[0]
+        rows = self.tracking_data.index[self.tracking_data[id_col] == int(track_id)]
+        if not len(rows):
+            return {"error": f"Track {track_id} not found."}
+        row = rows[0]
+
+        def cell_at(number):
+            column = f"Frame{number}"
+            if column not in self.tracking_data.columns:
+                return None
+            value = self.tracking_data.at[row, column]
+            return None if pd.isna(value) else str(value)
+
+        loaded = self._load_frame(int(frame))
+        if loaded is None or loaded[0] is None:
+            return {"error": f"No segmentation for frame {frame}."}
+        labels = loaded[0]
+
+        cell_index = cell_at(int(frame))
+        label = None if cell_index is None else int(str(cell_index).rsplit("_", 1)[1])
+        anchor_cell = cell_at(int(anchor_frame))
+        anchor_label = None if anchor_cell is None else int(str(anchor_cell).rsplit("_", 1)[1])
+
+        recentred = abs(int(frame) - int(anchor_frame)) > 1
+        window = None
+        if not recentred and anchor_label is not None:
+            # ONE window for the whole +/-1 neighbourhood, unioned over the
+            # anchor and BOTH its neighbours -- not over the anchor and
+            # whichever frame is being asked for. Per-frame unions differ from
+            # each other (measured on `AS_dorsal view_E-cad` track 1: 147x85,
+            # 130x77, 164x100 for three supposedly shared frames), so stepping
+            # -1 -> 0 -> +1 moved the background and the blink stopped being a
+            # blink. All three must be byte-identical in size and origin.
+            window = self._anchor_window(int(track_id), int(anchor_frame), int(pad))
+        if window is None and label is not None:
+            window = self._cell_window(labels, label, pad=int(pad))
+            recentred = recentred or int(frame) != int(anchor_frame)
+        if window is None:
+            # No cell here and no anchor window: fall back to the anchor's own
+            # box so the panel shows WHERE the track was, not a blank.
+            anchor_loaded = self._load_frame(int(anchor_frame))
+            if anchor_loaded is None or anchor_label is None:
+                return {"error": f"Track {track_id} has no cell at frame {anchor_frame} to anchor on."}
+            window = self._cell_window(anchor_loaded[0], anchor_label, pad=int(pad))
+            recentred = False
+        if window is None:
+            return {"error": f"Could not place a crop window for track {track_id}."}
+
+        return {
+            "track_id": int(track_id), "frame": int(frame), "anchor_frame": int(anchor_frame),
+            "cell_index": cell_index, "held": cell_index is not None,
+            "recentred": bool(recentred),
+            "window_note": ("re-centred on this frame -- background moves, so this shows where the "
+                            "track goes, not whether it swapped"
+                            if recentred else
+                            "shared window with the anchor frame -- background is fixed, so this is "
+                            "a true blink"),
+            "image": self._cell_crop(int(frame), labels, label, window, "#00ff88",
+                                     show_labels=bool(show_labels),
+                                     show_outline=bool(show_outline),
+                                     label_size=int(label_size),
+                                     outline_color=outline_color or "#ff0000"),
+        }
+
     # --- Ground-truth census: one link at a time -----------------------------
     #
     # Round 14 §A3 left a question no reference-free metric can answer: every
@@ -2014,9 +2419,27 @@ class EpiQuantAPI:
     def start_census(self, kind: str = "geometry_flagged", frame: int = None,
                      decoy_rate: float = census.DEFAULT_DECOY_RATE,
                      repeat_rate: float = census.DEFAULT_REPEAT_RATE,
-                     seed: int = 0, labeller: str = "") -> dict:
-        """Build the labelling queue. `kind` is `geometry_flagged` (the whole
-        movie's disagreements) or `frame_pair` (every link in one pair).
+                     seed: int = 0, labeller: str = "", mode: str = "census") -> dict:
+        """Build the queue. `kind` is `geometry_flagged` (the whole movie's
+        disagreements) or `frame_pair` (every link in one pair).
+
+        `mode` picks what the session is FOR, and the two are mutually
+        exclusive by construction (Round 16 C2):
+
+        | | `census` | `correct` |
+        |---|---|---|
+        | writes | verdicts to `ground_truth_links.csv` | pending edits, one batch |
+        | mutates `tracking_data` | **never** | on Apply all |
+        | decoys / silent repeats | on | **off** |
+
+        **Ground truth collected against a tracking run is not valid for a run
+        it corrected**, so a session writes verdicts or edits, never both. The
+        mode is stamped into the provenance, and the two write paths refuse
+        each other rather than relying on the UI to keep them apart.
+
+        Decoys are forced off in correction mode: a decoy displays a
+        deliberately wrong link, and accepting one would inject a deliberate
+        error into the tracking table.
 
         The judge is registered whenever the tracking was, and the answer says
         so. An overlap reference computed on unregistered masks scoring a
@@ -2025,10 +2448,18 @@ class EpiQuantAPI:
         """
         if self.tracking_data is None:
             return {"error": "Track the movie before starting a census."}
+        if mode not in ("census", "correct"):
+            return {"error": f"Unknown census mode {mode!r}; expected 'census' or 'correct'."}
+        if mode == "correct":
+            decoy_rate = repeat_rate = 0.0
         masks = self._census_masks()
         if len(masks) < 2:
             return {"error": "Need at least two frames with masks."}
-        register = self.drift_mode != "none"
+        # The convention of the RUN, not of the current setting. Falling back to
+        # the setting only when the run's is unknown (a table loaded from disk),
+        # and the answer says which it was.
+        run_mode = self.tracking_drift_mode if self.tracking_drift_mode is not None else self.drift_mode
+        register = run_mode != "none"
         drift = self._registration().get("drift_by_frame") if register else None
         if kind == "frame_pair":
             if frame is None:
@@ -2037,6 +2468,21 @@ class EpiQuantAPI:
         elif kind == "geometry_flagged":
             items = census.geometry_flagged_items(
                 self.tracking_data, masks, register=register, drift_by_frame=drift)
+        elif kind == "environment_flagged":
+            # The repair tier (0.5), not the look tier (0.75): the look tier
+            # flags several times as many cells, which is the wrong size for a
+            # census. Users correct what the visualisation flags, and this is
+            # one of the two overlays they actually read.
+            scores = {}
+            for frame in sorted(masks):
+                if frame + 1 not in masks:
+                    continue
+                per_frame = self._environment_scores(frame, "next")
+                if per_frame:
+                    scores[frame] = per_frame
+            items = census.environment_flagged_items(
+                self.tracking_data, scores, masks,
+                threshold=float(self.environment_repair_threshold))
         else:
             return {"error": f"Unknown census kind {kind!r}."}
         if not items:
@@ -2046,16 +2492,41 @@ class EpiQuantAPI:
                                    repeat_rate=float(repeat_rate), seed=int(seed))
         self._census = {
             "queue": queue, "masks": masks, "kind": kind, "frame": frame,
-            "register": register, "labeller": labeller,
+            "register": register, "labeller": labeller, "mode": mode,
+            # Kept so `get_census_item` can drift-correct its candidate search
+            # without re-deriving the registration for every item.
+            "drift_by_frame": drift,
             "session_id": coverage_log.new_session_id(),
             "path": os.path.join(self.output_dirs["cell_track_output"], "ground_truth_links.csv"),
+            "edits": {},      # position -> {"chosen_label": int|None}
+            "undo": None,     # the whole-table snapshot Apply-all can restore
+            # position -> [{"label", "reason", "rank"}], filled in by
+            # `get_census_item`, so a verdict can say WHICH ranking first
+            # proposed the cell the human picked without the frontend having to
+            # send it back (Round 23 D).
+            "candidates": {},
+            "environment_threshold": (float(self.environment_repair_threshold)
+                                      if kind == "environment_flagged" else None),
         }
         self._write_census_provenance()
         return {"n": len(queue), "n_real": len(items),
                 "n_decoys": sum(1 for e in queue if e["is_decoy"]),
                 "n_repeats": sum(1 for e in queue if e["is_repeat"]),
-                "kind": kind, "register": register,
-                "session_id": self._census["session_id"], "path": self._census["path"]}
+                "kind": kind, "mode": mode, "register": register,
+                # What the queue size MEANS. On GBE, measured on matching
+                # inputs: tracking and judge both unregistered gives 255 items
+                # (3.53%), both registered gives 25 (0.35%) -- the same movie,
+                # 10x apart, because without registration the centroid term and
+                # the greedy overlap reference respond to 6.98 px/frame drift
+                # differently. The queue size is a diagnostic, not a UI problem:
+                # never capped, never filtered.
+                "tracking_drift_mode": run_mode,
+                "convention_from_run": self.tracking_drift_mode is not None,
+                "current_drift_setting": self.drift_mode,
+                "setting_changed_since_tracking": (self.tracking_drift_mode is not None
+                                                   and self.tracking_drift_mode != self.drift_mode),
+                "session_id": self._census["session_id"],
+                "path": self._census["path"] if mode == "census" else None}
 
     def _write_census_provenance(self) -> None:
         """Ground truth collected against one tracking run is not automatically
@@ -2066,6 +2537,7 @@ class EpiQuantAPI:
             "written_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             "session_id": state["session_id"],
             "kind": state["kind"],
+            "mode": state["mode"],
             "frame": state["frame"],
             "labeller": state["labeller"],
             "judge_registered": state["register"],
@@ -2113,8 +2585,22 @@ class EpiQuantAPI:
         if window is None:
             return {"error": f"Cell {item['label']} has no pixels at frame {frame}."}
 
-        candidates = self._census_candidates(item, after_labels, window)
+        drift = (0.0, 0.0)
+        if state["register"]:
+            drift = ((state.get("drift_by_frame") or {}).get(frame)
+                     or tracking_benchmark.estimate_frame_drift(masks, frame) or (0.0, 0.0))
+        # Capped at 12 (four pages of three). Beyond that the list is not a
+        # shortlist any more (Round 20 C2).
+        candidates = self._census_candidates(item, before_labels, after_labels, window, drift,
+                                             limit=12)
+        state["candidates"][int(position)] = [
+            {"label": c["label"], "reason": c["reason"], "rank": c["rank"]}
+            for c in candidates]
         return {
+            # How far down each source's own ranking the merge actually got.
+            # Not the same thing as `len(candidates)` -- Round 22 reported the
+            # latter and believed it was the former (Round 23 A).
+            "candidate_depth": getattr(self, "_last_candidate_depth", {}),
             "position": int(position), "total": len(queue),
             "item_id": item["item_id"], "frame": frame, "label": item["label"],
             "track_id": item["track_id"], "shown_label": item["shown_label"],
@@ -2129,63 +2615,557 @@ class EpiQuantAPI:
             "candidates": candidates,
         }
 
-    def _census_window(self, before_labels, after_labels, item, pad):
-        ys, xs = np.nonzero(before_labels == int(item["label"]))
+    # --- One cropper, used by the census queue and the frame stepper ----------
+    #
+    # The shared-window property is the subtle part -- it is what makes the
+    # census blink a true toggle rather than two independently re-cropped
+    # images, where the cell sits still and the BACKGROUND jumps. Two croppers
+    # would diverge on exactly that, so there is one (Round 16 E3).
+
+    def _cell_window(self, labels_a, label_a, labels_b=None, label_b=None, pad: int = 28):
+        """The tight box around one cell, optionally unioned with a second
+        cell in another frame so both fit one window."""
+        ys, xs = np.nonzero(labels_a == int(label_a))
         if not len(ys):
             return None
-        if item["shown_label"] is not None:
-            ys2, xs2 = np.nonzero(after_labels == int(item["shown_label"]))
+        if labels_b is not None and label_b is not None:
+            ys2, xs2 = np.nonzero(labels_b == int(label_b))
             if len(ys2):
                 ys = np.concatenate([ys, ys2]); xs = np.concatenate([xs, xs2])
-        height, width = before_labels.shape
+        height, width = labels_a.shape
         return (max(0, int(ys.min()) - pad), min(height, int(ys.max()) + pad + 1),
                 max(0, int(xs.min()) - pad), min(width, int(xs.max()) + pad + 1))
 
-    def _census_crop(self, frame_number, labels, label, window, color):
+    def _cell_crop(self, frame_number, labels, label, window, color,
+                   show_labels: bool = False, show_outline: bool = False,
+                   label_size: int = 10, outline_color: str = "#ff0000"):
         from PIL import Image
         loaded = self._load_frame(frame_number)
         base = loaded[2] if loaded else None
         if base is None:
             base = np.zeros(labels.shape + (3,), dtype=np.uint8)
+        if label is not None:
+            array = rendering.render_cell_highlight(labels, base, int(label), color)
+            array = np.asarray(array)
+        else:
+            array = base.copy()
+        if show_outline:
+            # Red by default (Round 18 B2): the membrane signal is grey-white
+            # and the highlight fills are green, so a green outline has the
+            # least separation of any available choice.
+            array = rendering.draw_cell_outlines(np.array(array), labels, outline_color)
+        image = Image.fromarray(np.asarray(array))
+        if show_labels:
+            # TRACK ids, from the same resolver the main overlay uses. The
+            # inset used to draw raw labels, which Cellpose renumbers every
+            # frame -- so stepping it made every number change even where
+            # tracking was perfect, the exact opposite of what the panel is
+            # for (Round 17 C2b).
+            image = rendering.draw_cell_labels(
+                image, labels, font_size=int(label_size),
+                matched_lookup=rendering.build_matched_lookup(self.tracking_data, int(frame_number)),
+                frame_number=int(frame_number),
+            )
         top, bottom, left, right = window
-        image = rendering.render_cell_highlight(labels, base, int(label), color) \
-            if label is not None else Image.fromarray(base)
         return rendering.encode_png_base64(image.crop((left, top, right, bottom)))
 
-    def _census_candidates(self, item, after_labels, window):
-        """The alternatives offered when the verdict is "wrong": the overlap
-        reference's own pick, then the nearest other cells. Numbered, so the
-        labeller presses a digit instead of clicking a small target."""
-        shown = item.get("shown_label")
-        options, seen = [], {shown}
-        for label in (item.get("reference_label"), item.get("true_label")):
-            if label is not None and label not in seen:
-                options.append(int(label)); seen.add(int(label))
-        centres = census._centroids(after_labels)
-        origin = centres.get(int(shown)) if shown is not None else None
-        if origin is not None:
-            nearby = sorted(((np.hypot(c[0] - origin[0], c[1] - origin[1]), l)
-                             for l, c in centres.items() if l not in seen),
-                            key=lambda pair: pair[0])
-            options.extend(int(l) for _, l in nearby[:3])
-        return [{"label": label,
-                 "image": self._census_crop(item["frame"] + 1, after_labels, label, window, "#ff6b6b")}
-                for label in options[:3]]
+    def _census_window(self, before_labels, after_labels, item, pad):
+        return self._cell_window(before_labels, item["label"],
+                                 after_labels, item.get("shown_label"), pad=pad)
+
+    def _census_crop(self, frame_number, labels, label, window, color):
+        return self._cell_crop(frame_number, labels, label, window, color)
+
+    def _census_candidates(self, item, before_labels, after_labels, window,
+                           drift=(0.0, 0.0), limit: int = 12):
+        """The alternatives offered when the verdict is "wrong", seeded from the
+        **anchor** rather than from the tracker's answer.
+
+        **This is a MERGE of several rankings, not a concatenation truncated to
+        three.** It used to accumulate four sources and then take `[:3]`, which
+        meant sources 3 and 4 could never appear unless source 2 ran short --
+        and for an `environment_flagged` item source 1 is empty by construction
+        (there is no overlap reference for that set), so the offered list was
+        *always exactly the IoU ranking's top three*. When that ranking was
+        wrong there was no second opinion, though two more had been computed
+        (Round 20 C1).
+
+        The sources, round-robin so a failure in any one costs at most one slot:
+
+        1. the overlap reference's pick, where the set provides one;
+        2. highest IoU after shifting the anchor's mask by the global median
+           drift;
+        3. highest **coverage** of the shifted anchor -- `|A n B| / |A|`;
+        4. nearest centroid, drift-corrected;
+        5. nearest to where the tracker pointed, as a last resort.
+
+        Each source is ranked 12 deep, and `CANDIDATE_QUOTAS` decides how much
+        of that depth each may spend before the others get a turn; whatever a
+        source cannot fill is handed back so the list still reaches `limit`.
+        The quotas exist because Round 22 raised both cuts from 4 to 12 and
+        changed nothing: the merge is depth-first, so with three non-empty
+        sources and `limit=12` it stopped after rank 3 and every source
+        contributed the same first four as before. The list grew from 4-5 to 12
+        only because those four stopped duplicating each other. See
+        `_merge_candidate_sources`.
+
+        **Sources 2 and 3 fail in opposite directions, which is why both are
+        here.** IoU penalises a size difference in both directions, so when the
+        true successor is much larger than the anchor it barely separates it
+        from a same-size neighbour; coverage normalises by the anchor only, so
+        it does not -- but when the anchor divides into two smaller daughters
+        it is IoU that separates the daughter better. `docs/census.md` §8.8
+        works both pairs out. That is **algebra, not a measurement**: which
+        source a human actually picks is recorded per verdict (`chosen_reason`,
+        `chosen_rank`), and that is what decides whether coverage stays.
+
+        **A per-cell constant-velocity source was built and then removed** --
+        the reasoning was that a single global translation is a poor model for
+        germband extension, which converges along one axis and extends along the
+        other. It measured worse at rank 3 on every dataset and queue kind tried
+        (GBE geometry 77.9% -> 75.7%, GBE environment 89.5% -> 88.2%,
+        `AS_dorsal` geometry 100% -> 95.2%) and gained nothing at full depth: it
+        displaced good candidates off the first page. `v2/docs/census.md` §8.4
+        has the table, so it does not need re-measuring to stay removed.
+
+        **IoU and the motion prediction PROPOSE here; they do not score.**
+        Nothing is measured and no figure comes out of this ordering -- it
+        arranges a shortlist and the human decides. That is not the circularity
+        the standing constraint forbids. Do not "fix" it back.
+        """
+        anchor = int(item["label"])
+        shown = None if item.get("shown_label") is None else int(item["shown_label"])
+        frame = int(item["frame"])
+
+        moved_before = before_labels
+        if drift and (drift[0] or drift[1]):
+            moved_before = tracking_benchmark.shift_labels(before_labels, drift[0], drift[1])
+
+        def _ranked(pairs):
+            ranked = sorted(((value, b) for (a, b), value in pairs.items() if a == anchor),
+                            reverse=True)
+            return [(int(b), round(float(v), 3)) for v, b in ranked[:12]]
+
+        def iou_ranking():
+            return _ranked(cell_tracking.mask_overlap_fractions(moved_before, after_labels))
+
+        def coverage_ranking():
+            # `|A n B| / |A|`, NOT the raw intersection: the raw intersection
+            # favours whichever candidate is biggest, which is the failure this
+            # source exists to avoid. See `mask_coverage_fractions`.
+            return _ranked(cell_tracking.mask_coverage_fractions(moved_before, after_labels))
+
+        centres_after = census._centroids(after_labels)
+        centres_before = census._centroids(before_labels)
+
+        def nearest_to(point):
+            if point is None:
+                return []
+            ranked = sorted(((np.hypot(c[0] - point[0], c[1] - point[1]), label)
+                             for label, c in centres_after.items()), key=lambda pair: pair[0])
+            return [(int(label), round(float(distance), 1)) for distance, label in ranked[:12]]
+
+        origin = centres_before.get(anchor)
+        drifted_origin = None if origin is None else (origin[0] + drift[0], origin[1] + drift[1])
+
+        sources = [
+            ("reference", [(int(l), None) for l in
+                           (item.get("reference_label"), item.get("true_label")) if l is not None]),
+            ("overlap", iou_ranking()),
+            ("coverage", coverage_ranking()),
+            ("nearest", nearest_to(drifted_origin)),
+            ("pointed", nearest_to(centres_after.get(shown)) if shown is not None else []),
+        ]
+
+        # `shown` is excluded: it is what the user is already looking at, and
+        # offering it as an alternative is offering nothing.
+        merged, depth_reached = self._merge_candidate_sources(
+            sources, limit, {shown} if shown is not None else set())
+        # Reachable from the product, not only from a measurement script
+        # (`CLAUDE.md` rule 6 case 2): `get_census_item` returns it and the
+        # harness prints it. A depth that can only be measured out of band is
+        # how Round 22 came to report a list length as if it were a depth.
+        self._last_candidate_depth = dict(depth_reached)
+
+        # Every tile gets its OWN window, the same pixel size as the anchor's,
+        # centred on that candidate (Round 23 C2). It used to be one window
+        # grown to contain all of them at once (`_window_containing`), which
+        # was tolerable at 4-5 nearby candidates and became unusable at 12: the
+        # candidates span ~50 px, so the shared window opened out to most of the
+        # field and every candidate tile rendered as a whole-tissue thumbnail
+        # with the cell a few pixels across, beside a tightly-cropped anchor.
+        # Two images at different scales cannot be compared, which is the one
+        # thing this panel exists for.
+        for rank, candidate in enumerate(merged, start=1):
+            candidate["rank"] = rank
+            candidate["image"] = self._census_crop(
+                frame + 1, after_labels, candidate["label"],
+                self._window_like(window, after_labels, candidate["label"]), "#ff6b6b")
+            # Every tile states its BASIS in the same words. They used to read
+            # "13.4 px", "16.5 px from the link", "26.1 px" -- three tiles, two
+            # different origins, and only one of them saying which. A user
+            # cannot compare numbers measured from different points
+            # (Round 21 C3).
+            #
+            # And the words name a PLACE (Round 23 C3): "the cell" and "the
+            # link" are not locations, and the maintainer asked what the
+            # difference was -- which is the answer. "the anchor at frame N" is
+            # the cell being judged, at f; "the tracker's answer" is the cell it
+            # linked to, at f+1.
+            candidate["why"] = {
+                "reference": "the overlap reference's pick",
+                "overlap": (f"IoU {candidate['detail']} with the anchor at frame {frame}"
+                            if candidate["detail"] is not None
+                            else f"overlaps the anchor at frame {frame}"),
+                "coverage": (f"covers {round(100 * candidate['detail'])}% of the anchor at frame {frame}"
+                             if candidate["detail"] is not None
+                             else f"covers the anchor at frame {frame}"),
+                "nearest": (f"{candidate['detail']} px from the anchor at frame {frame}"
+                            if candidate["detail"] is not None
+                            else f"near the anchor at frame {frame}"),
+                "pointed": (f"{candidate['detail']} px from the tracker's answer"
+                            if candidate["detail"] is not None
+                            else "near the tracker's answer"),
+            }[candidate["reason"]]
+        return merged
+
+    #: How deep each source may be searched before the others get the rest of
+    #: the budget. They sum to more than `limit`, deliberately: whatever a
+    #: source cannot fill is handed back, so the list still reaches `limit`.
+    #:
+    #: The split is not even, and the measurement says why (Round 23 A3, GBE
+    #: `environment_flagged`, 64 items, this run's own extraction + tracking):
+    #: the 12th-nearest cell already sits a median **49.8 px** from the anchor,
+    #: about 3.8 GBE cell radii, and a normally-moving cell's successor is not
+    #: out there -- so ranks 4-12 of `nearest` are budget spent where it cannot
+    #: help. `overlap` is the shallow one: only 1-5 f+1 cells overlap the anchor
+    #: at all (9 of 64 items have exactly one), so it usually cannot spend even
+    #: its four.
+    CANDIDATE_QUOTAS = {"reference": 2, "overlap": 4, "coverage": 4,
+                        "nearest": 3, "pointed": 2}
+
+    @classmethod
+    def _merge_candidate_sources(cls, sources, limit, exclude, quotas=None):
+        """Round-robin `[(reason, [(label, detail), ...]), ...]` into one list,
+        each source held to its quota until the others have had their turn.
+
+        Returns `(merged, depth_reached)` -- `depth_reached[reason]` is **how
+        far down that source's own ranking the merge actually got**, 1-based,
+        and 0 for a source that contributed nothing.
+
+        That second return value is the whole point (Round 23 A2). Round 22
+        raised each source's own cut from `[:4]` to `[:12]` and the walk from
+        `range(4)` to `range(12)`, and reported that the offered list grew from
+        4-5 to 12 -- which it did, **without any source being searched one rank
+        deeper**. The merge is depth-first: rank 0 from every source, then rank
+        1 from every source, and so on. With three non-empty sources (source 1
+        is empty by construction for `environment_flagged`) and `limit=12` it
+        stops after rank 3, so every source contributed exactly its first four,
+        the same four as before. The list got longer only because those first
+        four stopped duplicating each other.
+
+        **List length is not search depth**, and reporting the first is what hid
+        that the second had not moved.
+
+        Two passes: quota first, then the leftovers. The second pass is what
+        keeps the list at `limit` when a source runs dry -- on GBE `overlap`
+        typically offers 1-3 entries against a quota of 4, and that slack goes
+        to whichever source still has entries rather than shortening the list.
+        """
+        quotas = cls.CANDIDATE_QUOTAS if quotas is None else quotas
+        merged, seen = [], set(exclude)
+        depth_reached = {reason: 0 for reason, _ in sources}
+        taken = {reason: 0 for reason, _ in sources}
+
+        def offer(reason, entries, cap):
+            for depth in range(taken[reason], len(entries)):
+                if taken[reason] >= cap or len(merged) >= limit:
+                    return
+                label, detail = entries[depth]
+                taken[reason] = depth + 1
+                if label in seen:
+                    continue
+                seen.add(label)
+                merged.append({"label": label, "reason": reason, "detail": detail})
+                depth_reached[reason] = depth + 1
+                return
+
+        longest = max((len(entries) for _, entries in sources), default=0)
+        for _ in range(longest):                      # quota pass
+            if len(merged) >= limit:
+                break
+            for reason, entries in sources:
+                offer(reason, entries, quotas.get(reason, 0))
+        for _ in range(longest):                      # leftover pass
+            if len(merged) >= limit:
+                break
+            before = len(merged)
+            for reason, entries in sources:
+                offer(reason, entries, longest)
+            if len(merged) == before:
+                break
+        return merged, depth_reached
+
+    @staticmethod
+    def _window_like(window, labels, label):
+        """A window the SAME pixel size as `window`, centred on `label`.
+
+        Same size is the point: the crops are encoded at 1:1 and sized by CSS,
+        so two crops render at the same scale only if they have the same pixel
+        dimensions. Centred rather than grown, so the candidate is not a speck
+        at the edge of a wide view (Round 23 C2). Clamped at the image bounds,
+        which can shift the centre but never changes the size unless the window
+        is larger than the frame.
+        """
+        top, bottom, left, right = window
+        height, width = labels.shape
+        box_h, box_w = bottom - top, right - left
+        ys, xs = np.nonzero(labels == int(label))
+        if not len(ys):
+            return window
+        cy, cx = (int(ys.min()) + int(ys.max())) // 2, (int(xs.min()) + int(xs.max())) // 2
+        new_top = min(max(0, cy - box_h // 2), max(0, height - box_h))
+        new_left = min(max(0, cx - box_w // 2), max(0, width - box_w))
+        return (new_top, min(height, new_top + box_h),
+                new_left, min(width, new_left + box_w))
+
+    @staticmethod
+    def _window_containing(window, labels, extra_labels, pad: int = 8):
+        """Grow `window` until it contains every label in `extra_labels`.
+
+        No longer used for census candidates -- each of those now gets its own
+        equally-sized window via `_window_like` (Round 23 C2). Kept because the
+        frame stepper's shared-window property is built on the same idea."""
+        top, bottom, left, right = window
+        height, width = labels.shape
+        for label in extra_labels:
+            ys, xs = np.nonzero(labels == int(label))
+            if not len(ys):
+                continue
+            top = min(top, max(0, int(ys.min()) - pad))
+            bottom = max(bottom, min(height, int(ys.max()) + pad + 1))
+            left = min(left, max(0, int(xs.min()) - pad))
+            right = max(right, min(width, int(xs.max()) + pad + 1))
+        return (top, bottom, left, right)
 
     def submit_census_verdict(self, position: int, verdict: str,
                               chosen_label: int = None, ms_elapsed: float = 0.0) -> dict:
         state = getattr(self, "_census", None)
         if not state:
             return {"error": "Start a census first."}
+        if state["mode"] != "census":
+            return {"error": "This is a correction session; it cannot write ground truth. "
+                            "Ground truth collected against a tracking run is not valid for a "
+                            "run it corrected -- start a census session instead."}
         queue = state["queue"]
         if not 0 <= int(position) < len(queue):
             return {"error": f"Position {position} is outside the queue."}
+        # Which source first proposed the chosen cell, and where it sat. Looked
+        # up from the list this API itself offered rather than sent back by the
+        # frontend: the frontend would have to be trusted to report the reason
+        # of the tile it drew, and a mismatch there is exactly the kind of thing
+        # that would never surface.
+        reason, rank = "", None
+        if chosen_label is not None:
+            for entry in state.get("candidates", {}).get(int(position), []):
+                if entry["label"] == int(chosen_label):
+                    reason, rank = entry["reason"], entry["rank"]
+                    break
         try:
             census.append_verdict(state["path"], state["session_id"], queue[int(position)],
-                                  verdict, chosen_label, ms_elapsed, labeller=state["labeller"])
+                                  verdict, chosen_label, ms_elapsed, labeller=state["labeller"],
+                                  chosen_reason=reason, chosen_rank=rank,
+                                  register=state["register"],
+                                  environment_threshold=state.get("environment_threshold"))
         except ValueError as error:
             return {"error": str(error)}
-        return {"saved": True, "next": int(position) + 1, "total": len(queue)}
+        return {"saved": True, "next": int(position) + 1, "total": len(queue),
+                "chosen_reason": reason, "chosen_rank": rank}
+
+    # --- Correction mode ------------------------------------------------------
+    #
+    # Same queue, same blink, same keystrokes; a different destination. Edits
+    # accumulate as pending and land in ONE batch with one snapshot and one
+    # undo -- not N sequential writes, each of which could trip
+    # `_evict_future_if_colliding` separately with no way back.
+
+    def queue_census_edit(self, position: int, chosen_label: int = None) -> dict:
+        """Record a pending correction for the item at `position`.
+
+        `chosen_label` is the label at frame f+1 the link should point to;
+        `None` means "none of these", which clears the track's claim at that
+        frame rather than pointing it anywhere. Nothing is written yet.
+        """
+        state = getattr(self, "_census", None)
+        if not state:
+            return {"error": "Start a session first."}
+        if state["mode"] != "correct":
+            return {"error": "This is a census session; it cannot edit the tracking data. "
+                            "Its verdicts judge the run as it stands -- start a correction "
+                            "session instead."}
+        queue = state["queue"]
+        if not 0 <= int(position) < len(queue):
+            return {"error": f"Position {position} is outside the queue."}
+        item = queue[int(position)]
+        if item.get("track_id") is None:
+            return {"error": f"The cell at frame {item['frame']} belongs to no track, so there is "
+                             "no link to correct here."}
+        state["edits"][int(position)] = {
+            "frame": int(item["frame"]),
+            "track_id": int(item["track_id"]),
+            "from_label": item.get("shown_label"),
+            "chosen_label": None if chosen_label is None else int(chosen_label),
+        }
+        return {"pending": len(state["edits"]), "position": int(position)}
+
+    def clear_census_edit(self, position: int) -> dict:
+        state = getattr(self, "_census", None)
+        if not state:
+            return {"error": "Start a session first."}
+        state["edits"].pop(int(position), None)
+        return {"pending": len(state["edits"])}
+
+    def _apply_census_edits_to(self, table):
+        """Apply every pending edit to `table`, in queue order. Returns
+        `(table, displaced_list, taken_from)`. `add_tracking_id` carries the
+        dedup and the eviction guard, so this does not re-implement either.
+
+        `taken_from` records every claim the batch removed from a track that did
+        not ask to lose it. `add_tracking_id`'s dedup clears the losing track's
+        cell so one cell is never owned twice (Round 15 §A3) -- necessary, but
+        it happened silently: `displaced_list` only carries
+        `_evict_future_if_colliding` relocations, so a track could lose a frame
+        with nothing in the return value saying so. Round 18 §C's invariant is
+        that no track loses a claim the return value did not report, and this is
+        what makes that assertable rather than merely true-looking.
+        """
+        state = self._census
+        id_col = table.columns[0]
+        displaced_list, taken_from = [], []
+        for position in sorted(state["edits"]):
+            edit = state["edits"][position]
+            target_frame = edit["frame"] + 1
+            column = f"Frame{target_frame}"
+            if column not in table.columns:
+                continue
+            if edit["chosen_label"] is None:
+                rows = table.index[table[table.columns[0]] == edit["track_id"]]
+                if len(rows):
+                    table.at[rows[0], column] = None
+                continue
+            cell_index = f"Cell{target_frame}_{edit['chosen_label']}"
+            # Who holds this cell right now, before the write takes it away.
+            for row in table.index:
+                if (str(table.at[row, column]) == cell_index
+                        and int(table.at[row, id_col]) != int(edit["track_id"])):
+                    taken_from.append({"frame": target_frame, "cell_index": cell_index,
+                                       "from_track_id": int(table.at[row, id_col]),
+                                       "to_track_id": int(edit["track_id"])})
+            table, displaced = manual_correction_tracking.add_tracking_id(
+                table, target_frame, edit["track_id"], cell_index,
+            )
+            if displaced is not None:
+                displaced_list.append(displaced)
+        return table, displaced_list, taken_from
+
+    def preview_census_edits(self) -> dict:
+        """Run the whole pending batch through §B1's structural checks, without
+        touching the live table."""
+        state = getattr(self, "_census", None)
+        if not state or state["mode"] != "correct":
+            return {"error": "Not a correction session."}
+        if not state["edits"]:
+            return {"error": "No pending corrections."}
+        snapshot = self.tracking_data.copy(deep=True)
+        trial, displaced, taken_from = self._apply_census_edits_to(snapshot.copy(deep=True))
+        report = manual_correction_tracking.diff_report(snapshot, trial)
+        assert self.tracking_data.astype(str).equals(snapshot.astype(str)), \
+            "previewing corrections must not mutate the live tracking table"
+        return {
+            **report,
+            "pending": len(state["edits"]),
+            "evicts": displaced,
+            "claims_removed": taken_from,
+            "takes_from": [
+                {"frame": e["frame"] + 1, "track_id": e["track_id"],
+                 "chosen_label": e["chosen_label"]}
+                for e in state["edits"].values() if e["chosen_label"] is not None
+            ],
+            "blocking": bool(report["double_claimed"] or report["orphaned"]
+                             or report["vanished_track_ids"]),
+        }
+
+    def apply_census_edits(self, force: bool = False) -> dict:
+        """Apply the whole pending batch: one snapshot, one atomic write, one
+        undo. Refuses a batch that fails a structural check unless `force`."""
+        state = getattr(self, "_census", None)
+        if not state:
+            return {"error": "Start a session first."}
+        if state["mode"] != "correct":
+            return {"error": "A census session cannot apply corrections."}
+        if not state["edits"]:
+            return {"error": "No pending corrections."}
+        preview = self.preview_census_edits()
+        if preview.get("blocking") and not force:
+            return {"error": "This batch would double-claim a cell or leave a track holding "
+                             "nothing. Nothing was applied.", "preview": preview}
+
+        snapshot = self.tracking_data.copy(deep=True)
+        asked_frames = sorted({e["frame"] + 1 for e in state["edits"].values()})
+        applied, displaced, taken_from = self._apply_census_edits_to(self.tracking_data)
+        self.tracking_data = applied
+        state["undo"] = snapshot
+        count = len(state["edits"])
+        state["edits"] = {}
+
+        # `frames_written` is MEASURED from the before/after tables, not
+        # asserted from the edit list. Reporting the edited frames was a false
+        # claim: `_evict_future_if_colliding` relocates a colliding track's
+        # ENTIRE future onto a fresh id, so a single edit at frame 3 was
+        # observed rewriting frames 3-11. The eviction is the intended
+        # behaviour -- it beats silently overwriting -- but a return value that
+        # under-reports its own reach is how a caller ends up trusting a range
+        # that was never true.
+        written = sorted(self._frames_that_differ(snapshot, applied))
+        return {"applied": count, "displaced_list": displaced,
+                "claims_removed": taken_from,
+                "frames_asked": asked_frames, "frames_written": written,
+                "beyond_asked": sorted(set(written) - set(asked_frames)),
+                "undo_available": True, "preview": preview}
+
+    @staticmethod
+    def _frames_that_differ(before, after) -> set:
+        """Which `Frame{n}` columns actually changed, compared BY TRACK ID --
+        an eviction appends a row, so the two tables need not be the same
+        length and a positional diff would be meaningless."""
+        def claims(table):
+            id_col = table.columns[0]
+            out = {}
+            for position in table.index:
+                holder = int(table.at[position, id_col])
+                for column in (c for c in table.columns if c.startswith("Frame")):
+                    value = table.at[position, column]
+                    if pd.notna(value):
+                        out[(int(column[len("Frame"):]), holder)] = str(value)
+            return out
+
+        was, now = claims(before), claims(after)
+        return {frame for (frame, _holder) in set(was) | set(now)
+                if was.get((frame, _holder)) != now.get((frame, _holder))}
+
+    def undo_census_edits(self) -> dict:
+        """Restore the table to the snapshot taken before the last Apply-all.
+
+        A restore, never an inverse operation: `add_tracking_id` may trigger
+        `_evict_future_if_colliding`, which relocates a third track's whole
+        future onto a fresh id and has no clean inverse.
+        """
+        state = getattr(self, "_census", None)
+        if not state or state.get("undo") is None:
+            return {"error": "Nothing to undo."}
+        self.tracking_data = state["undo"]
+        state["undo"] = None
+        return {"restored": True}
 
     def get_census_summary(self) -> dict:
         """Counts, decoy pass-rate, intra-rater agreement, median seconds.
@@ -2200,10 +3180,15 @@ class EpiQuantAPI:
             if self.output_dirs else None)
         if path is None:
             return {"error": "Set up the project paths first."}
-        summary = census.summarise(path, state["session_id"] if state else None)
+        try:
+            summary = census.summarise(path, state["session_id"] if state else None,
+                                       source=(state or {}).get("kind"))
+        except census.MixedSources as error:
+            return {"error": str(error)}
         if state:
             summary["queue_size"] = len(state["queue"])
             summary["judge_registered"] = state["register"]
+            summary["mode"] = state["mode"]
         return summary
 
     # --- Coverage log: what the human actually looked at ---------------------
@@ -2270,6 +3255,59 @@ class EpiQuantAPI:
         summary = coverage_log.summarise(path, cells_by_frame, **kwargs)
         summary["weak_positives"] = len(coverage_log.weak_positives(summary))
         return summary
+
+    # --- Ground truth as a CTC-style sibling folder (Round 18 E) -------------
+
+    def save_ground_truth_tracking(self, labeller: str = "", note: str = "") -> dict:
+        """Write the current tracking table as ground truth under
+        `cell_track_output/GT_All_cell_tracking/`, stamped with the run it was
+        collected against.
+
+        The normal pipeline never reads `GT_*`; it is loaded only when asked.
+        """
+        if self.tracking_data is None:
+            return {"error": "Track the movie before saving ground truth."}
+        if not self.output_dirs:
+            return {"error": "Set up the project paths first."}
+        state = getattr(self, "_census", None)
+        record = census.save_ground_truth(
+            self.output_dirs["cell_track_output"], self.tracking_data, self.tracking_data,
+            labeller=labeller or (state or {}).get("labeller", ""),
+            note=note,
+            session_id=(state or {}).get("session_id"),
+            source=(state or {}).get("kind"),
+            mode=(state or {}).get("mode"),
+            tracking_parameters={
+                "overlap_weight": self.overlap_weight,
+                "centroid_weight": self.centroid_weight,
+                "motion_compensation": self.motion_compensation,
+                "max_frame_gap": self.max_frame_gap,
+                "drift_mode": self.drift_mode,
+            },
+            resolved_inputs={"mask_folder": self.mask_folder, "npy_folder": self.npy_folder,
+                             "image_folder": self.image_folder},
+        )
+        return {"saved": census.gt_table_path(self.output_dirs["cell_track_output"]),
+                "provenance": record}
+
+    def load_ground_truth_tracking(self) -> dict:
+        """Read the GT table back, and say whether it was collected against the
+        tracking currently in memory."""
+        if not self.output_dirs:
+            return {"error": "Set up the project paths first."}
+        found = census.load_ground_truth(self.output_dirs["cell_track_output"],
+                                         against=self.tracking_data)
+        if "error" in found:
+            return found
+        table = found.pop("table")
+        found["rows"] = int(len(table))
+        if found.get("matches_current_tracking") is False:
+            found["warning"] = (
+                "This ground truth was collected against a DIFFERENT tracking table than the one "
+                "loaded. Ground truth collected against one run is not valid for a run it "
+                "corrected -- the link set itself changes."
+            )
+        return found
 
     def save_ground_truth_links(self, links: dict = None, path: str = None) -> dict:
         """Write hand-labelled links to `cell_track_output/ground_truth_links.csv`.
@@ -2609,6 +3647,119 @@ class EpiQuantAPI:
         except ValueError as e:
             return {"error": str(e)}
 
+    def verify_confirmed_identity_moves(self, track_id: int, moves: list,
+                                        drift_gate_multiplier: float = 1.5) -> dict:
+        """Run a "Check how far this holds" plan through the three structural
+        checks and the transposition score, BEFORE Apply becomes clickable.
+
+        See `v2/docs/check-how-far.md`. Three things travel back:
+
+        - the structural report (`manual_correction_tracking.verify_moves_plan`)
+          -- double claims, truncated or orphaned tracks, and any step that
+          triggers `_evict_future_if_colliding`, which still has no clean
+          inverse;
+        - each step's `distance` against the gate that admitted it
+          (`drift_gate_multiplier x last_radius`), so a step that only just
+          squeezed through is visible;
+        - a **consistency delta** from `tracking_benchmark.table_link_consistency`
+          over the frame pairs the plan touches.
+
+        **The delta is a consistency measure, never an accuracy.** It re-solves
+        the affected pairs backwards with the same cost function the tracker
+        used, so it answers "does the transposed problem confirm the links this
+        table now asserts", not "is the table right". Its degenerate case --
+        a coherent identity permutation scores 0 -- is shared with
+        `environment_dice` and `forward_backward_consistency`, so it is not a
+        second independent line on top of either. Both sides are measured under
+        one registration convention, reported in `registered`.
+
+        `forward_backward_consistency` is deliberately NOT used here even
+        though §B3 named it: it re-solves from `cells_info` and the masks and
+        never reads `tracking_data`, so its delta is identically zero for every
+        plan (measured: a fully scrambled table scores the same 48 / 2,634 on
+        `AS_dorsal view_E-cad`). A score that cannot move is worse than none.
+
+        Scoring runs on a deep copy and the live table is asserted unchanged --
+        that assertion is the safety property of an accept-and-revert loop, and
+        it is not optional.
+        """
+        if self.tracking_data is None or self.cells_info is None:
+            return {"error": "No tracking data loaded."}
+        if not moves:
+            return {"error": "This plan has no moves to verify."}
+
+        structural = manual_correction_tracking.verify_moves_plan(
+            self.tracking_data, int(track_id), moves)
+        if not structural.get("ok"):
+            return {"error": structural.get("error", "The plan could not be applied.")}
+
+        # Per-move gate context. `distance` is already in the plan and nothing
+        # displayed it; the gate is what admitted the step, so the ratio is the
+        # readable number.
+        radii = (self.cells_info.set_index("Cell Index")["Circumscribed Circle Radius"]
+                 if "Cell Index" in self.cells_info.columns
+                 else self.cells_info["Circumscribed Circle Radius"])
+        annotated = []
+        for move in moves:
+            radius = float(radii.get(move["cell_index"], float("nan"))) if len(radii) else float("nan")
+            gate = float(drift_gate_multiplier) * radius
+            distance = move.get("distance")
+            annotated.append({
+                **move,
+                "gate_px": None if gate != gate else round(gate, 2),
+                "gate_fraction": (None if (gate != gate or not gate or distance is None)
+                                  else round(float(distance) / gate, 3)),
+            })
+
+        frames = sorted({int(m["frame"]) for m in moves})
+        pairs = sorted({f - 1 for f in frames} | set(frames))
+        masks = {}
+        for frame in self.get_frame_numbers():
+            if min(pairs) <= frame <= max(pairs) + 1:
+                loaded = self._load_frame(frame)
+                if loaded is not None:
+                    masks[frame] = loaded[0]
+
+        delta = None
+        snapshot = self.tracking_data.copy(deep=True)
+        if len(masks) >= 2:
+            drift = self._registration().get("drift_by_frame") if self.register_reference else None
+            drift_mode = "mask" if drift else "none"
+            cells = (self.cells_info.set_index("Cell Index")
+                     if "Cell Index" in self.cells_info.columns else self.cells_info)
+            score = lambda table: tracking_benchmark.table_link_consistency(  # noqa: E731
+                table, cells, masks, frames=pairs,
+                drift_mode=drift_mode, drift_by_frame=drift)
+            before = score(snapshot)
+            trial, _ = manual_correction_tracking.apply_confirmed_identity_moves(
+                snapshot.copy(deep=True), int(track_id), moves)
+            after = score(trial)
+            delta = {
+                "before_unconfirmed": before["unconfirmed"],
+                "after_unconfirmed": after["unconfirmed"],
+                "delta": after["unconfirmed"] - before["unconfirmed"],
+                "n": after["n"],
+                "frames": pairs,
+                "registered": bool(drift),
+                "judge": "table_link_consistency",
+                "note": ("Consistency under transposition, using the same cost function as the "
+                         "tracker -- NOT an accuracy. Negative is fewer links the backward solve "
+                         "fails to confirm."),
+            }
+
+        # The live table must be untouched by verification. Asserted, not
+        # assumed: this is the whole safety property of an accept-and-revert.
+        assert self.tracking_data.astype(str).equals(snapshot.astype(str)), \
+            "verifying a plan must not mutate the live tracking table"
+
+        return {
+            **structural,
+            "moves": annotated,
+            "consistency": delta,
+            "blocking": bool(structural["double_claimed"] or structural["orphaned"]
+                             or structural["vanished_track_ids"]),
+        }
+
     def apply_confirmed_identity_moves(self, track_id: int, moves: list) -> dict:
         try:
             self.tracking_data, displaced_list = manual_correction_tracking.apply_confirmed_identity_moves(
@@ -2718,9 +3869,7 @@ class EpiQuantAPI:
             nematic_axes = None
             if show_nematic_axes:
                 events = self.get_t1_events(frame_number)
-                keep = {"all": ("persistent", "transient", "unjudgeable"),
-                        "persistent": ("persistent",),
-                        "persistent_unjudgeable": ("persistent", "unjudgeable")}[self.t1_axis_filter]
+                keep = self._EVENT_FILTER_STATES[self.t1_event_filter]
                 nematic_axes = [
                     {**axis, "length": 14,
                      "color": "#66ccff" if axis["type"] == "gain" else "#ff9933"}
@@ -2853,13 +4002,122 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     parser = argparse.ArgumentParser(description="Standalone smoke-test harness for EpiQuantAPI (no real window)")
-    parser.add_argument("--mask-folder", required=True)
-    parser.add_argument("--image-folder", required=True)
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--mask-folder")
+    parser.add_argument("--image-folder")
+    parser.add_argument("--output-dir")
     parser.add_argument("--classify", action="store_true", help="Run classify + leading-edge + boundary-split tracking")
     parser.add_argument("--shape", action="store_true", help="Also compute shape/tissue descriptors and exercise every feature mode")
     parser.add_argument("--n-clusters", default="2")
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the checks that need no project, and exit")
     args = parser.parse_args()
+
+    if args.self_test:
+        # --- C1 (R20): the candidate list is a MERGE, not a truncation.
+        # It used to accumulate four sources and take `[:3]`, so sources 3 and 4
+        # were unreachable whenever source 2 yielded three -- and for an
+        # `environment_flagged` item source 1 is empty by construction, making
+        # the offered list *always exactly* the IoU ranking's top three.
+        probe = EpiQuantAPI()
+        probe._census = {"register": False, "drift_by_frame": None}
+        probe.cells_info = None
+        probe._census_crop = lambda *a, **k: ""
+
+        height, width = 80, 400
+        before = np.zeros((height, width), dtype=int)
+        before[30:40, 30:40] = 1
+        after = np.zeros((height, width), dtype=int)
+        # Strips that CLIP the anchor's footprint (IoU > 0) but whose centroids
+        # are far away -- a neighbour winning on overlap, which is the GBE shape.
+        after[30:34, 30:200] = 11
+        after[34:37, 30:250] = 12
+        after[37:40, 30:300] = 13
+        # The true successor: adjacent, NOT overlapping, nearest centroid.
+        after[30:40, 42:52] = 7
+
+        item = {"label": 1, "shown_label": 99, "frame": 5,
+                "reference_label": None, "true_label": None}
+        merged = probe._census_candidates(item, before, after, (0, height, 0, width))
+        labels = [c["label"] for c in merged]
+        reasons = {c["label"]: c["reason"] for c in merged}
+        assert set(l for l in labels if reasons[l] == "overlap") <= {11, 12, 13}, reasons
+        assert 7 in labels[:3], (labels, reasons)
+        assert reasons[7] == "nearest", reasons
+        print("C1: the IoU ranking returns three wrong labels and the centroid-nearest")
+        print("  candidate is still offered on the first page -- a merge, not a truncation.")
+        print("  offered:", [(c["label"], c["reason"]) for c in merged])
+
+        # `shown_label` is never offered as an alternative to itself.
+        assert 99 not in labels, labels
+
+        # --- F (R22): `limit` is the only bound. Both sources ranked 4 deep
+        # and the merge walked 4 levels, in two independent places, so on an
+        # `environment_flagged` item (source 1 empty, sources 2-4 overlapping)
+        # the list came out 3-6 long and `limit=12` never bound it.
+        wide_after = after.copy()
+        for n in range(20, 40):                     # 20 more cells to rank
+            wide_after[70:74, (n - 20) * 8:(n - 20) * 8 + 6] = n
+        wide = probe._census_candidates(item, before, wide_after, (0, height, 0, width))
+        assert len(wide) == 12, len(wide)
+        narrow = probe._census_candidates(item, before, wide_after, (0, height, 0, width), limit=5)
+        assert len(narrow) == 5, len(narrow)
+        print("F: with 24 distinct cells at f+1 the merge returns `limit` of them")
+        print("  (12, and 5 when limit=5). Before Round 22 the two hardcoded 4s")
+        print("  capped it below `limit`, so `limit` was a dead parameter.")
+
+        # --- A1 (R23): LIST LENGTH IS NOT SEARCH DEPTH.
+        # Three sources, twelve distinct labels each, nothing overlapping. The
+        # pre-quota merge was depth-first, so with `limit=12` it stopped after
+        # rank 3 and every source contributed exactly its first four -- the same
+        # four it contributed before Round 22 widened the cuts from 4 to 12.
+        # Round 22 reported the list growing from 4-5 to 12 and called that
+        # "widened depth"; it was not. Run against that version this asserted
+        # `{'overlap': 4, 'nearest': 4, 'pointed': 4}` and failed.
+        #
+        # The plan's own fixture asked for "source 3's fifth element". That is
+        # not what shipped, and the reason is a measurement, not a compromise:
+        # `nearest` is the source whose rank 4+ is provably useless here (its
+        # 12th entry sits a median 49.8 px from the anchor on GBE, ~3.8 cell
+        # radii), so `CANDIDATE_QUOTAS` holds it at 3 and spends the depth on
+        # `overlap`/`coverage`, which run out at 1-5 entries. The assertion is
+        # therefore "the sources no longer move in lockstep at 4", which is the
+        # defect, rather than a rank on a particular source.
+        three = [("overlap", [(100 + i, None) for i in range(12)]),
+                 ("nearest", [(200 + i, None) for i in range(12)]),
+                 ("pointed", [(300 + i, None) for i in range(12)])]
+        merged3, depth3 = EpiQuantAPI._merge_candidate_sources(three, 12, set())
+        labels3 = [c["label"] for c in merged3]
+        assert len(merged3) == 12, len(merged3)
+        assert depth3 != {"overlap": 4, "nearest": 4, "pointed": 4}, (
+            "A1: every source still stops at rank 4 in lockstep -- %r" % (depth3,))
+        assert max(depth3.values()) >= 5, depth3
+        assert 104 in labels3, (labels3, depth3)   # overlap DID reach rank 5
+        print("A1 (R23): 3 sources x 12 unique labels -> depth reached %s." % depth3)
+        print("  Before the quotas this was {overlap: 4, nearest: 4, pointed: 4} --")
+        print("  Round 22's [:4]->[:12] moved the list length, not the depth.")
+
+        # A source that runs dry hands its quota back, so the list still fills.
+        dry = [("overlap", [(100, None)]),
+               ("coverage", [(400 + i, None) for i in range(12)]),
+               ("nearest", [(200 + i, None) for i in range(12)]),
+               ("pointed", [(300 + i, None) for i in range(12)])]
+        merged4, depth4 = EpiQuantAPI._merge_candidate_sources(dry, 12, set())
+        assert len(merged4) == 12, len(merged4)
+        assert depth4["overlap"] == 1 and depth4["coverage"] >= 5, depth4
+        print("  a source with one entry gives its quota back: %s" % depth4)
+
+        # --- C2: pages are ceil(n / 3) on the ACTUAL list, never padded.
+        for count, expected in ((1, 1), (3, 1), (4, 2), (5, 2), (6, 2), (7, 3), (12, 4)):
+            assert -(-count // 3) == expected, (count, expected)
+        print("C2: %d candidates -> %d page(s); 5 gives 2 pages, not a padded 3."
+              % (5, -(-5 // 3)))
+
+        print("\nAll api self-tests passed.")
+        raise SystemExit(0)
+
+    if not (args.mask_folder and args.image_folder and args.output_dir):
+        parser.error("--mask-folder, --image-folder and --output-dir are required "
+                     "unless --self-test is given")
 
     api = EpiQuantAPI()
 
@@ -3030,6 +4288,268 @@ if __name__ == "__main__":
             print(f"  frame {never_opened}: never displayed "
                   f"({len(unseen['never_displayed'])} cells) -- distinct from unchanged")
             print(f"  weak positives: {coverage['weak_positives']}  log: {coverage['path']}")
+
+            # --- Round 16 B: verify a plan before Apply, and prove the live
+            # table is untouched by verifying. That last one is the safety
+            # property of an accept-and-revert loop and is not optional.
+            print("\n== plan verification (R16 B) ==")
+            plan, plan_track = None, None
+            for candidate in track_numbers[:80]:
+                trial = api.compute_confirmed_identity_moves(
+                    frame_range["min_frame"], candidate, 20, False)
+                if trial.get("moves"):
+                    plan, plan_track = trial, candidate
+                    break
+            if plan is None:
+                print("  no track produced a non-empty plan on this movie -- nothing to verify")
+            else:
+                before_table = api.tracking_data.copy(deep=True)
+                report = api.verify_confirmed_identity_moves(plan_track, plan["moves"])
+                assert not report.get("error"), report
+                assert api.tracking_data.astype(str).equals(before_table.astype(str)), \
+                    "verifying a plan must not mutate the live tracking table"
+                print(f"  track #{plan_track}: {len(plan['moves'])} move(s) -- "
+                      f"{len(report['double_claimed'])} double-claim, "
+                      f"{len(report['orphaned'])} orphan, {len(report['truncated'])} truncated, "
+                      f"{len(report['evicts'])} eviction(s), "
+                      f"{len(report['takes_from'])} take-from-another-track")
+                for move in report["moves"]:
+                    print(f"    frame {move['frame']}: {move['distance']}px of a "
+                          f"{move['gate_px']}px gate ({move['gate_fraction']})")
+                delta = report["consistency"]
+                if delta:
+                    print(f"  consistency delta {delta['before_unconfirmed']} -> "
+                          f"{delta['after_unconfirmed']} of {delta['n']} links unconfirmed "
+                          f"({delta['delta']:+d}), masks "
+                          f"{'registered' if delta['registered'] else 'unregistered'} both sides. "
+                          "A consistency measure, never an accuracy.")
+                print("  live table byte-identical after verification.")
+
+            # --- Round 16 C2: the two session modes cannot cross. Asserted,
+            # not documented: ground truth collected against a tracking run is
+            # not valid for a run it corrected.
+            print("\n== census / correction modes (R16 C2) ==")
+            gt_path = os.path.join(api.output_dirs["cell_track_output"], "ground_truth_links.csv")
+            started = api.start_census(mode="census", seed=0, labeller="harness")
+            if started.get("error"):
+                print("  census unavailable:", started["error"])
+            else:
+                table_before = api.tracking_data.copy(deep=True)
+                assert api.queue_census_edit(0, 1).get("error"), "a census session must not edit"
+                assert api.apply_census_edits().get("error"), "a census session must not apply"
+                api.submit_census_verdict(0, "correct", None, 1200.0)
+                assert api.tracking_data.astype(str).equals(table_before.astype(str)), \
+                    "a census session must never mutate the tracking table"
+
+                # Round 23 D: a "wrong" verdict with a tile chosen must record
+                # WHICH ranking proposed that cell and where it sat. Exercised
+                # here and not only in `census.py --self-test`, because the
+                # lookup lives in this file and reads a cache `get_census_item`
+                # fills -- a unit test on `append_verdict` cannot see that wire.
+                shown = api.get_census_item(1)
+                offered = shown.get("candidates") or []
+                print(f"  candidate depth reached per source: {shown.get('candidate_depth')} "
+                      f"({len(offered)} offered) -- depth, not list length.")
+                if offered:
+                    pick = offered[min(1, len(offered) - 1)]
+                    wrote = api.submit_census_verdict(1, "wrong", pick["label"], 2400.0)
+                    assert wrote.get("chosen_reason") == pick["reason"], (wrote, pick)
+                    assert wrote.get("chosen_rank") == pick["rank"], (wrote, pick)
+                    with open(gt_path, newline="", encoding="utf-8") as handle:
+                        last = list(csv.DictReader(handle))[-1]
+                    assert last["chosen_reason"] == pick["reason"], last
+                    assert last["chosen_rank"] == str(pick["rank"]), last
+                    assert last["register"] in ("0", "1"), last
+                    print(f"  a chosen tile is recorded with its source and rank: "
+                          f"{last['chosen_reason']} at rank {last['chosen_rank']}, "
+                          f"register={last['register']}.")
+                    assert api.tracking_data.astype(str).equals(table_before.astype(str)), \
+                        "a census session must never mutate the tracking table"
+                gt_size = os.path.getsize(gt_path)
+                print(f"  census mode: {started['n_real']} links, "
+                      f"{started['n_decoys']} decoys, {started['n_repeats']} repeats; "
+                      "edits refused; tracking table unchanged.")
+
+                fixing = api.start_census(mode="correct", seed=0, labeller="harness")
+                assert fixing["n_decoys"] == 0 and fixing["n_repeats"] == 0, fixing
+                assert api.submit_census_verdict(0, "correct", None, 1.0).get("error"), \
+                    "a correction session must not write ground truth"
+                first = api.get_census_item(0)
+                api.queue_census_edit(0, first["candidates"][0]["label"])
+                preview = api.preview_census_edits()
+                snapshot = api.tracking_data.copy(deep=True)
+                applied = api.apply_census_edits()
+                assert applied.get("applied") == 1, applied
+                assert not api.tracking_data.astype(str).equals(snapshot.astype(str)), \
+                    "applying a correction must actually change the table"
+                assert os.path.getsize(gt_path) == gt_size, \
+                    "a correction session must not append to ground_truth_links.csv"
+                api.undo_census_edits()
+                assert api.tracking_data.astype(str).equals(snapshot.astype(str)), \
+                    "undo must restore the snapshot exactly"
+                print(f"  correction mode: no decoys/repeats; verdicts refused; "
+                      f"{preview['pending']} pending applied as one batch; "
+                      "ground truth untouched; undo restores byte-identically.")
+
+            # --- Round 16 E: within +/-1 of the anchor every crop must share
+            # ONE window, or the blink compares two differently framed images.
+            print("\n== frame stepper (R16 E) ==")
+            strip = api.get_track_filmstrip(track_numbers[0])
+            if strip.get("error") or len(strip["held"]) < 3:
+                print("  no track with enough frames to step")
+            else:
+                anchor = strip["held"][len(strip["held"]) // 2]
+                sizes, notes = [], []
+                for offset in (-1, 0, 1, 3):
+                    step = api.get_track_step_frame(track_numbers[0], anchor, anchor + offset)
+                    if step.get("error"):
+                        continue
+                    payload = base64.b64decode(step["image"].split(",", 1)[1])
+                    from PIL import Image as _Image
+                    from io import BytesIO as _BytesIO
+                    sizes.append((offset, _Image.open(_BytesIO(payload)).size, step["recentred"]))
+                shared = [size for offset, size, moved in sizes if not moved]
+                assert len(set(shared)) <= 1, sizes
+                print(f"  anchor frame {anchor}: {sizes}")
+                print("  every crop within +/-1 shares one window; beyond that it re-centres "
+                      "and says so.")
+
+            # --- Round 17 C3: `settled only` must leave NO transient T1 cell
+            # fill on the frame. Asserted by counting painted pixels, not by
+            # eye -- the defect was invisible in the dev mock and survived
+            # every previous verification because nobody counted.
+            print("\n== T1 event filter gates the fill (R17 C3) ==")
+            from PIL import Image as _Image
+            from io import BytesIO as _BytesIO
+            t1_frame = api.get_frame_numbers()[len(api.get_frame_numbers()) // 2]
+            t1_labels = (api._load_frame(t1_frame) or (None,))[0]
+            events = api.get_t1_events(t1_frame)
+            if t1_labels is None or "error" in events or not events.get("counts"):
+                print("  no T1 events on this frame -- nothing to filter")
+            else:
+                settled = {int(l) for l in events["counts_persistent"]}
+                unjudgeable = {int(l) for l in events.get("counts_unjudgeable", {})}
+                transient = {int(l) for l in events["counts"]} - settled - unjudgeable
+                base_png = np.asarray(_Image.open(_BytesIO(base64.b64decode(
+                    api.get_raw_frame_image(t1_frame).split(",", 1)[1]))).convert("RGB"))
+                for mode in ("all", "persistent"):
+                    api.set_t1_event_filter(mode)
+                    drawn = {label for label, entry in api._dynamics_states(t1_frame).items()
+                             if entry["event"] == "t1"}
+                    overlay = np.asarray(_Image.open(_BytesIO(base64.b64decode(
+                        api.get_trajectory_overlay(
+                            track_numbers[0], t1_frame, color_mode="dynamics",
+                            show_nematic_axes=True).split(",", 1)[1]))).convert("RGB"))
+                    # A cell is FILLED when most of its pixels changed; a few
+                    # changed pixels are a neighbouring settled event's axis
+                    # line crossing it, which is not a fill.
+                    filled = set()
+                    for label in transient:
+                        mask = t1_labels == label
+                        if not mask.any():
+                            continue
+                        if (overlay[mask] != base_png[mask]).any(axis=1).mean() > 0.5:
+                            filled.add(int(label))
+                    print(f"  {mode:11s}: {len(drawn):3d} T1 cells drawn, "
+                          f"{len(filled)} of {len(transient)} transient cells filled")
+                    if mode == "persistent":
+                        assert not filled, (
+                            "'settled only' still fills transient T1 cells: %s" % sorted(filled))
+                        assert not (drawn & transient), sorted(drawn & transient)
+                api.set_t1_event_filter("persistent")
+                print(f"  ({len(settled)} settled / {len(transient)} transient / "
+                      f"{len(unjudgeable)} unjudgeable; raw counts still reported)")
+
+            # --- Round 18 C: does a correction actually REACH the record?
+            # Not "the batch API returned success" -- the frame column, the
+            # untouched columns, the undo, and the file on disk.
+            print("\n== correction write path, end to end (R18 C) ==")
+            started = api.start_census(mode="correct", seed=0, labeller="harness")
+            if started.get("error"):
+                print("  no correction queue on this movie:", started["error"])
+            else:
+                item = api.get_census_item(0)
+                chosen = item["candidates"][0]["label"]
+                target_frame = item["frame"] + 1
+                target_column = f"Frame{target_frame}"
+                track = item["track_id"]
+                api.queue_census_edit(0, chosen)
+
+                before_table = api.tracking_data.copy(deep=True)
+                result = api.apply_census_edits()
+                assert result.get("applied") == 1, result
+                after = api.tracking_data
+
+                # (2) the cell for that track at that frame is now the chosen one
+                row = after.index[after[after.columns[0]] == track][0]
+                assert str(after.at[row, target_column]) == f"Cell{target_frame}_{chosen}", (
+                    after.at[row, target_column], chosen)
+
+                # (3) nothing outside the declared range moved, and every track
+                # that lost a claim is named in the return value.
+                assert result["frames_asked"] == [target_frame], result["frames_asked"]
+                reported = {(c["frame"], c["from_track_id"]) for c in result["claims_removed"]}
+                for record in result["displaced_list"]:
+                    reported.add((target_frame, int(record["evicted_track_id"])))
+
+                # Compare BY TRACK ID, not positionally: an eviction appends a
+                # row, so the two tables need not be the same length.
+                def claims(table):
+                    id_col = table.columns[0]
+                    out = {}
+                    for position in table.index:
+                        holder = int(table.at[position, id_col])
+                        for column in (c for c in table.columns if c.startswith("Frame")):
+                            value = table.at[position, column]
+                            if pd.notna(value):
+                                out[(int(column[len("Frame"):]), holder)] = str(value)
+                    return out
+
+                was, now = claims(before_table), claims(after)
+                # A change beyond the asked frame is legitimate ONLY as part of
+                # an eviction the return value names -- that is the one
+                # operation with a reach wider than the edit.
+                evicted = {int(r["evicted_track_id"]) for r in result["displaced_list"]}
+                evicted |= {int(r["new_track_id"]) for r in result["displaced_list"]}
+                unreported = []
+                for key in set(was) | set(now):
+                    if was.get(key) == now.get(key):
+                        continue
+                    frame, holder = key
+                    if frame != target_frame and holder not in evicted:
+                        unreported.append(("beyond the asked frame", key))
+                    elif frame == target_frame and holder != track \
+                            and (frame, holder) not in reported and holder not in evicted:
+                        unreported.append(("lost a claim", key))
+                assert not unreported, f"changes nothing in the return value accounts for: {unreported}"
+                assert set(result["beyond_asked"]) == set(result["frames_written"]) - {target_frame}, result
+                print(f"  track #{track} at frame {target_frame} -> Cell{target_frame}_{chosen}; "
+                      f"{len(result['claims_removed'])} claim(s) removed, "
+                      f"{len(result['displaced_list'])} eviction(s); "
+                      f"asked {result['frames_asked']}, actually wrote {result['frames_written']}.")
+                if result["beyond_asked"]:
+                    print(f"  frames {result['beyond_asked']} were rewritten too -- an eviction "
+                          "relocates a colliding track's whole future, and the return value "
+                          "now says so instead of claiming the edited frame alone.")
+
+                # (5) the file on disk matches memory -- the step that catches
+                # "the UI updated but nothing persisted".
+                api.save_tracking()
+                on_disk = pd.read_excel(os.path.join(
+                    api.output_dirs["cell_track_output"], "all_cell_tracking",
+                    "all_cell_merged_tracking_results.xlsx"))
+                assert on_disk.shape == api.tracking_data.shape, (on_disk.shape, api.tracking_data.shape)
+                assert on_disk.fillna("~").astype(str).equals(
+                    api.tracking_data.reset_index(drop=True).fillna("~").astype(str)), \
+                    "the saved .xlsx does not match the in-memory table"
+                print("  saved .xlsx matches the in-memory table exactly.")
+
+                # (4) one undo restores byte-identically
+                api.undo_census_edits()
+                assert api.tracking_data.astype(str).equals(before_table.astype(str)), \
+                    "undo must restore the table byte-identically"
+                api.save_tracking()
+                print("  one undo restores the table byte-identically, and re-saves it.")
 
             api.save_tracking()
             print("Saved tracking.")

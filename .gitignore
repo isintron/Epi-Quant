@@ -22,3 +22,4 @@ __pycache__/
 # Output of test data generation (ignored at any directory depth)
 test_data/
 tmp/
+v2/baseline_data/

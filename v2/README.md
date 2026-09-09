@@ -56,6 +56,16 @@ Two rules are worth keeping in mind when adding a dataset:
   in the folder has them. Add one digit-less file to a numbered folder and the
   whole folder renumbers positionally — deliberate (it prevents silent
   collisions) but surprising if unexpected.
+- **Frame 0 is a frame.** `list_segmentation_files` filtered to `frame >= 1`
+  until Round 22, copied from `src/gui_main.py`, where it guarded a digit-less
+  name falling back to `inf` — a case `resolve_frame_numbers` had long since
+  taken over, and which `inf >= 1` passed anyway. The only thing the filter
+  still did was drop frame 0, silently: `embryos_GBE_GAP43` numbers from
+  `handCorrection0000`, so the movie read as **30 frames, 7,449 cells** when
+  the folder holds **31 frames, 7,717 cells**. The function now asserts that
+  it returns as many files as the directory holds `.npy`, and names the ones
+  it lost if it ever does not — all four consumers call it, so they can only
+  agree with each other; only the directory can disagree.
 - **Name beats position for image pairing.** Sorted order can disagree between
   the mask and image folders, so the stem match runs first and position is
   only the fallback. `Demo_Seg_QC` is the case that proves it: its masks sort
@@ -1398,6 +1408,1053 @@ pre-existing track id, and kept the count at 185; re-tracking unmodified data
 is correctly a no-op. Then, breaking 30 `Frame10` claims deliberately (20
 nulled, 10 swapped) and re-tracking `[9,11]` **repaired all 30 exactly**,
 with zero residual difference from the original table.
+
+> **A rule this project keeps re-deriving, stated once.** *A filter whose
+> removals cannot be seen cannot be judged too aggressive.* Every filter here
+> reports what it removed, beside what it kept: the T1 event filter
+> (`T1s drawn 2 of 3, 1 hidden by "persistent"`), the junction-length minimum,
+> and Round 19's minimum cell area (`3 cell(s) below 19 px removed — frame 19: 1,
+> frame 24: 1, frame 29: 1`). Three applications, one rule; it is not re-argued
+> in each round section.
+
+### Round 23: widening the candidate depth did not widen the depth (2026-09-08)
+
+**Round 22 reported the wrong number.** It raised each ranking's own cut from
+`[:4]` to `[:12]` and the merge walk from `range(4)` to `range(12)`, measured
+that the offered list went from 4-5 entries to 12, and called that a widened
+search. The merge is depth-first with a hard `limit` exit: rank 0 from every
+source, then rank 1, and so on. Three non-empty sources and `limit=12` means it
+stops after rank 3, so **every source still contributed exactly its first four**
+— the same four as before. The list grew only because those four stopped
+duplicating each other. A unit test now pins it (`api.py --self-test` A1): three
+sources of twelve unique labels each, and the pre-quota merge reports
+`{overlap: 4, nearest: 4, pointed: 4}`. It was written first and it failed
+first.
+
+**On this data the cap does not bind, which cuts the other way.** Measured on
+both movies with this session's own extraction and tracking
+(`exclude_edge_cells=True`, `motion_compensation=True`): `reference` is empty by
+construction, `overlap` yields 1-5 entries (9 of GBE's 64 items yield exactly
+one), so the loop soon has only `nearest` and `pointed` left and reaches **rank
+11-12 in both, already, before this round**. Reached rank per source, median
+over the items where that source contributed anything:
+
+| | GBE before | GBE after | AS before | AS after |
+|---|---:|---:|---:|---:|
+| overlap | 2 (61 of 64 items) | 1 (61) | 2 (25 of 56) | 2 (28) |
+| coverage | — | 3 (45) | — | 3 (11) |
+| nearest | 11 (64) | 11 (64) | 11 (55) | 11 (55) |
+| pointed | 10 (64) | 11 (64) | 10.5 (50) | 11 (55) |
+
+`CANDIDATE_QUOTAS` (reference 2, overlap 4, coverage 4, nearest 3, pointed 2,
+leftovers redistributed) now decides the split, spending depth where it can
+help: the 12th-nearest cell sits a median **49.8 px** from the anchor on GBE,
+about 3.8 cell radii, and a normally-moving cell's successor is not out there.
+But the quotas only bind when the other sources have entries, and mostly they do
+not — of GBE's 12 slots per item, `nearest` takes 338 and `pointed` 300 against
+`overlap`'s 75 and `coverage`'s 45. **That is not a mis-set quota; there is
+simply not more to propose.**
+
+**Why the true cell is missing is therefore not depth.** The three causes §A3
+listed, each counted rather than argued (GBE, 64 items):
+
+- *The search starts from the wrong place.* Confirmed, and it is a **convention
+  mismatch**: the census derives `register` from `drift_mode`, which was `none`,
+  so the candidate search ran at zero drift while the tracking it is questioning
+  ran with motion compensation. All 64 items.
+- *The true cell is the tracker's own answer, which is excluded.* `shown` is the
+  **nearest** cell to the anchor for **25 of 64** items and within the top three
+  for **49 of 64**. On those the list opens at the second-best cell and no tile
+  can be right. Left excluded by decision — `J` (`correct`) already says "this
+  link is fine" — and recorded here so the next round has the count.
+- *The true cell is not at f+1 at all.* Nil on GBE; **large on `AS_dorsal`**,
+  where 22 of 56 anchors have **zero** overlap with any f+1 cell — their whole
+  footprint is background in the next frame. Those anchors have a median area of
+  455 px against a median cell of 3,218 px: the AS environment queue is
+  sampling fragments at the edge of the segmented region, not typical cells.
+- *Edge exclusion desynchronising the label sets* — the fourth member of the
+  Round 21 §A family — **is real but tiny**: `exclude_edge_cells` drops rows
+  from `Cells_info` and nothing from the mask the candidates are drawn from, so
+  5 labels across the whole GBE movie exist as candidates without a row. None
+  reached any item's top twelve, and the nearest cell was never one of them.
+
+**A coverage source, on corrected reasoning.** `|A n B| / |A|`, hardcoded, never
+the raw intersection — the raw intersection just favours the biggest candidate.
+Round 21 §C2 justified it as "more forgiving of a dividing cell" and **that is
+wrong**: for a division IoU separates the daughter from a neighbour 4.5x against
+coverage's 2.5x. Coverage wins where the true successor is much *larger* than
+the anchor (2.5x against IoU's 1.3x). They fail in opposite directions, which is
+an argument for offering both and not for replacing either. Four numbers, pinned
+by `cell_tracking.py --self-test`. **They are algebra, not a measurement** —
+Round 20's motion model also had a clean argument and measured worse.
+
+**So the measurement is a click.** `census.FIELDS` gains `chosen_reason` and
+`chosen_rank` — which source first proposed the cell a human picked, and where
+it sat — looked up in the backend from the list it offered, not sent back by the
+frontend. They are reference-free: the input is a person's choice, not a
+tracking table. Whether `coverage` earns its slot, and whether `pointed`
+amplifies a wrong link or finds an adjacent swap fastest, are both settled by
+reading them after a few dozen items. `register` and `environment_threshold`
+join them, so a verdict file can say afterwards what it was collected under.
+
+**Each candidate tile gets its own crop, at the anchor's scale.** The shared
+window grown to hold every candidate was tolerable at 4-5 and is not at 12:
+measured, it opens to a median **1.73x** the anchor window's area on GBE (max
+2.41x) and **2.42x** on `AS_dorsal` (max 4.46x), so the anchor rendered tight
+and the candidates rendered as shrunken tissue thumbnails. `_window_like` gives
+each candidate a window of the anchor's exact pixel size, centred on it — equal
+pixel dimensions is what makes two CSS-sized crops render at one scale. The tile
+caption also splits in two, the evidence on its own line in muted 11 px, and
+that evidence now names a **place**: `IoU 0.42 with the anchor at frame 20`,
+`44.6 px from the tracker's answer`. "the cell" and "the link" were not
+locations, which is what the maintainer asked about.
+
+### Round 22: frame 0 enters the pipeline (2026-09-08)
+
+**One line, and everything it exposed.** `list_segmentation_files` filtered to
+`frame >= 1`, so `embryos_GBE_GAP43`'s `handCorrection0000.tif` had never been
+extracted, tracked, classified or counted. The maintainer diagnosed it from a
+status line before it was reported (click-test guide `:383`).
+
+| | frames | cells (threshold 0) |
+|---|---:|---:|
+| before | 30 | 7,449 |
+| **after** | **31** | **7,717** |
+
+Counted from the directory, and from an Extract this round ran; frame 0 alone
+holds 268 labels. The other five `test_data/` datasets are unaffected — GBE is
+the only 0-numbered one.
+
+**The assertion is against the directory, not against the consumers.** Round 19
+added a cross-consumer check and it could never have caught this: all four
+consumers call `list_segmentation_files`, so a frame it drops is missing from
+all four identically. `list_segmentation_files` now raises if it returns fewer
+files than the folder holds `.npy`, and the message names them.
+
+**What frame 0 broke.** `suggest_match_candidates` returned `[]` for
+`frame_number <= 1` — "nothing precedes it". On a 0-numbered movie frame 1 does
+have a predecessor, so every orphaned track at frame 1 came back as "no
+candidates", silently, on the frame where a track most often first goes missing.
+It now asks `tracking_data` whether a `Frame{n-1}` column exists; `<= 0` would
+only have moved the same assumption down one frame. Four other patterns were
+searched (frame-number truthiness in Python and JS, 1-based indexing, frontend
+minimums, `Cell{frame}_{id}` parsing) and are listed in the round's report; the
+only code change beyond the above is three `min="1"` frame inputs in
+`index.html` relaxed to `min="0"`.
+
+**A third copy of Round 21's bug, in the branch next door.** `extract_cell_info`
+carried the comment *"Through the shared loader"* and called
+`apply_min_cell_area(dat.get("masks"))` directly. On an older `.npy` whose only
+key is a *filled* array under `outlines`, `masks` is None, so extraction
+filtered nothing and said nothing, while `cell_tracking` filtered the same file.
+`get_min_area_removals` was the third site: it skipped such a frame entirely, so
+the UI's removal count read low. All three now go through
+`data_input.load_label_array`, whose `looks_filled` test (moved out of
+`cell_tracking`, where it was the only copy) makes its own docstring true: a
+genuine boundary ring returns `None`, not a label array to filter down to
+nothing. Extraction and the UI now say when a frame could not be judged rather
+than reporting zero removals for it.
+
+**Census candidates: `limit=12` was a dead parameter.** Two independent 4s —
+`ranked[:4]` in each of the two ranking helpers, and `for depth in range(4)` in
+the merge — capped the list below `limit` on every call ever made. For an
+`environment_flagged` item source 1 is empty by construction and the other three
+overlap heavily, so the offered list was 3–6 long. Widened to 12; no new source,
+no re-ordering. Measured **length only — this round has no reference, so it
+reports no hit-rate** (inputs extracted and tracked by the measurement itself
+into a scratch directory; tracking and judge both unregistered):
+
+| | queue | median before | before | median after | after |
+|---|---:|---:|---|---:|---|
+| GBE (31 frames / 7,717 cells / 422 tracks) | 109 | 4 | 3:29, 4:53, 5:25, 6:2 | **12** | 11:13, 12:96 |
+| `AS_dorsal` (24 frames / 2,824 cells / 181 tracks) | 55 | 4 | 0:1, 3:15, 4:24, 5:12, 6:2, 8:1 | **12** | 0:1, 11:22, 12:32 |
+
+The one zero-length `AS_dorsal` item is zero before and after: nothing at f+1 to
+propose, which depth cannot fix.
+
+**Round 21 §C4's table is marked not-citable** (see the ⚠️ beside it below). It
+conflicts with the maintainer's manual classification of the same set, and
+calling it "reference-free" was wrong — it judges the anchor's own link with the
+**overlap reference**, whose answer depends on a registration convention the
+table does not record, produced by a script that is not in the repository. The
+**fourth verdict is suspended**, with both reasons written into
+`v2/docs/census.md` §8.7 so it is not re-proposed as a new idea.
+
+### Round 21: the min-area filter never reached the row, and three rounds of "ground truth" that was not (2026-09-07)
+
+#### The correction that reframes Rounds 18–20
+
+The maintainer's answer this round: **the corrected tracking tables were never
+ground truth — no visual inspection was ever done on them** — and anything of
+that kind should be regenerated from the masks by the pipeline.
+
+Rounds 18, 19 and 20 all treated `corrected_tracking.xlsx` and the `GT_*`
+folders as a reference, and `CLAUDE.local.md` called a hand-corrected table *"the
+most valuable artefact in this repository"*. That sentence is now corrected in
+place. The consequence for the record: Round 19's 62.9% → 75.3% and Round 20's
+89.5% / 77.9% are **agreement with an unvalidated tracking table**, not accuracy
+and not a measure of candidate quality. Round 20's *relative* conclusion survives
+— merge helps, per-cell prediction does not — because that compared three
+variants against one fixed reference, and the reference's own correctness does
+not affect the ordering. The absolute numbers should not be quoted.
+`census.md` §8.4 carries the same caveat beside its table.
+
+Those files, and `v2/baseline_data/` entirely, were gone by the start of this
+round. Given the above, nothing irreplaceable was lost; the baselines were
+regenerated from the masks.
+
+#### §A — the filter was applied to the wrong array
+
+**Reproduced before fixing, as the plan required.** At a 200 px threshold on
+GBE: Extract reported 123 removals but produced 7,449 cells (7,452 − 3), and
+**all 123 removed labels appeared in the tracking table** — in the same process,
+with the global still set. So it was none of the three causes the plan listed.
+
+The cause was a fourth, and mine from Round 19: the filter was applied to the
+filled `masks` array, but **the per-cell loop enumerates `outlines`**, which was
+never filtered. Extraction kept emitting a row for every removed label, and
+tracking — which is driven by `Cells_info` — linked them all. Round 19's
+assertion missed it because it compared the four consumers that read `masks` and
+never checked extraction's own row set.
+
+The decision is now made once, on the filled array, and applied to both arrays.
+Filtering `outlines` by *its own* pixel counts would be wrong in the other
+direction: it is a ~2–5%-of-pixels boundary ring, so a 200 px area threshold took
+all 262 labels in the first attempt. Extraction now gives 7,326 = 7,452 − 123.
+
+The three gaps §A2 named are closed too: the threshold **persists with the
+project** (`extract_settings.json`, restored by `set_project`), is **recorded in
+the tracking provenance** with `baselines.check()` refusing across differing
+thresholds, and `_FrameLabelLoader` **reports** the threshold it applied. Round
+trip asserted end to end: set 200, Extract, discard the API object, Track — 123
+removed labels, **0** reaching the table.
+
+#### §B — the census candidate block
+
+It was a `.field-row`, so the question, the tiles and the buttons were flex
+siblings on one line: the question floated level with the tiles and tile 3
+wrapped to its own row. Now a column — question, tiles, buttons — all
+left-aligned. At 1440×900 the panel is 606 px against a 900 px viewport; the
+candidate block went from wrapping to 175 px (hint 15 + tiles 114 + actions 34).
+
+#### §C — instrumented, not theorised
+
+**§C3** is done: every tile now states its basis in the same words — *"the
+overlap reference's pick"*, *"IoU 0.31 with the cell"*, *"12.4 px from the
+cell"*, *"18.1 px from the link"*. They previously read `13.4 px`, `16.5 px from
+the link`, `26.1 px` — two origins, one of them unstated.
+
+**§C1's probe is built and self-tested** (`v2/candidate_probe.py`): per-source
+rank of the expected cell, whether any source generated it before the merge, its
+distance and IoU against the anchor, whether it is already claimed, and the
+anchor's area and centroid-containment. **The measurement is deferred**: §C1
+requires a reference collected on the current segmentation, and there is none.
+The probe runs the moment there is one. **§C2 is not attempted** — the plan
+requires measuring a new source against C1's table before shipping it, and that
+table does not exist yet.
+
+**§C4 has a reference-free answer, and it is the strongest result of the round.**
+An `environment_flagged` item means the anchor's *neighbourhood* changed, which
+need not mean the anchor's own link is wrong. Classifying each item by what the
+overlap reference says about that link:
+
+| | anchor link disagrees | agrees | unjudgeable |
+|---|---|---|---|
+| GBE (118 items) | **9 (7.6%)** | 43 (36.4%) | 66 (55.9%) |
+| `AS_dorsal` (61 items) | **10 (16.4%)** | 15 (24.6%) | 36 (59.0%) |
+
+So for **92% of GBE items and 84% of `AS_dorsal`'s**, the UI asks *"which cell is
+it really?"* about a link nothing has flagged. That explains the short candidate
+lists and the frequent absence of a convincing tile far better than any ranking
+hypothesis — and it means the two removed mechanisms were being blamed for a
+question that was malformed for this set.
+
+> ⚠️ **Do not cite any number in this table** (added Round 22 §G1).
+>
+> It conflicts with the maintainer's own manual classification of the GBE
+> `environment_flagged` set (2026-09-07, click-test guide `:444`): of 18 items
+> reviewed by eye, **7 links were fine — 39%**, against this table's 92%. The
+> conflict sits in the 55.9% "unjudgeable" bucket: a person *can* judge those,
+> and judged them "the link is wrong".
+>
+> Calling this answer **"reference-free" above is wrong**, and that is the
+> likelier error of the two. It is not reference-free: it uses the **overlap
+> reference** to judge the anchor's own link, and an overlap reference's answer
+> depends on the registration convention of the masks it is computed on —
+> exactly the switch that produced the 255 / 518 / 955 / 25 two-by-two. **This
+> table does not record which convention it used, and no script in the
+> repository generates it.** Until both exist, it is not evidence.
+
+§C4's proposed fix is a **fourth verdict** — *"this link is fine, the
+neighbourhood changed for another reason"*. The plan gates it on C1, so it is
+**not built**: it changes what gets recorded, and the case for it is now on the
+record with numbers. **Round 22 §G2 suspends it outright**, for two reasons
+recorded in `v2/docs/census.md` §8.6: the verdict `correct` already says "this
+link is fine", and by the manual count the larger group is not that one.
+
+### Round 20: the candidate-ranking diagnosis did not survive measurement (2026-09-07)
+
+Four items from the click-test. §C was the substantial one, and measuring it
+overturned its own premise.
+
+#### §A/§B — two small UI fixes
+
+The Extract hint described a GBE measurement rather than the controls; it now
+describes **Exclude edge cells** and **Minimum cell area** and names no dataset.
+The GBE justification (2/3/3 px against a next-smallest 119 px) stays in this
+file, where the threshold is argued. The drift `?` moved onto the checkbox row
+beside **Register masks (drift)**, matching the *Match cells by* button so the
+two read as one affordance.
+
+#### §C1 — the candidate list was a truncation, and that part was real
+
+`_census_candidates` accumulated four sources and then took `[:3]`. Sources 3
+and 4 were therefore **unreachable** unless source 2 ran short — and for an
+`environment_flagged` item source 1 is empty by construction, so the offered
+list was *always exactly the IoU ranking's top three*. When that ranking was
+wrong there was no second opinion, though two more had been computed.
+
+Now a round-robin merge: a failure in any one ranking costs at most one slot.
+Asserted by a unit test — an IoU ranking returning three wrong labels no longer
+crowds the centroid-nearest candidate out of the first page.
+
+#### §C2 — pagination, and the reason it earns its place
+
+`4` cycles through `ceil(n/3)` pages and wraps; `0` is on every page; digits mean
+the tile in that position, so page 2's tiles are labelled 1–2. Pages are computed
+on the **actual** list length — five candidates is two pages, not a padded three
+— and the pool is capped at 12. Each tile now says why it was offered
+(`reference`, `IoU 0.31`, `12 px`), and the hint reports the list length as a
+signal: short means the rankings agree, long means they disagree.
+
+#### §C3 — the measurement, and what it overturned
+
+**§C's premise does not survive contact with the data.** It held that AS_dorsal
+usually has the true cell in the top three and GBE often does not, because a
+single global translation is the wrong motion model for germband extension.
+Measured on both queue kinds, against the maintainer's corrected tables, over
+only the items where the tracker's own pick disagrees:
+
+| queue | dataset | before | interleaved (**shipped**) | + per-cell prediction |
+|---|---|---|---|---|
+| `environment_flagged` | GBE | 89.5% / 89.5% | 89.5% / **89.5%** | 88.2% / 89.5% |
+| | `AS_dorsal` | 94.1% / 94.1% | 94.1% / **97.1%** | 94.1% / 97.1% |
+| `geometry_flagged` | GBE | 77.9% / 77.9% | 77.9% / **81.4%** | 75.7% / 81.4% |
+| | `AS_dorsal` | 100% / 100% | 100% / **100%** | 95.2% / 100% |
+
+*(@3 / @all. Agreement with a human-corrected tracking table, not an accuracy;
+unregistered tracking, unregistered judge; inputs generated by the run from
+`v2/baseline_data/`. Median list length 3 → 4–5.)*
+
+Three findings, none of them the expected one:
+
+**1. The GBE/AS_dorsal split is an artefact of a stale reference.** GBE's
+comparison table was collected on the 7,457-label segmentation and the masks have
+been hand-corrected twice since, renumbering raw labels. Before filtering,
+**every one of the 27 misses had its GT-named successor a median 130 px from the
+anchor — five cell diameters, up to 373 px.** No motion model puts a cell there
+at 7 px/frame. Excluding links whose reference is not spatially plausible (19 and
+46 of them) leaves GBE at 89.5% / 77.9% against AS_dorsal's 94.1% / 100% — a
+modest gap, not the split the premise described. `AS_dorsal` excluded **zero**,
+because only GBE's masks were re-segmented. The misses seen in the click-test
+were most likely these.
+
+**2. The merge helps, and its help lands exactly on the pagination.** GBE's
+`geometry_flagged` @all rises 77.9% → 81.4% — five more items — while @3 is
+unchanged. Those five answers are on page 2 or later, which is what `4` reaches.
+So §C1 and §C2 justify each other, and neither needed the motion argument.
+
+**3. The per-cell prediction was built, measured, and removed.** It was worse at
+rank 3 in **every** measurement (77.9→75.7, 89.5→88.2, 100→95.2) and gained
+nothing at full depth: it displaced good candidates off the first page.
+Consistent across two datasets and two queue kinds is not noise. The physical
+reasoning in §C may still be right about GBE's motion; it is not supported *for
+this use*. `v2/docs/census.md` §8.4 keeps the table so a later round does not
+rebuild it blind.
+
+#### §D — `census.md` §8
+
+Covers the sources in order and that source 1 is empty by construction for
+`environment_flagged`; that the list is a merge and why the truncation made two
+sources unreachable; the motion models and the drift/radius ratios; the measured
+hit-rates with their reference and convention named; and that IoU proposes
+rather than scores.
+
+### Round 19: what the first real click-test found (2026-09-07)
+
+The native-window pass finally happened, three rounds after it was first owed,
+and did what the rounds kept predicting: it found things the dev mock
+structurally cannot see, plus two backend defects that only surface when a
+person works through a queue. Everything below came from that session.
+
+#### §A1 — the preflight failure was the flag, not the test
+
+`cell_tracking.py --self-test` errored with *"unrecognized arguments"*. The
+self-test was fine; **7 of 20 modules accepted `--self-test` and 13 ran it by
+omitting an argument instead**, so a preflight checklist could not use one
+invocation shape. Every module accepts the flag now — a no-op where the
+self-test already runs by default.
+
+A second, larger cause hid behind it. `tracking_benchmark`'s pinned block
+checked the *extraction* fingerprint but not the *masks*, so the maintainer's
+hand-corrected segmentation surfaced as a 15.81% cost regression. Round 18 added
+that check to `baselines`; it is now in both. Re-extracted (**7,452 cells, 419
+tracks**) and re-pinned, with all four superseded values kept beside their
+replacements.
+
+#### §A2 — the guide was wrong, the mechanism was right
+
+The maintainer marked the `baselines --check` step ✗: *"我持否定意见，因为我刚
+manual correct 一些 segmentation 错误"*. They were right. Having just corrected
+segmentation, a refusal **is** the pass condition, and the guide asked them to
+expect `OK`. Rewritten as a two-row table where both outcomes are ☑ and the
+absence of a refusal is the ✗.
+
+Their transcript also showed the refusal blaming the *tracking table* (*"no
+longer matches its provenance hash"*) when the masks were what changed. It now
+says **SEGMENTATION changed** and names the label counts.
+
+#### §A3/§A4 — a recipe, and a rule
+
+The drift-warning note now carries the exact three steps that trigger it (track
+with Register masks on → uncheck it → start a census), plus why it exists.
+
+`CLAUDE.local.md`'s ownership table gains the maintainer's rule as a rule:
+**do not rely on any output folder without a `GT_` prefix; generate what a
+measurement needs as part of the measurement.** It earned itself again this
+round — GBE's `GT_All_cell_tracking/` was destroyed by an app run between
+sessions. Round 18's decision to **copy rather than move** the hand corrections
+into it is what saved them; the `baseline_data/` copies were intact and are what
+§C2 was measured against.
+
+#### §B — three UI fixes
+
+**B1**: the census preamble is one line plus `?`; the two-modes rule is in the
+popover, one click rather than one scroll away.
+
+**B2a**: inset outlines default off, red picker retained.
+
+**B2b**: the arrow keys died after a census. Cause: two independent global
+`keydown` listeners with no ownership rule, the stepper's defending itself with
+`if (censusState.active) return` — and that flag stays true when a queue is
+*abandoned* rather than finished, so the arrows were dead for the rest of the
+session. Replaced with **one dispatcher**: owners are tried in priority order,
+each returns whether it consumed the key, and an unconsumed key falls through.
+The census owns J/K/L/space/digits; the arrows reach the stepper underneath it.
+Verified before, during and after a census, with the census still owning J.
+
+**B3**: the drift hint led with `ratio` and `threshold`, internals of
+`registration_decision`. It now leads with the decision and keeps the arithmetic
+behind a `?`, along with the fact worth surfacing — the same movie gives 25 or
+938 flagged links on that switch alone. *One deviation from the plan's example
+text:* it suggested "more than half a cell width" for ratio 0.537, but 0.537 is
+half a **radius**; 6.97 px against a 13 px radius is about a quarter of a cell
+width, and the code says the physically correct thing.
+
+#### §C1 — a correction session now ends at the button that commits it
+
+`#census-apply-btn` lives inside `#census-panel`, which was hidden when the
+queue finished: the work was done and there was no way to commit it. The panel
+has a completed state instead — *"4 of 4 reviewed — 4 pending correction(s)"*,
+per-item buttons hidden, Apply present and enabled. Asserted, not eyeballed.
+
+#### §C2 — candidates were seeded from the tracker's answer
+
+`_census_candidates` built its list from `reference_label`, `true_label`, then
+the three cells nearest `shown_label`. For an `environment_flagged` item there
+is no overlap reference, so the whole list collapsed to *"the three cells
+nearest where the tracker put the link"* — and when the link is wrong, the true
+cell is near where the cell was at frame **f**, not near where a wrong link
+points at **f+1**.
+
+Now seeded from the anchor: the reference's pick, then highest IoU against the
+anchor's own frame-f mask (drift-corrected), then nearest to the anchor's
+centroid, with nearest-to-`shown_label` only as a last resort. The shared crop
+window is widened to contain every candidate, so none renders as a near-empty
+tile.
+
+**Measured hit rate, on the items that matter** — those where the tracker's pick
+disagrees with the reference, since a correct pick is answered with J and never
+opens the candidate list: **62.9% → 75.3% (56 → 67 of 89).** Reference: the
+maintainer's corrected GBE tracking table, of which only 21 links are tied to a
+logged edit — the rest is a tracker's output, so this is agreement with a
+human-corrected run, not an accuracy. Unregistered tracking, unregistered judge.
+Inputs: `v2/baseline_data/embryos_GBE_GAP43/`.
+
+*Using IoU to propose candidates is not the circularity the standing constraint
+forbids* — nothing is scored, no number comes out of it, and the human decides.
+That is stated in the docstring so a later round does not "fix" it back.
+
+#### §C3 — re-track re-extracts the range it re-tracks
+
+Round 13 made re-track *refuse* when `Cells_info` was stale. That stops the
+corruption and leaves the user to fix it by hand. Now re-tracking a range
+re-extracts that range first — including the seam frames the cost reads — so the
+geometry the tracker sees is by construction the geometry of the masks on disk.
+
+`extract_cell_info`, `extract_shape_features` and `extract_tissue_features` all
+gained a `frames` filter. All three are per-cell, so a range is exact rather
+than an approximation. **Which families to recompute is decided by which sidecar
+files exist**, not by inspecting columns. Asserted both ways: with the sidecars
+absent only `Cells_info.xlsx` is touched and nothing is created; with them
+present all three are updated for exactly the re-extracted rows and byte-
+identical elsewhere.
+
+**§C3a**: `Cells_info_PCA.xlsx` and `cells_clustering_results.xlsx` are
+dataset-fitted, not per-cell — the PCA basis is fit over every cell and k-means
+over that basis. There is no correct local recomputation, so they are left
+untouched and reported out of date, with refitting left to the user because its
+blast radius is the whole movie.
+
+#### §D — one shared loader, then the filter
+
+**There was no single mask-loading step to hang this on.** Six modules
+independently indexed `dat["masks"]`; `_close_label_gaps` gets away with running
+at TIFF→npy *conversion*, which `.npy` datasets never pass through. All six now
+go through `data_input.load_label_array`, with the minimum area as module state
+— six parameters would be six chances to diverge, which is the failure this
+whole round is about.
+
+**The threshold came from the data and the data was unambiguous.** GBE's three
+smallest labels are **2, 3 and 3 px**; the next smallest is **119 px** — a 116 px
+gap with nothing in it. `AS_dorsal`'s smallest is 139 px and it has none. The
+suggested 19 px is the geometric midpoint of that gap (√(3×119) = 18.9): an
+order of magnitude above the artefacts, six times below the smallest real cell.
+
+Removal is on the **mask**, to background. `exclude_edge_cells` drops the row and
+leaves the label, which is harmless for an edge cell; for a vertex artefact it is
+not, because a 1 px label where four cells meet becomes a fifth neighbour in the
+adjacency graph and can stop those four being recorded as neighbours of one
+another — corrupting T1 detection exactly where T1s happen. Donating the pixel to
+a neighbour would move that cell's measured area, so background is correct.
+
+Verified: with the filter **off**, extraction is unchanged on both movies and
+`apply_min_cell_area` returns the same array object. With it **on**, the label
+sets resolved by extraction, tracking, the benchmark and rendering are
+**identical** (GBE 262/262/262/262, `AS_dorsal` 177 ×4). It removes **3 cells on
+GBE** (frames 19, 24, 29) and **0 on `AS_dorsal`**. `_close_label_gaps` does not
+refill a removed pixel. **Ships off**, and is recorded in `CLAUDE.local.md` as a
+fifth thing that must be settled before the cell-loss benchmark is final.
+
+#### Verification
+
+Items 1–11 done. Item 12 (the guide) is updated with a §8 covering everything
+this round changed, so the next native pass has it. The native pass itself is,
+as always, the maintainer's.
+
+### Round 18: the census as a working tool, and a segmentation swap that hid itself (2026-09-06)
+
+#### The finding that reordered the round
+
+Half-way through §D the GBE numbers made no sense: `iou_agreement` read **22.61%**
+where the self-test had asserted 4.83% an hour earlier, and `environment_dice`
+0.7236 where it had been 0.9018. HEAD and the working tree gave byte-identical
+results, so it was not the code.
+
+**The masks had been replaced.** GBE's segmentation TIFFs were hand-corrected on
+2026-09-06 at 17:13 and `npy_converted/` rebuilt, while the pinned extraction
+stayed at 09-05. So the tracker linked cells from the *old* segmentation while
+every judge measured overlap on the *new* masks — they disagreed on **12 of 30
+frames** (7,456 extracted cells against 7,457 mask labels).
+
+Every existing check passed while this happened: the parameters were right, the
+resolved paths were right, the extraction fingerprint matched. **`CLAUDE.md` rule
+7 case 3 exactly** — *record a fingerprint of what was actually read*. `baselines`
+now hashes the mask **arrays** (not the files, so a re-conversion that produces
+identical arrays is correctly not a change), and `check()` refuses with *"that is
+a segmentation change, not a tracking regression"*.
+
+Extract was re-run against the corrected masks: **7,457 cells, 422 tracks** at
+the shipped defaults. The pinned constants were re-pinned for the third round
+running, and for the third time the cause was the inputs, never the code —
+verified each time by running HEAD against the same inputs. Every superseded
+value is kept in the comment beside its replacement (4.89 → 4.83 → 4.64), so the
+sequence stays legible.
+
+#### §A — `baseline_data/` ignored, hand corrections moved to safety first
+
+`v2/baseline_data/` is in `.gitignore`. The hand-corrected tables, their coverage
+logs and their `ground_truth_links.csv` were **copied** into §E's
+`GT_All_cell_tracking/` with provenance **before** anything else — and copied,
+not moved, so the only copy of unreproducible hand work was never in flight.
+Step 3 (emptying the regenerable half) is deliberately not done: keeping it local
+and ignored is the lower-risk option the plan itself prefers.
+
+#### §B — naming, and a red inset outline
+
+Section renamed to **Census: Correction / Ground-truth Collection**. The inset's
+outline gained a colour picker defaulting to **red**: the membrane signal is
+grey-white and the highlight fills are green, so green outlines separate least.
+**§B3 was already built** in Round 16 — verified, not rebuilt: the toggle
+defaults on, closes the panel without dropping the selection, stays closed across
+re-selections, and reopens when re-enabled.
+
+#### §C — the correction write path, asserted end to end
+
+Not "the batch API returned success". On both movies: the frame column changed to
+the chosen cell; the saved `.xlsx` matches the in-memory table exactly; one undo
+restores byte-identically.
+
+**The assertion caught a false claim in the return value.** `apply_census_edits`
+reported `frames_written` as the frames it *edited*. But `_evict_future_if_colliding`
+relocates a colliding track's entire future, so on GBE **one link correction
+rewrote 27 of 30 frames**. `frames_written` is now measured from the before/after
+tables rather than asserted from the edit list, `frames_asked` records what was
+requested, and `beyond_asked` names the difference. `add_tracking_id`'s dedup also
+removed another track's claim with nothing reporting it; that is now
+`claims_removed`.
+
+A correction tool whose reach is under-reported is not usable for real work, and
+this is the shape that under-reporting took.
+
+#### §D — the queue size is a property of the run, and the status line could lie
+
+The completed 2×2, measured in-repo on matching inputs and added to
+`judge-calibration.md`:
+
+| tracking | judge | GBE | `AS_dorsal` |
+|---|---|---|---|
+| unregistered | unregistered | **255 / 7,233 (3.53%)** | 62 / 2,816 (2.20%) |
+| unregistered | registered | 938 (12.97%) | 70 (2.49%) |
+| registered | unregistered | 518 (7.16%) | 71 (2.52%) |
+| registered | registered | **25 / 7,231 (0.35%)** | 66 (2.34%) |
+
+Matching the convention is necessary but not sufficient: both diagonals match and
+on GBE they are **10× apart**. And it is a property of the drift, not a law — on
+`AS_dorsal` all four cells sit within 2.2–2.5% and the diagonal buys nothing.
+Quoting GBE's ratio as a general fact about registration would be quoting one
+movie's stage drift.
+
+**The reported 523 was a convention mismatch, and the status line said the
+opposite.** `start_census` read `self.drift_mode` — a live UI setting the user can
+change *after* tracking — and claimed "matching this tracking". 523 is the
+registered-tracking / unregistered-judge cell (measured 518); the
+unregistered/unregistered cell is 255. The run's own convention is now recorded
+when tracking completes, the queue follows it, and a setting changed since the run
+raises a visible warning. No cap, no top-N, no severity filter: 3.5% disagreement
+is the tracking telling the user something.
+
+§D2 confirmed rather than rebuilt: `geometry_flagged` and the Link-agreement
+overlay are one function with two callers, so the overlay paints what the queue
+enqueues.
+
+**§D3** adds `environment_flagged` at the repair tier (0.5, not the look tier's
+0.75). Every verdict now carries `source`, and **pooling across sources raises**
+rather than being discouraged in a footnote — `environment_dice` is invariant
+under a coherent identity permutation, so it rewards exactly the systematic
+mislabelling a drift-compensated cost can introduce. Only `frame_pair` reports
+`unbiased: True`.
+
+#### §E — ground truth as a CTC-style sibling
+
+`cell_track_output/GT_All_cell_tracking/` beside `All_cell_tracking/`, holding the
+xlsx, `provenance.json` and the per-judgment CSV. The xlsx is the readable
+artefact; the CSV is the evidence, because the xlsx schema cannot hold `verdict`,
+`ms_elapsed`, `is_decoy`, `is_repeat` or `source` — and the decoy pass-rate and
+intra-rater agreement are what make the labels quotable.
+
+The provenance hashes the tracking table it was collected against, and a
+correction applied afterwards flips `matches_current_tracking` to False rather
+than passing silently. Asserted that no pipeline path picks it up: both `listdir`
+calls are on the per-population subfolder and filter by a prefixed regex, so
+neither a `GT_` sibling nor a `GT_`-prefixed file inside the result folder is
+visible to them.
+
+**This sits inside a directory the app writes to, which looks like the pattern
+rule 7 forbids. It is not.** Rule 7 governs test fixtures — things a normal day's
+work must not be able to overwrite. This is the user's own data and belongs with
+their outputs. The distinction is who owns the file, not which directory it is in.
+
+#### §F, §G — the two documents
+
+`v2/人机协同点击测试指南.md` rewritten for what is actually owed: Round 17's three
+unverified rendering fixes, this round's UI, the correction write path as a
+close-the-app-and-reopen check, and the census timing run Round 15 §C6(3) asked
+for and forbade estimating. Every item names a dataset, a click and an expected
+result, with a "known limitations, don't report these" section.
+
+`v2/docs/census.md` covers what one item is, each set's rule and measured size,
+the completed 2×2, the two modes and why they are exclusive, what decoys/repeats/
+timing each measure, and that only `frame_pair` gives an unbiased rate.
+
+#### Also noted, not fixed
+
+`track_all_populations` writes the merged table to `all_cell_tracking/` while
+`track_cells` writes its per-population folder as `All_cell_tracking/`. On macOS
+these resolve to one directory; on a case-sensitive filesystem they would be two.
+The app's own read and write paths are consistently lowercase, so nothing is
+broken here — flagged rather than changed, since changing it moves output paths.
+
+#### Verification
+
+Items 1–8 done. **Item 9 — the native-window pass — is not done and is now the
+guide's entire purpose**; §F exists so that it stops being an unactionable line
+item and becomes a half-hour with a checklist.
+
+### Round 17: close Round 16, undo the shared-directory damage, fix what the native window showed (2026-09-06)
+
+#### §A -- the native pass happened, and it earned its place
+
+Round 16's verification item 7 is **done, by the user**. The standing "Still not
+verified" gap had been open since 2026-08-17.
+
+It found three real defects, and the pattern is the argument for keeping the
+native pass a hard item rather than a nice-to-have: **every one of the three is
+invisible to the dev mock.** Two are pure rendering (a CSS collision, a fill
+that ignored its filter) and the third is a label-source mismatch that only
+shows when two panels are on screen together. That is the third time the mock
+has hidden something.
+
+#### §B1 -- baselines moved out of the dataset directory
+
+`baseline_path()` used to return a path *inside* `test_data/<dataset>/`, which
+is where the app writes on every Extract / Classify / Track run. Four of the six
+occurrences in `v2/docs/shared-directory-cost.md` trace to that one fact.
+
+They now live in `v2/baseline_data/<slug>/`:
+
+```
+tracking.xlsx      the pipeline-produced table
+Cells_info.xlsx    the PINNED extraction it was produced from
+provenance.json    commit, params, RESOLVED input paths, both content hashes
+```
+
+Pinning the extraction is the part that matters. Round 16's trigger was a
+re-extraction moving a constant from 4.89% to 4.83% with nothing in the tracker
+changed, surfacing as a tracking regression; `check()` now hashes the input as
+well and reports a mismatch as *"an extraction change, not a tracking
+regression"*. Regression runs read masks from `test_data/` and write every
+output to a temp directory that is deleted on the way out.
+
+Three things are asserted rather than intended: no baseline path resolves inside
+an app output directory, a path that would is **refused**, and adopt +
+regenerate + a regression run leave the dataset directory byte-identical.
+`tracking_benchmark`'s pinned block now reads the pinned extraction too.
+
+#### §B2 -- `__bool__` means "found arrays", not "path exists"
+
+It was `isdir(npy_folder)`. A TIFF dataset's own `masks/` holds only `.tif` --
+the arrays are in `masks/npy_converted/` beneath it -- so the check passed, the
+loader found nothing, and the mask-overlap term at weight 1.0 contributed
+nothing while the run reported success. It cost twice (Round 15 §A1, Round 16's
+centroid-only baseline).
+
+Now false when no arrays resolve, and `track_cells` / `retrack_frame_range` warn
+naming the folder and what could not be computed -- but only when something is
+actually lost, so `overlap_weight=0` stays quiet. The self-test covers the TIFF
+shape specifically.
+
+#### §B3 -- the withdrawn numbers, re-measured
+
+From provenance-stamped baselines with the arrays reachable and the resolved
+paths recorded. **The old values stay withdrawn; these do not replace them in
+the historical record, they succeed them.**
+
+| dataset | `none` (shipped default) | `centroid` | `mask` |
+|---|---|---|---|
+| `embryos_GBE_GAP43` | **418** | 475 (+57) | 487 (+69) |
+| `AS_dorsal view_E-cad` | **181** | 183 (+2) | 183 (+2) |
+| `AS_LE_lateral view_E-cad` | **151** | 151 (+0) | 151 (+0) |
+
+Withdrawn for comparison, **not** to be quoted: 414 -> 473 / 488. The anchor was
+four tracks low because that run's overlap term was silently inert, so the old
+deltas (+59 / +74) conflated turning registration on with turning the overlap
+term on. The corrected deltas are +57 / +69.
+
+Worth noting beyond the fix: registration does essentially nothing on
+`AS_LE_lateral` and almost nothing on `AS_dorsal`. GBE is the dataset that
+drifts (6.98 px/frame against a 13.0 px median radius), and it is the only one
+where the choice matters.
+
+The 370 -> 414 endpoint is not in this table: 370 belongs to a code state before
+Round 7's `_close_label_gaps` bound and cannot be reproduced without reverting
+it.
+
+#### §B4 -- diffed before regenerating, and the corrections were kept
+
+Both replaced tables were compared against fresh pipeline runs before anything
+was written. The pipeline is deterministic (two runs share 100% of links), so
+the comparison is meaningful.
+
+| stored table | closest setting | links shared | residual |
+|---|---|---|---|
+| GBE (written 09-06 00:10) | `drift=mask` | 6,851 / 6,935 (98.8%) | 84 stored-only |
+| `AS_dorsal` (09-05 17:26) | `drift=none` | 2,499 / 2,632 (94.9%) | 133 stored-only |
+
+No setting swept (drift x motion x gap x overlap_weight) reproduces either
+table. **The coverage log settles what the residual is**: 11 of GBE's 14 logged
+`cell_changed` cells appear in a stored-only link, and 2 of `AS_dorsal`'s 3. The
+tables carry human corrections, and the log shipped in Round 15 is what made
+that answerable rather than a guess.
+
+So they were **not overwritten**. Preserved under `v2/baseline_data/<slug>/`:
+`corrected_tracking.xlsx`, the session's `coverage_log.csv`, and
+`ground_truth_links.csv` holding the 21 (GBE) and 5 (`AS_dorsal`) links that
+touch a cell the log records as edited -- narrow on purpose. An edit is evidence
+about the cell it changed, not about the other 98% of links the tracker produced
+and nobody looked at. `corrections.provenance.json` records the run, the
+extraction, the closest setting and that caveat.
+
+*A method note:* the first comparison was per-track and reported 99 of 181
+`AS_dorsal` tracks differing, which looked alarming. It was an artefact of the
+metric -- one differing link splits two tracks, and the Index columns were not
+even aligned. At link level the same tables agree on 94.9%. The granularity of
+a diff is part of the claim.
+
+#### §C1 -- the legend collision, fixed at its cause
+
+`.control-group-label` carried `margin-right: -8px`, which cancelled
+`.field-row`'s 8px gap **exactly**, so the lead-in butted against the first
+control: *"Disagrees with overlapAgrees [swatch]"*. Every row using the class
+had it.
+
+Fixed in the CSS, not in one row's markup, so all four colour-legend rows are
+covered. Reproduced and verified by measurement rather than by eye: re-applying
+the old rule in the live page gives a **0 px** gap, the fix gives **10 px** plus
+a 1 px separator rule. The agreement row's lead-in also read as a sentence
+fragment and is now *"vs overlap reference"*, which reads as the row heading it is.
+
+#### §C2 -- one label resolver, and an inset toggle
+
+**(a)** "Show cell labels" drew **track** ids, falling back to the raw label
+only for unmatched cells. Renamed to *"Show track labels"*, and the fallback is
+now marked -- prefixed `#` and drawn in orange -- because a number that is a
+track id for most cells and a raw label for a few, with no way to tell which, is
+worse than either alone.
+
+**(b)** The inset labelled with raw ids, so the same three cells read 284 / 281 /
+282 in the main view and 65 / 72 / 76 in the inset. Cellpose renumbers raw labels
+every frame, so stepping the inset changed every number even where tracking was
+perfect -- the opposite of what the panel is for. Both now go through
+`rendering.build_matched_lookup` + `rendering.cell_label_text`. The defect *was*
+the duplication, so the fix is one function rather than a second copy, and a
+self-test asserts one cell reads `7` at frames 1, 2 and 3 while its raw id is
+65 / 11 / 5.
+
+**(c)** An *"Enable inset view"* checkbox, default on, closes the panel without
+deselecting the cell and keeps it closed across re-selections until re-enabled.
+
+#### §C3 -- the filter was an axis filter calling itself a T1 filter
+
+`Show: settled only` reported *"Axes drawn 3 of 13"* and still painted ten faded
+olive cells, because the filter and the fill were two code paths and only the
+axis path had heard of it (`rendering.py:466` gated the axis; `:413` dimmed the
+fill from `confirmed`, which nothing connected to the filter).
+
+The filter now runs in `_dynamics_states`, so every consumer gets one answer, and
+an excluded T1 is **not drawn at all** rather than dimmed -- the user's judgement
+was that the faded rendering only adds visual load. Renamed `t1_axis_filter` ->
+`t1_event_filter` throughout: the old name was accurate when it only gated axes
+and stopped being accurate the moment it gated the fill. The readout now says
+*"T1s drawn 2 of 3 (1 hidden by 'persistent') -- cell and axis together"*, and the
+**raw counts still render** beside it.
+
+Asserted by counting painted pixels, not by eye, on both movies. GBE frame 16:
+161 T1 cells (148 settled / 13 transient), `all` fills 13 of 13 transient,
+`settled only` fills **0 of 13**. `AS_dorsal`: 5 of 5 -> 0 of 5. Two transient
+cells on GBE still show a few changed pixels under `settled only` (8 of 441 and
+32 of 446) -- that is a settled neighbour's axis line crossing them, not a fill,
+which is why the assertion is on the fill fraction and not on any change at all.
+
+**Divisions and delaminations are deliberately left alone.** They share the same
+`confirmed -> dim` rendering path, but the decision is not the same one: an
+unconfirmed division candidate has to stay visible or it can never be confirmed,
+whereas an unsettled T1 is noise the user asked to stop seeing.
+
+#### Verification
+
+Items 1-8 are done: all module self-tests, the real-data harness on
+`AS_dorsal view_E-cad` and GBE, and a dev-mode click-through of C1-C3 (legend
+gap measured before and after, the inset toggle's four states, the renamed
+filter, both readouts).
+
+**Item 9 -- a second native-window pass on C1-C3 -- is NOT done.** It needs the
+real window, and all three are rendering defects, which is precisely the class
+the mock cannot see. It is the one outstanding item of this round.
+
+### Round 16: retire one tool, verify before applying, and reuse the census view (2026-09-05)
+
+All five items came from the user running the app on real data. The coverage
+log shipped in Round 15 recorded that session, and it is the first real
+evidence this project has of how the correction view is actually used: **578
+events, 8.8 minutes over all 30 GBE frames, 28 cells clicked, 14 corrections
+applied**, with the overlay on `agreement` for 275 of 536 frame views and
+`environment` for 226. That is a tool being used for judging, not for browsing.
+
+#### §A -- Smart-stop propagate is retired from the UI
+
+Hidden, not deleted. `compute_propagation_stop_frame`,
+`score_propagation_stop_frames` and `apply_smart_stop_merge` and their tests
+stay as the record of what was tried, the same way the four unthreaded LAP cost
+parameters do. The three elements stay in the DOM inside
+`#smart-stop-retired[hidden]` so the handlers keep working rather than being
+half-removed.
+
+The evidence had been against it for three rounds: its line search never
+discriminated (all three candidates scored 2.155% on the tested merge), and its
+stop rule overshoots by one frame *by construction* -- a neighbour unclaimed at
+`frame_number` has `previous_owner` `None`, so the frame at which tracking picks
+it up can never satisfy the test. "Check how far this holds" covers the harder
+case, which Smart-stop's "trust `old_id`'s own row" assumption cannot represent
+at all.
+
+#### §B -- the plan is verified before Apply, and the plan's judge had to be replaced
+
+`v2/docs/check-how-far.md` is the write-up; this is what it identified as
+missing, now built.
+
+**The judge §B3 named does not work, and this was measured before building on
+it.** `tracking_benchmark.forward_backward_consistency` re-solves both
+directions from `cells_info` and the masks and **never reads `tracking_data`**:
+on `AS_dorsal view_E-cad` a *fully scrambled* tracking table scores identically
+(48 / 2,634, 1.822% both ways). Its delta would therefore be exactly zero for
+every plan -- endorsing a destructive plan as readily as a good one. A judge
+that cannot fail is worse than no judge.
+
+The replacement, `tracking_benchmark.table_link_consistency`, keeps the
+plan's intent -- transposition, same cost function -- but scores the links the
+**table** asserts: for each pair, does the backward solve confirm `b -> a`?
+Measured on the same scrambled table: **2.55% -> 99.60%** where
+`forward_backward_consistency` reads 2.55% -> 2.55%. The two are now asserted
+apart in the self-test so this cannot be re-discovered.
+
+It remains a **consistency delta, never an accuracy**. Same cost function, so it
+says whether the result is self-consistent under transposition, not whether it
+is right; its degenerate case (a coherent identity permutation scores 0) is
+shared with `environment_dice` and with forward--backward, so it is not a second
+independent line on either; and both sides are measured under one registration
+convention, reported in the answer.
+
+Also shipped: the three structural checks
+(`manual_correction_tracking.verify_moves_plan`, answered by running the plan
+through the **real writer** on a deep copy rather than modelling what the writer
+would do -- this module has shipped three data-destroying write paths, and a
+checker that modelled them would have agreed with every one), each step's
+`distance` against the gate that admitted it, and every
+`from_track_id is not None` step marked red as the only destructive action a
+plan contains.
+
+Measured on `AS_dorsal` track #2 through the harness: 20 moves, all 20 taking a
+cell from another track, 2 tracks truncated, one step at **0.809 of its gate**,
+consistency delta +1 of 2,616. On GBE track #2: 20 moves, delta +0 of 5,250.
+The live table is asserted byte-identical after verification -- the safety
+property of an accept-and-revert loop, and not optional.
+
+#### §C1 -- how census items are chosen
+
+Two queue kinds, both raster-ordered within a frame pair so consecutive items
+are adjacent cells and the crop moves a little rather than across the image:
+
+- **`geometry_flagged`** -- every link where `classify_links` returns
+  `"disagrees"`: the tracker's pick is not the overlap reference's best-IoU
+  successor. On registered GBE **24 of 7,219 (0.33%)**; on `AS_dorsal`, 66 of
+  2,818 (2.34%).
+- **`frame_pair`** -- every link in one chosen pair; the unbiased design,
+  ~240 items.
+
+`register` defaults True and is recorded in the provenance, because an overlap
+reference computed on unregistered masks scores a registered tracker by a
+convention it does not share -- that switch alone moved GBE's flagged count from
+955 to 24.
+
+#### §C2 -- correction mode, kept strictly apart from census mode
+
+> Ground truth collected against a tracking run is not valid for a run it
+> corrected. A session writes verdicts **or** edits, never both.
+
+The two modes share the blink, the keystrokes and the auto-advance, and refuse
+each other in the **backend**, not in the UI: `submit_census_verdict` refuses a
+correction session and `queue_census_edit` / `apply_census_edits` refuse a
+census one. Correction mode forces decoys and repeats off -- accepting a decoy
+would inject a deliberate error into the tracking table -- and applies the whole
+batch as **one snapshot, one atomic write, one undo**, with §B1's structural
+checks run over the batch first and Apply refused if it fails one.
+
+Asserted on both movies in the harness: a census session leaves the table
+byte-identical and a correction session leaves `ground_truth_links.csv`
+byte-identical, and undo restores the snapshot exactly.
+
+#### §D -- transient T1 axes are off by default
+
+Default changed from `all` to `persistent`, on the user's report that the faded
+transient axes interfere with reading the frame -- 21% of raw events on GBE
+reverse within one frame, and at ~1,500 gains per movie that is a lot of flicker
+drawn over the tissue. **Rendering only**; no count changes and nothing is
+dropped from the data. `all` stays one click away, and `get_t1_events` now
+returns `axis_counts` so the readout says `Axes drawn 2 of 3 (1 hidden by
+"persistent", 0 can't judge)` -- a filter whose removals cannot be seen cannot
+be judged too aggressive.
+
+#### §E -- a docked frame stepper
+
+Opens on selecting a matched cell, steps with the arrow keys, closes with `Esc`,
+and **never touches the main view or the selection** -- the reported bug. A
+filmstrip marks which frames the track actually holds a cell in.
+
+The window rule is explicit and the panel says which one is in force:
+
+- **within one frame of the anchor**: one shared window, so the immediate
+  before/after is a true blink -- the cell moves, the background does not;
+- **beyond that**: re-centred, because under GBE's ~6.5 px/frame drift a fixed
+  window loses the cell within a few steps.
+
+*The first implementation got this wrong and measuring caught it.* Unioning the
+anchor with **whichever frame was asked for** gives a different window per
+frame: 147x85, 130x77, 164x100 for three supposedly shared frames of `AS_dorsal`
+track 1. The window is now unioned over the anchor and *both* its neighbours, so
+all three are identical -- asserted in the harness (`AS_dorsal` 151x114 x3,
+GBE 89x97 x3, and the +3 step re-centred and flagged).
+
+`_census_crop` / `_census_window` were factored into one cropper used by both
+the census queue and the stepper, rather than a second one written; the
+shared-window property is the subtle part and two croppers would diverge on
+exactly it.
+
+#### Two findings from the day's real use, neither of them a regression
+
+**1. The GBE pinned numbers moved because the INPUTS changed.** The user
+re-ran Extract on GBE (7,456 cells), which replaced
+`cell_classification_output/Cells_info.xlsx` -- the file
+`tracking_benchmark`'s pinned constants were measured against. The first symptom
+was an assertion failing at 4.83% where 4.89% was pinned, which reads exactly
+like a cost regression. It is not: **HEAD and the working tree give
+byte-identical scores on today's extraction** (4.8296% / 94.9153% / 5,487
+judged / 7,221 total / 418 tracks, both). The constants are re-pinned to the
+current extraction with the previous values kept in the comment, and the block
+now fingerprints `cells_info` so the next occurrence says *which* of the two it
+is instead of failing like a regression.
+
+**2. `baselines.regenerate` pointed at the wrong folder for a TIFF dataset.**
+`masks/` on GBE holds only `.tif`; the arrays live in `masks/npy_converted/`.
+`_FrameLabelLoader.__bool__` passes on the former (the folder exists) and then
+finds nothing, so the mask-overlap term -- weight 1.0 by default -- silently did
+nothing. **The GBE baseline written in Round 15 is therefore centroid-only:
+414 tracks, where the same defaults with the arrays reachable give 418.**
+Provenance could not catch it, because every parameter it recorded was correct;
+only the inputs were wrong. Fixed, and the resolved path is now recorded in the
+provenance rather than just whether one was supplied.
+
+**Both stored baselines for `AS_dorsal` and GBE were replaced by the user's own
+app runs** (17:26 and 17:04), which recreated the output folder and removed the
+provenance files. `baselines.py --check` reports both as *"has no provenance, so
+it is not a baseline for any settings"* -- the B1 mechanism doing its job on its
+first live occurrence. They are **not** regenerated here: those folders may hold
+manual corrections, and overwriting them is the user's call.
+`AS_LE_lateral view_E-cad` is untouched and still verifies (151 tracks).
+
+#### Not verified in the native window
+
+Everything above was verified through module self-tests, the real-data harness
+on `AS_dorsal view_E-cad` and `embryos_GBE_GAP43`, and a dev-mode click-through
+of every item (Smart-stop absent, plan checks and red marking, both session
+modes refusing each other, batch apply/undo and the blocked path, the axis-count
+readout, and the stepper preserving the main frame and the selection).
+**Verification item 7 -- a native-window pass -- is not done**; it needs the
+real window. The last full native pass remains 2026-08-17.
+
+One useful thing learned in the dev-mode pass: `window.EpiQuantAPI` is frozen,
+so a click-through cannot monkey-patch a mock method to force a branch. Reach
+branches through `mockState` instead.
 
 ### Round 15: close the leftovers, build the mechanisms, collect the first ground truth (2026-09-03)
 

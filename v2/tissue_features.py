@@ -274,6 +274,7 @@ def extract_tissue_features(
     min_interface_px: int = MIN_INTERFACE_PX,
     rings: int = 1,
     progress_cb: Optional[Callable[[str, int], None]] = None,
+    frames: Optional[set] = None,
 ) -> pd.DataFrame:
     """Tissue-texture descriptors for every cell in every frame of `npy_folder`.
 
@@ -287,6 +288,12 @@ def extract_tissue_features(
     """
     npy_files = data_input.list_segmentation_files(npy_folder)
     frame_number_by_file = data_input.resolve_frame_numbers(npy_files)
+    # `frames` limits the work to a range. Every value here is a function of
+    # that cell's own mask and its own frame's neighbours, so a range is exact
+    # (Round 19 C3).
+    if frames is not None:
+        wanted = {int(f) for f in frames}
+        npy_files = [f for f in npy_files if frame_number_by_file.get(f) in wanted]
     total = len(npy_files)
 
     if shape_info is None:
@@ -299,7 +306,7 @@ def extract_tissue_features(
         if os.path.splitext(filename)[1] != ".npy":
             continue
         loaded = np.load(os.path.join(npy_folder, filename), allow_pickle=True).item()
-        labels = loaded["masks"] if "masks" in loaded else loaded["outlines"]
+        labels = data_input.load_label_array(loaded)
         frame_id = str(frame_number_by_file[filename])
 
         if progress_cb is not None:

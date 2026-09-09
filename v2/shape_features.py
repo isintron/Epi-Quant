@@ -363,6 +363,7 @@ def extract_shape_features(
     exclude_edge_cells: bool = False,
     with_coefficients: bool = False,
     progress_cb: Optional[Callable[[str, int], None]] = None,
+    frames: Optional[set] = None,
 ) -> pd.DataFrame:
     """Shape descriptors for every cell in every frame of `npy_folder`.
 
@@ -380,6 +381,12 @@ def extract_shape_features(
 
     npy_files = data_input.list_segmentation_files(npy_folder)
     frame_number_by_file = data_input.resolve_frame_numbers(npy_files)
+    # `frames` limits the work to a range. Every value here is a function of
+    # that cell's own mask and its own frame's neighbours, so a range is exact
+    # (Round 19 C3).
+    if frames is not None:
+        wanted = {int(f) for f in frames}
+        npy_files = [f for f in npy_files if frame_number_by_file.get(f) in wanted]
     total = len(npy_files)
 
     row_index: list[str] = []
@@ -391,7 +398,7 @@ def extract_shape_features(
         loaded = np.load(os.path.join(npy_folder, filename), allow_pickle=True).item()
         # The filled array, per `webview/api.py:_load_frame`'s convention. The
         # `outlines` fallback exists only for files that predate `masks`.
-        labels = loaded["masks"] if "masks" in loaded else loaded["outlines"]
+        labels = data_input.load_label_array(loaded)
         height, width = labels.shape
         frame_id = str(frame_number_by_file[filename])
 
