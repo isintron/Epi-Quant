@@ -48,25 +48,32 @@ from PIL import Image
 from scipy.ndimage import distance_transform_edt as ndimage_distance_transform_edt
 from scipy.ndimage import find_objects as ndimage_find_objects
 from scipy.ndimage import label as ndimage_label
+from scipy.ndimage import maximum_filter as ndimage_maximum_filter
+from scipy.ndimage import minimum_filter as ndimage_minimum_filter
 
 logger = logging.getLogger(__name__)
 
-# 15-column schema written to Cells_info.xlsx. Column ORDER is load-bearing:
-# `cell_tracking.DEFAULT_TRACKING_WEIGHTS` indexes into it positionally, so the
-# two must be changed together.
+# 17-column schema written to Cells_info.xlsx. The two row builders in
+# `extract_cell_info` fill it positionally, so they change with it. Tracking
+# weights are resolved BY NAME (`cell_tracking.WEIGHTED_COLUMNS`), so the order
+# no longer moves them.
 #
 # Three columns from v1's 18 were removed on 2026-08-18 because they confused
-# users by appearing in the output while being offered nowhere in Classify:
-#   `Fitted Ellipse Angle` -- stored FOLDED (`180 - a if a > 90`), a mirror
-#       reflection rather than a modulo, so orientations 40 degrees apart share
-#       a value (70 and 110 both stored 20.0). Not invertible, so unusable as a
-#       direction. Orientation now comes from `shape_features`' Sin2Theta /
-#       Cos2Theta, recomputed from the elliptic-Fourier harmonic-1 SVD.
-#   `Circularity` -- exactly recoverable as `4*pi*A/P^2` from two columns that
-#       remain; verified against the stored column to within its own 2-decimal
-#       rounding (max diff 0.005) with all 2824 sentinel rows reproduced.
+# users by appearing in the output while being offered nowhere in Classify.
+# Two came back in Round 24 (2026-09-11), in their v1 positions, as
+# default-off Classify features -- see `pca_kmeans.FEATURE_FAMILIES["basic"]`:
+#   `Fitted Ellipse Angle` -- stored FOLDED (`180 - a if a > 90`, so 0-90), a
+#       mirror reflection rather than a modulo, so orientations 40 degrees apart
+#       share a value (70 and 110 both stored 20.0). Not invertible, so unusable
+#       as a direction; for that use `shape_features`' Sin2Theta / Cos2Theta,
+#       recomputed from the elliptic-Fourier harmonic-1 SVD. Restored because
+#       as a classifier on an axis-aligned specimen it is strong (single-feature
+#       AUC 0.917 on `AS_LE_lateral view_E-cad`,
+#       `docs/classification-feature-audit.md`).
+#   `Circularity` -- `4*pi*A/P^2`, the same quantity as `Shape Index`. Restored
+#       so the basic family can offer it without the shape step.
 #   `P-Value` -- `4*pi/circularity**2`, a monotone function of a monotone
-#       function of `Shape Index`. The same quantity a third time.
+#       function of `Shape Index`. The same quantity a third time. Stays removed.
 # Neither `Circularity` nor `P-Value` was ever a QC signal in its own right:
 # dropping both from `segmentation_qc.measurement_failures` detected exactly the
 # same 12 failures across 24 frames of `AS_dorsal view_E-cad`.
@@ -74,25 +81,25 @@ CELLS_INFO_COLUMNS = [
     "Cell Area", "Maximum Horizontal Length", "Maximum Vertical Length", "Horizontal/Vertical Length Ratio",
     "Cell Perimeter", "Approximate Polygon Vertex Count",
     "Fitted Ellipse Minor Axis", "Fitted Ellipse Major Axis", "Ellipse Major/Minor Axis Ratio",
-    "Circumscribed Circle Radius",
+    "Fitted Ellipse Angle", "Circumscribed Circle Radius",
     "Inscribed Circle Radius", "Center X Coordinate", "Center Y Coordinate", "Cell Left Boundary",
-    "Cell Right Boundary",
+    "Cell Right Boundary", "Circularity",
 ]
 
 # Default PCA/K-means feature set: every column except the raw positions
 # (Center X/Y, Left/Right Boundary), which locate a cell rather than describe
-# it. This is `pca_kmeans.FEATURE_FAMILIES["basic"]`.
+# it. This is `pca_kmeans.FEATURE_FAMILIES["basic"]`, whose `default_off`
+# decides which of these are ticked by default.
 #
-# **v1's 13-feature list is retired.** It contained `Fitted Ellipse Angle` and
-# `Circularity`, both removed above, so it can no longer be assembled -- and it
-# would no longer reproduce v1's numbers in any case, since the switch to
+# **v1's 13-feature list stays retired.** These are the same 13 columns in v1's
+# order, but they would not reproduce v1's numbers, since the switch to
 # mask-derived geometry moved perimeter by ~-5% and circularity by ~+10%.
 # `src/` remains frozen and is the reference for exact v1 reproduction.
 ML_FEATURE_COLUMNS = [
     "Cell Area", "Fitted Ellipse Major Axis", "Fitted Ellipse Minor Axis", "Ellipse Major/Minor Axis Ratio",
-    "Cell Perimeter", "Maximum Horizontal Length", "Maximum Vertical Length",
+    "Fitted Ellipse Angle", "Cell Perimeter", "Maximum Horizontal Length", "Maximum Vertical Length",
     "Horizontal/Vertical Length Ratio", "Approximate Polygon Vertex Count",
-    "Circumscribed Circle Radius", "Inscribed Circle Radius",
+    "Circumscribed Circle Radius", "Inscribed Circle Radius", "Circularity",
 ]
 
 # Background margin added around each cell's bounding box before the per-cell
@@ -104,6 +111,27 @@ ML_FEATURE_COLUMNS = [
 # enough to reproduce the full-frame result exactly. 8 is kept as cheap
 # headroom -- the cost scales with the (small) bbox area, not the frame.
 _BBOX_MARGIN = 8
+
+# A cell whose stored `outlines` ring has fewer than this fraction of the
+# pixels on its mask's external contour -- image-border pixels not counted --
+# is measured from that contour instead.
+# The mask is the segmentation; `outlines` is derived from it, and Cellpose's
+# GUI does not always re-derive it after a manual edit. On `AS_dorsal
+# view_E-cad` (every file carries `manual_changes`) 12 cells kept 1-10 px of
+# ring against a 99-240 px mask boundary, so every column taken from the ring
+# -- centroid, H/V extent, ellipse fit, left/right boundary -- described one
+# pixel, and the ellipse fit failed. Those were the "12 measurement failures"
+# `segmentation_qc.measurement_failures` had been reporting on that dataset.
+# Border pixels are left out of the comparison because the two ring
+# conventions differ exactly there: a Cellpose ring IS the external contour
+# (pixel-identical on 3,761 cells checked), while `thin_label_outlines`, which
+# writes the TIFF-converted rings, has no ring pixel along the image border. With
+# the border counted, `Demo_Seg_QC`'s corner cells read 0.42-0.48 and were
+# wrongly rebuilt. Measured ratio over all seven test datasets (43,983 cells):
+# those 12 sit at 0.00-0.08; the next-lowest cell anywhere is 0.97, bar one
+# puzzle cell at exactly 0.5 (`Cell1564_255`, a 6 px cell plus a stray mask
+# pixel -- see `_MIN_ELLIPSE_AXIS_PX`), which this deliberately leaves alone.
+_STALE_OUTLINE_FRACTION = 0.5
 
 # Smallest ellipse semi-axis, in pixels, that `cv2.fitEllipse` is trusted to
 # have measured. Below this the fit is degenerate and its output is not even
@@ -525,6 +553,32 @@ def thin_label_outlines(labeled: np.ndarray) -> np.ndarray:
     return ring
 
 
+def _vertex_pockets(labeled: np.ndarray) -> np.ndarray:
+    """Pixels of every label that has NO interior pixel -- none whose whole
+    3x3 neighbourhood is that label (a pixel on the image edge never
+    qualifies, as with `binary_erosion`'s zero border).
+
+    On a skeleton mask these are the background slivers the drawn network
+    encloses at a vertex, not cells. Tissue Analyzer leaves them where three
+    boundary lines meet: on `embryos_GBE_OE_GAP43` 201 of them (189 at 2 px,
+    12 at 3 px) became labels, and at `min_cell_area_px = 3` -- which drops
+    `count < 3` -- the twelve 3 px ones reached `Cells_info` with a sentinel
+    ellipse and one took a real link in tracking (`Cell25_17 -> Cell26_43`, a
+    73 px jump). The test is shape, not size: a pocket is at most 2 px thick
+    everywhere, so it cannot hold a 3x3 block, while the smallest real label
+    on the three TIFF test datasets (64 px, `Demo_Seg_QC`; 114 px on OE once
+    the pockets are gone) has plenty. Measured: exactly those 201 labels and
+    nothing else on all three (`embryos_GBE_GAP43`, `embryos_GBE_OE_GAP43`,
+    `Demo_Seg_QC`). No pixel count to guess, and it ports across
+    magnifications.
+    """
+    low = ndimage_minimum_filter(labeled, size=3, mode="constant", cval=0)
+    high = ndimage_maximum_filter(labeled, size=3, mode="constant", cval=0)
+    has_interior = np.zeros(int(labeled.max()) + 1, dtype=bool)
+    has_interior[labeled[(low == high) & (labeled > 0)]] = True
+    return (labeled > 0) & ~has_interior[labeled]
+
+
 def _label_binary_mask(
     label_array: np.ndarray, mask_type: str, background_area_ratio: Optional[float] = 10.0,
 ) -> np.ndarray:
@@ -585,6 +639,21 @@ def _label_binary_mask(
         labeled = _drop_oversized_components(labeled, background_area_ratio)
 
     if boundary is not None:
+        # A vertex pocket goes back to the network it is a gap in, not to
+        # background, so the gap-closing below hands its pixels to the cells
+        # around it exactly as it does the drawn line. After the oversize
+        # drop, not before: that test is relative to the MEDIAN component area,
+        # which removing ~1% of tiny components would nudge. Labels are zeroed,
+        # not renumbered, so every other cell keeps its ID.
+        pockets = _vertex_pockets(labeled)
+        if pockets.any():
+            logger.info(
+                "Returned %d vertex pocket(s) (labels with no interior pixel) to the skeleton",
+                len(np.unique(labeled[pockets])),
+            )
+            labeled[pockets] = 0
+            boundary = boundary | pockets
+
         # Hand the drawn boundary line back to the cells it separates.
         #
         # Without this, the 1-px skeleton belongs to no cell and every pair of
@@ -1004,6 +1073,18 @@ _MIN_CELL_AREA_PX = 0
 #: 18.9): an order of magnitude above the artefacts, six times below the
 #: smallest real cell. It is a suggestion the UI offers, never a default --
 #: `_MIN_CELL_AREA_PX` ships 0.
+#:
+#: **The bound is inclusive on the kept side: a label of exactly N px SURVIVES**
+#: (`apply_min_cell_area` drops `count < N`). "Minimum area 3" therefore keeps
+#: 3 px labels; to drop them, set 4. That is what let twelve 3 px vertex
+#: pockets through on `embryos_GBE_OE_GAP43` at a setting of 3 (Round 24), so
+#: the UI says "keep >= N px" rather than leaving the boundary to be guessed.
+#:
+#: Since Round 24 (2026-09-11) the numbers above are history: WT GBE's masks,
+#: hand-corrected since, no longer hold the 2/3/3 px labels (smallest 119 px),
+#: and a skeleton TIFF's vertex pockets are returned to the network at load by
+#: shape, whatever their size (`_vertex_pockets`). On that input this filter is
+#: a second line, not the fix.
 SUGGESTED_MIN_CELL_AREA_PX = 19
 
 
@@ -1320,6 +1401,14 @@ def extract_cell_info(
         # indexed by `label - 1` (None for absent labels), which is why it is
         # indexed rather than iterated.
         bboxes = ndimage_find_objects(outlines)
+        # The crop must hold the whole MASK, not only the ring: the raster
+        # measurements below read `fill_labels` through it, and a ring that has
+        # gone stale (see `_STALE_OUTLINE_FRACTION`) can be far smaller than
+        # its cell -- on `AS_dorsal` a 1826 px cell was measured as the 13 px of
+        # it that fell inside its 1 px ring's box. The union keeps a ring pixel
+        # outside the mask (none found in any test dataset) inside the crop too.
+        mask_bboxes = ndimage_find_objects(fill_labels) if fill_labels is not None else []
+        stale_outlines = []
 
         for cell_id in unique_ids:
             # Indexed, not guarded: `cell_id` came from `np.unique(outlines)`,
@@ -1328,13 +1417,37 @@ def extract_cell_info(
             # documents, and raising says so rather than silently dropping a
             # cell from the table.
             bbox = bboxes[cell_id - 1]
-            y0 = max(0, bbox[0].start - _BBOX_MARGIN)
-            y1 = min(height, bbox[0].stop + _BBOX_MARGIN)
-            x0 = max(0, bbox[1].start - _BBOX_MARGIN)
-            x1 = min(width, bbox[1].stop + _BBOX_MARGIN)
+            mask_bbox = mask_bboxes[cell_id - 1] if cell_id <= len(mask_bboxes) else None
+            y0, y1, x0, x1 = bbox[0].start, bbox[0].stop, bbox[1].start, bbox[1].stop
+            if mask_bbox is not None:
+                y0, y1 = min(y0, mask_bbox[0].start), max(y1, mask_bbox[0].stop)
+                x0, x1 = min(x0, mask_bbox[1].start), max(x1, mask_bbox[1].stop)
+            y0 = max(0, y0 - _BBOX_MARGIN)
+            y1 = min(height, y1 + _BBOX_MARGIN)
+            x0 = max(0, x0 - _BBOX_MARGIN)
+            x1 = min(width, x1 + _BBOX_MARGIN)
             window = outlines[y0:y1, x0:x1]
 
             local = np.where(window == cell_id)
+            if mask_bbox is not None:
+                # Cellpose's own ring convention (`masks_to_outlines`): every
+                # external contour of the cell's mask, all pixels.
+                own = (fill_labels[y0:y1, x0:x1] == cell_id).astype(np.uint8)
+                mask_ring = np.zeros_like(own)
+                for contour in cv2.findContours(own, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[-2]:
+                    mask_ring[contour[:, 0, 1], contour[:, 0, 0]] = 1
+                interior = mask_ring.copy()
+                if y0 == 0:
+                    interior[0, :] = 0
+                if y1 == height:
+                    interior[-1, :] = 0
+                if x0 == 0:
+                    interior[:, 0] = 0
+                if x1 == width:
+                    interior[:, -1] = 0
+                if local[0].size < _STALE_OUTLINE_FRACTION * np.count_nonzero(interior):
+                    stale_outlines.append(int(cell_id))
+                    local = np.where(mask_ring > 0)
             # Absolute frame coordinates, matching the pre-bbox behaviour that
             # every column below (centroid, left/right boundary, edge test) is
             # defined in.
@@ -1378,8 +1491,8 @@ def extract_cell_info(
                 dv = np.max(positions[0]) - np.min(positions[0])
                 cell_info = [
                     np.nan, ap, dv, ap / dv if dv != 0 else -1, np.nan, np.nan,
-                    np.nan, np.nan, np.nan, np.nan, np.nan,
-                    cx, cy, np.min(positions[1]), np.max(positions[1]),
+                    np.nan, np.nan, np.nan, np.nan, np.nan, np.nan,
+                    cx, cy, np.min(positions[1]), np.max(positions[1]), np.nan,
                 ]
                 # Rounded like the full path so the populated columns come out
                 # float64 rather than int64; without it the two modes produce
@@ -1459,13 +1572,21 @@ def extract_cell_info(
                 cell_area, ap, dv, aspect_ratio, cell_arclength, len(vertices),
                 cell_ellipse[1][0] if cell_ellipse is not None else -1,
                 cell_ellipse[1][1] if cell_ellipse is not None else -1,
-                ratio_long_and_short_axes,
+                ratio_long_and_short_axes, cell_ellipse_angle,
                 min_enclosing_circle_radius, max_inner_circle_radius,
-                cx, cy, np.min(positions[1]), np.max(positions[1]),
+                cx, cy, np.min(positions[1]), np.max(positions[1]), circularity,
             ]
             cell_info = np.round(cell_info, 2)
             row_index.append(f"Cell{fig_id}_{cell_id}")
             row_values.append(cell_info)
+
+        if stale_outlines:
+            logger.warning(
+                "Frame %s (%s): %d cell(s) have a stored outline covering less than half "
+                "of their mask's boundary (stale after a manual edit?) and were measured "
+                "from the mask instead: labels %s",
+                frame_number, filename, len(stale_outlines), stale_outlines,
+            )
 
     cells_info = pd.DataFrame(row_values, index=row_index, columns=CELLS_INFO_COLUMNS)
 
@@ -1527,6 +1648,30 @@ if __name__ == "__main__":
               % (100 * (ring > 0).mean(), set(np.unique(ring)) - {0} == set(np.unique(labeled)) - {0})),
         assert (ring > 0).sum() < (labeled > 0).sum(), "a ring must be smaller than the filled mask"
         assert set(np.unique(ring)) - {0} == set(np.unique(labeled)) - {0}
+
+        # --- R24: a vertex pocket is not a cell. The same grid with the vertex
+        # at (10, 10) drawn as a thick knot that encloses a 3-px L -- the shape
+        # Tissue Analyzer left 12 times on `embryos_GBE_OE_GAP43` (frame 30
+        # label 17). It must go back to the network, not become a 10th cell.
+        knot = grid.copy()
+        knot[9:13, 9:13] = 255
+        for y, x in ((10, 10), (11, 10), (11, 11)):
+            knot[y, x] = 0
+        knot_path = os.path.join(tmp, "skeleton_pocket.tif")
+        Image.fromarray(knot).save(knot_path)
+        knot_labels = load_tiff_mask(knot_path, mask_type="auto")
+        assert ncells(knot_labels) == 9, ("the enclosed 3-px pocket became a cell", ncells(knot_labels))
+        knot_areas = np.bincount(knot_labels.ravel())[1:]
+        assert knot_areas[knot_areas > 0].min() > 50, knot_areas   # zeroed, not renumbered: gaps are expected
+        # The shape test at its boundary: a 3x3 block has one interior pixel
+        # and stays; a 2-px-thick strip of any length has none and goes.
+        shapes = np.zeros((12, 30), dtype=np.int64)
+        shapes[1:4, 1:4] = 1
+        shapes[6:8, 1:29] = 2
+        flagged = set(np.unique(shapes[_vertex_pockets(shapes)]))
+        assert flagged == {2}, flagged
+        print("R24: an enclosed 3-px vertex pocket is returned to the skeleton (9 cells,")
+        print("  not 10); a 3x3 block is kept, a 2 x 28 strip is not.")
 
         # binary_mask means "foreground IS the cell body" -- three solid blobs
         # on empty background. The background here is real empty space, so it
@@ -1651,6 +1796,10 @@ if __name__ == "__main__":
 
     off, none_removed = apply_min_cell_area(grid, 0)
     assert off is grid and none_removed == [], "0 must be a true no-op"
+    # The UI promises "keep >= N px": a label of exactly N px survives N.
+    three_px = np.zeros((5, 5), dtype=int)
+    three_px[1, 1:4] = 7
+    assert apply_min_cell_area(three_px, 3)[1] == [] and apply_min_cell_area(three_px, 4)[1] == [7]
     print("  0 px is a no-op that returns the same array object, so 'off' cannot drift.")
 
     # `_close_label_gaps` fills separator pixels up to `_MAX_GAP_FILL_PX`. It
@@ -1727,6 +1876,75 @@ if __name__ == "__main__":
     assert recovered is not None and ring_removed_2 == [3], ring_removed_2
     print("E4 (R22 D): `load_label_array` falls back to `outlines` only when it is")
     print("  filled -- a ring returns None, an old filled-under-outlines file filters.")
+
+    # --- R24: the two restored columns land in their named slots, and the
+    # wider sheet survives the Excel round trip the product does: written by
+    # Extract, re-read by "load existing extraction", then the leading-edge
+    # column written back into the same file. The row builders are positional,
+    # so a value in the wrong slot would pass every length check -- assert the
+    # values by NAME against quantities they must equal.
+    import manual_correction_classification
+    set_min_cell_area(0)
+    xlsx_dir = _tmp.mkdtemp()
+    written, _ = extract_cell_info(holder, output_path=xlsx_dir)
+    assert list(written.columns) == CELLS_INFO_COLUMNS, list(written.columns)
+    squares = written.loc[["Cell1_1", "Cell1_2"]]
+    expected_c = (4 * math.pi * squares["Cell Area"] / squares["Cell Perimeter"] ** 2).round(2)
+    assert np.allclose(squares["Circularity"], expected_c, atol=0.006), (squares["Circularity"], expected_c)
+    assert squares["Fitted Ellipse Angle"].between(0, 90).all(), squares["Fitted Ellipse Angle"]
+    # The neighbours of both inserted slots: a 20x20 square has an inscribed
+    # radius of 10, and a circumscribed radius of 13 -- the contour runs through
+    # pixel centres, 19 px apart, so the half-diagonal is 13.4, truncated.
+    assert (squares["Circumscribed Circle Radius"] == 13).all(), squares["Circumscribed Circle Radius"]
+    assert (squares["Inscribed Circle Radius"] == 10).all(), squares["Inscribed Circle Radius"]
+    assert (squares["Cell Right Boundary"] - squares["Cell Left Boundary"] == 19).all()
+
+    path = os.path.join(xlsx_dir, "Cells_info.xlsx")
+    loaded = pd.read_excel(path, sheet_name="Cell")          # as `load_existing_extraction`
+    assert list(loaded.columns) == ["Cell Index"] + CELLS_INFO_COLUMNS, list(loaded.columns)
+    pd.testing.assert_frame_equal(loaded.set_index("Cell Index"), written, check_dtype=False)
+    loaded["leading_edge"] = [1.0, -1.0, 1.0][: len(loaded)]
+    manual_correction_classification.save_leading_edge_column(loaded, path)
+    again = pd.read_excel(path, sheet_name="Cell")
+    assert list(again.columns) == ["Cell Index"] + CELLS_INFO_COLUMNS + ["leading_edge"], list(again.columns)
+    pd.testing.assert_frame_equal(again.drop(columns="leading_edge"), loaded.drop(columns="leading_edge"),
+                                  check_dtype=False)
+    assert list(again["leading_edge"]) == list(loaded["leading_edge"]), again["leading_edge"]
+    # --- R24 stale outlines. The mask is the segmentation; a stored ring that
+    # has lost most of its pixels (Cellpose's GUI does not always re-derive it
+    # after a manual edit) must not decide the row. Cell 1 keeps ONE ring pixel
+    # of its 76; its row must come out exactly as from an intact file. Cell 2 is
+    # a full-width strip along the top edge in the TIFF convention
+    # (`thin_label_outlines` has no ring pixel on the image border), so its
+    # stored ring is 60 of a 136 px contour -- under half, yet not stale. It must
+    # be left alone; counting the border, it was rebuilt (Demo_Seg_QC corners).
+    labels_r = np.zeros((60, 60), dtype=np.int32)
+    labels_r[0:10, :] = 2
+    labels_r[20:40, 20:40] = 1
+    intact_dir, stale_dir = _tmp.mkdtemp(), _tmp.mkdtemp()
+    ring_r = thin_label_outlines(labels_r)
+    np.save(os.path.join(intact_dir, "s0001_seg.npy"), {"masks": labels_r, "outlines": ring_r}, allow_pickle=True)
+    stale_ring = ring_r.copy()
+    stale_ring[stale_ring == 1] = 0
+    stale_ring[20, 30] = 1
+    np.save(os.path.join(stale_dir, "s0001_seg.npy"), {"masks": labels_r, "outlines": stale_ring}, allow_pickle=True)
+    intact_rows, _ = extract_cell_info(intact_dir)
+    stale_rows, _ = extract_cell_info(stale_dir)
+    pd.testing.assert_frame_equal(stale_rows, intact_rows)
+    assert stale_rows.loc["Cell1_1", "Cell Area"] == 400, stale_rows.loc["Cell1_1"]
+    assert not (stale_rows.loc["Cell1_1"] == -1).any(), stale_rows.loc["Cell1_1"]
+    # Both files store the same ring for the strip, so the equality above cannot
+    # see it being rebuilt -- assert its values. Its stored ring is the bottom
+    # row alone (y = 9); rebuilt from the contour, its centroid moves to ~4.5.
+    strip = stale_rows.loc["Cell1_2"]
+    assert strip["Center Y Coordinate"] == 9.0 and strip["Maximum Vertical Length"] == 0, strip
+    print("\nR24: a 1-px stale ring is measured from the mask (area 400, no sentinel), row-")
+    print("  identical to the intact file; a TIFF-convention strip on the image border")
+    print("  (stored ring 60 of a 136 px contour) is left alone.")
+
+    print("\nR24: Circularity/Fitted Ellipse Angle land in their named slots (C = 4*pi*A/P^2,")
+    print("  angle in 0-90, neighbours intact), and the 17-column sheet round-trips through")
+    print("  load-existing and the leading-edge write-back with every column unchanged.")
 
     print("\nAll data_input self-tests passed.")
 

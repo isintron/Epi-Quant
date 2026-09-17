@@ -31,22 +31,28 @@ import data_input
 
 logger = logging.getLogger(__name__)
 
-# The Cells_info.xlsx columns used to build the tracking cost matrix -- taken
-# from the schema itself so the two can never disagree.
-#
-# v1 indexed this list POSITIONALLY for both the displacement gate and the
-# weights, which made the column order silently load-bearing. The gate is
+# v1 indexed its feature list POSITIONALLY for both the displacement gate and
+# the weights, which made the column order silently load-bearing. The gate is
 # resolved by name (`_gate_indices`); the weights were NOT until Round 14 --
 # `DEFAULT_TRACKING_WEIGHTS` is a positional list, so a caller passing custom
 # `feature_columns` without matching `weights` got them silently misaligned.
 # `resolve_weights` fixes that, and `build_cost_matrix` now refuses an all-zero
 # resolution rather than returning an arbitrary permutation.
-DEFAULT_TRACKING_FEATURES = list(data_input.CELLS_INFO_COLUMNS)
 
 # Columns the plausible-displacement gate reads: a match is rejected when the
 # centroid moved further than the cell's own bounding-box extent.
 GATE_EXTENT_COLUMNS = ("Maximum Horizontal Length", "Maximum Vertical Length")
 GATE_CENTER_COLUMNS = ("Center X Coordinate", "Center Y Coordinate")
+
+# The Cells_info.xlsx columns the tracking cost matrix reads: the gate's four,
+# which include the only two that carry weight (`WEIGHTED_COLUMNS`).
+#
+# This used to be the whole `data_input.CELLS_INFO_COLUMNS`. Every other column
+# had weight 0 and is skipped by `build_cost_matrix`, so it contributed nothing
+# -- but it still had to EXIST: when Round 24 restored two Classify columns, a
+# project extracted before it (15 columns on disk) would have raised KeyError
+# at tracking. The cost is bit-identical either way; the self-test asserts it.
+DEFAULT_TRACKING_FEATURES = list(GATE_EXTENT_COLUMNS + GATE_CENTER_COLUMNS)
 
 
 def _gate_indices(feature_columns: list) -> tuple:
@@ -694,7 +700,7 @@ def _build_cost_matrix_reference(
     if feature_columns is None:
         feature_columns = DEFAULT_TRACKING_FEATURES
     if weights is None:
-        weights = DEFAULT_TRACKING_WEIGHTS
+        weights = resolve_weights(feature_columns)
     scored = [k for k in range(len(feature_columns)) if weights[k] != 0]
     extent_x, extent_y, center_x, center_y = _gate_indices(list(feature_columns))
 
@@ -1006,7 +1012,7 @@ def track_cells(
     if feature_columns is None:
         feature_columns = DEFAULT_TRACKING_FEATURES
     if weights is None:
-        weights = DEFAULT_TRACKING_WEIGHTS
+        weights = resolve_weights(feature_columns)
 
     cells_info = cells_info.copy()
     cells_info.index = cells_info.index.map(str)
@@ -1480,7 +1486,7 @@ def retrack_frame_range(
     if feature_columns is None:
         feature_columns = DEFAULT_TRACKING_FEATURES
     if weights is None:
-        weights = DEFAULT_TRACKING_WEIGHTS
+        weights = resolve_weights(feature_columns)
 
     _validate_drift_mode(drift_mode)
     if drift_mode != "none" and not drift_by_frame and not (npy_folder and os.path.isdir(npy_folder)):
@@ -2001,6 +2007,36 @@ if __name__ == "__main__":
         assert 0 < gated < many1.shape[0] * many2.shape[0], gated
         print("  (%d of %d pairs gated in the ceiling case, so the NaN paths are actually exercised)"
               % (gated, many1.shape[0] * many2.shape[0]))
+
+        # --- R24: the Cells_info schema is not tracking's business. The default
+        # cost must be the same matrix whether the table carries the whole
+        # 17-column schema -- with -1 and NaN in the unweighted columns, as
+        # `extract_cell_info` writes them -- or only the four gate columns, or
+        # the pre-Round-24 15 columns an old project has on disk. When the
+        # default was the whole schema, the last case raised KeyError.
+        assert "Fitted Ellipse Angle" not in DEFAULT_TRACKING_FEATURES
+        assert set(WEIGHTED_COLUMNS) <= set(DEFAULT_TRACKING_FEATURES)
+        assert resolve_weights(DEFAULT_TRACKING_FEATURES) == DEFAULT_TRACKING_WEIGHTS
+        full1, full2 = many1.copy(), many2.copy()
+        for frame_ in (full1, full2):
+            for column in data_input.CELLS_INFO_COLUMNS:
+                if column not in frame_.columns:
+                    frame_[column] = rng.uniform(1, 50, len(frame_))
+            frame_.iloc[::4, frame_.columns.get_loc("Fitted Ellipse Angle")] = -1.0
+            frame_.iloc[1::4, frame_.columns.get_loc("Circularity")] = np.nan
+        old1 = full1.drop(columns=["Fitted Ellipse Angle", "Circularity"])
+        old2 = full2.drop(columns=["Fitted Ellipse Angle", "Circularity"])
+        for case in cases:
+            ref = build_cost_matrix(many1, many2, **case).to_numpy()
+            for a1, a2 in ((full1, full2), (old1, old2)):
+                got = build_cost_matrix(a1, a2, **case).to_numpy()
+                assert np.array_equal(got, ref, equal_nan=True), case
+            schema_wide = build_cost_matrix(full1, full2, feature_columns=list(data_input.CELLS_INFO_COLUMNS),
+                                            **case).to_numpy()
+            assert np.array_equal(schema_wide, ref, equal_nan=True), case
+        print("R24: default cost identical (bit-for-bit) on the 17-column table with -1/NaN in the")
+        print("  restored columns, on a 15-column pre-R24 table, and with the full schema passed")
+        print("  as feature_columns (weights resolved by name).")
 
         # --- A3: the population split. NO dataset in test_data/ carries a
         # `leading_edge` column (it is added by the Classify + leading-edge

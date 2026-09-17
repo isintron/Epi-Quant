@@ -148,6 +148,11 @@ class EpiQuantAPI:
         # a movie with genuine coherent drift (stage drift, a translating
         # tissue) -- which this one does not have.
         self.motion_compensation: bool = False
+        # Round 25 D1: which candidate generator the census offers. Both stay
+        # until the maintainer's click-test decides; switchable from the census
+        # row, and every verdict records which one it was given against.
+        self.candidate_mode: str = self.CANDIDATE_MODE
+        self.candidate_radius_k: float = self.CANDIDATE_RADIUS_K
         # Colours for the link-agreement overlay. Four states, because
         # "unjudgeable" must be VISIBLY distinct from "agrees" -- see
         # `get_link_agreement`.
@@ -1548,9 +1553,17 @@ class EpiQuantAPI:
             if name == "efd":
                 ready = self.has_efd_coefficients()
                 columns, missing = [], [] if ready else ["efd_* coefficients"]
+                unavailable = []
             else:
                 columns = list(spec["columns"])
-                missing = [c for c in columns if c not in available]
+                default_off = set(spec.get("default_off", ()))
+                # A default-off column absent from the table does not block the
+                # family: the default run never reads it. This is a project
+                # extracted before Round 24 restored `Fitted Ellipse Angle` and
+                # `Circularity` -- its basic family still runs exactly as it
+                # did, and the two boxes are shown disabled rather than hidden.
+                missing = [c for c in columns if c not in available and c not in default_off]
+                unavailable = [c for c in columns if c not in available and c in default_off]
                 ready = not missing
             families[name] = {
                 "label": spec["label"],
@@ -1564,6 +1577,7 @@ class EpiQuantAPI:
                 "note": spec.get("note", ""),
                 "ready": ready,
                 "missing": missing,
+                "unavailable": unavailable,
             }
         return {
             "families": families,
@@ -1608,17 +1622,37 @@ class EpiQuantAPI:
                 raise ValueError(
                     f"{len(missing)} feature(s) are not available in this project: {', '.join(missing[:6])}"
                     + (" ..." if len(missing) > 6 else "")
-                    + ". Run the shape-descriptor step in Extract first."
+                    + (". Re-run Extract - this project's Cells_info.xlsx predates them."
+                       if all(c in data_input.CELLS_INFO_COLUMNS for c in missing)
+                       else ". Run the shape-descriptor step in Extract first.")
                 )
             standardize_mode = "global"
 
         frame = joined.loc[:, columns].apply(pd.to_numeric, errors="coerce")
+        # `extract_cell_info` records a failed measurement as the sentinel -1
+        # (a collapsed ellipse fit, a zero perimeter, a one-row cell's H/V
+        # ratio), not as NaN, so `dropna` alone let those rows straight into
+        # StandardScaler and PCA -- where a -1 in a column whose values run
+        # 20-200 px is a many-SD outlier that owns the standardised range.
+        # `segmentation_qc.measurement_failures` already excluded them on its
+        # side; Classify did not. Scoped to the `Cells_info` columns because -1
+        # is THAT table's sentinel convention: the shape, tissue and EFD tables
+        # record failure as NaN, and a raw EFD coefficient is a signed float that
+        # can legitimately be negative. Every `Cells_info` feature is a length,
+        # area, radius, count, positive ratio or an angle folded into 0-90, so
+        # -1 there is never a value.
+        sentinel_columns = [c for c in columns if c in data_input.CELLS_INFO_COLUMNS]
+        if sentinel_columns:
+            frame[sentinel_columns] = frame[sentinel_columns].mask(frame[sentinel_columns] == -1)
         before = len(frame)
         frame = frame.dropna()
         if frame.empty:
             raise ValueError("No cells have a complete set of the selected features.")
         if len(frame) < before:
-            logger.info("Dropped %d cell(s) with missing values from classification", before - len(frame))
+            logger.info(
+                "Dropped %d cell(s) with missing or sentinel (-1) values from classification",
+                before - len(frame),
+            )
         return frame, standardize_mode
 
     def run_classification(
@@ -2461,6 +2495,7 @@ class EpiQuantAPI:
         run_mode = self.tracking_drift_mode if self.tracking_drift_mode is not None else self.drift_mode
         register = run_mode != "none"
         drift = self._registration().get("drift_by_frame") if register else None
+        measured = self._registration()
         if kind == "frame_pair":
             if frame is None:
                 return {"error": "A frame_pair census needs a frame number."}
@@ -2505,6 +2540,14 @@ class EpiQuantAPI:
             # proposed the cell the human picked without the frontend having to
             # send it back (Round 23 D).
             "candidates": {},
+            # The MEASURED per-pair drift and median cell radius, kept whatever the
+            # judge convention. The radius search's centre is a question about
+            # where the cell physically went, not about how the judge was run,
+            # so it is registered even when `register` is False (Round 25 D2).
+            "search_drift_by_frame": measured.get("drift_by_frame") or {},
+            "cell_radius_px": float(measured.get("median_cell_radius_px") or 0.0),
+            "windows": {},
+            "offered_mode": {},
             "environment_threshold": (float(self.environment_repair_threshold)
                                       if kind == "environment_flagged" else None),
         }
@@ -2560,7 +2603,7 @@ class EpiQuantAPI:
         except OSError as error:
             logger.warning("could not write census provenance: %s", error)
 
-    def get_census_item(self, position: int, pad: int = 28) -> dict:
+    def get_census_item(self, position: int, pad: int = 28, anchor_view: bool = True) -> dict:
         """One item, with the two crops the blink toggles between.
 
         `before` is the cell at frame f; `after` is the SHOWN successor at
@@ -2589,18 +2632,50 @@ class EpiQuantAPI:
         if state["register"]:
             drift = ((state.get("drift_by_frame") or {}).get(frame)
                      or tracking_benchmark.estimate_frame_drift(masks, frame) or (0.0, 0.0))
-        # Capped at 12 (four pages of three). Beyond that the list is not a
-        # shortlist any more (Round 20 C2).
-        candidates = self._census_candidates(item, before_labels, after_labels, window, drift,
-                                             limit=12)
+        search_drift = self._census_search_drift(state, frame)
+        radius_px = self._census_radius_px(state)
+        if self.candidate_mode == "radius":
+            candidates = self._census_radius_candidates(
+                item, before_labels, after_labels, search_drift, radius_px)
+            depth = {"radius": len(candidates)}
+            mode_tag = f"radius:k={self.candidate_radius_k:g}"
+        else:
+            # Capped at 12 (four pages of three). Beyond that the list is not a
+            # shortlist any more (Round 20 C2).
+            candidates = self._census_candidates(item, before_labels, after_labels, window, drift,
+                                                 limit=12, render=False)
+            depth = getattr(self, "_last_candidate_depth", {})
+            mode_tag = "ranked"
+        # ONE window for the blink and every candidate tile, centred on the
+        # registered anchor and at least 2R + 2*pad across (Round 25 B2).
+        window = self._census_anchor_window(before_labels, after_labels, item, candidates,
+                                            search_drift, radius_px, pad)
+        for candidate, image in zip(candidates, self._census_tile_images(
+                frame, before_labels, after_labels, item, candidates, window,
+                search_drift, anchor_view)):
+            candidate["image"] = image
         state["candidates"][int(position)] = [
             {"label": c["label"], "reason": c["reason"], "rank": c["rank"]}
             for c in candidates]
+        state.setdefault("windows", {})[int(position)] = window
+        state.setdefault("offered_mode", {})[int(position)] = mode_tag
+        top, bottom, left, right = window
         return {
             # How far down each source's own ranking the merge actually got.
             # Not the same thing as `len(candidates)` -- Round 22 reported the
-            # latter and believed it was the former (Round 23 A).
-            "candidate_depth": getattr(self, "_last_candidate_depth", {}),
+            # latter and believed it was the former (Round 23 A). In radius mode
+            # there is one source and its depth is the whole list.
+            "candidate_depth": depth,
+            "candidate_mode": mode_tag,
+            "anchor_view": bool(anchor_view),
+            "candidate_search": {
+                "mode": self.candidate_mode, "k": float(self.candidate_radius_k),
+                "radius_px": round(float(radius_px), 1),
+                "cell_radius_px": round(float(state.get("cell_radius_px") or 0.0), 1),
+                "drift_px": [round(float(search_drift[0]), 2), round(float(search_drift[1]), 2)],
+                "window": [int(top), int(bottom), int(left), int(right)],
+                "window_px": [int(bottom - top), int(right - left)],
+            },
             "position": int(position), "total": len(queue),
             "item_id": item["item_id"], "frame": frame, "label": item["label"],
             "track_id": item["track_id"], "shown_label": item["shown_label"],
@@ -2676,8 +2751,197 @@ class EpiQuantAPI:
     def _census_crop(self, frame_number, labels, label, window, color):
         return self._cell_crop(frame_number, labels, label, window, color)
 
+    # --- Round 25: the radius generator, the shared window, the anchor view -----
+
+    #: `"radius"` = Round 25's brute-force version: every f+1 cell whose centroid
+    #: lies within `k` median cell radii of the registered anchor, by distance,
+    #: excluding nothing. `"ranked"` = the Round 20-23 multi-source merge
+    #: (`_census_candidates`). Both coexist until the maintainer's click-test
+    #: decides; do not delete either -- the ranked one carries four rounds of
+    #: conclusions. Switchable per session with `set_candidate_settings`.
+    CANDIDATE_MODE = "radius"
+    #: R = k x median cell radius, not an absolute pixel count, so the setting
+    #: carries between magnifications: WT GBE (13.0 px) -> 39 px, OE GBE (23.0 px)
+    #: -> 69 px.
+    CANDIDATE_RADIUS_K = 3.0
+    #: The anchor's outline on each candidate tile. Blue, a thin line, so it
+    #: separates from the red candidate fill.
+    ANCHOR_OUTLINE_COLOR = "#29b6ff"
+
+    def get_candidate_settings(self) -> dict:
+        return {"mode": self.candidate_mode, "k": float(self.candidate_radius_k),
+                "modes": ["radius", "ranked"]}
+
+    def set_candidate_settings(self, mode: str = None, k: float = None) -> dict:
+        """Switch the candidate generator or its radius multiple. Only changes
+        what the NEXT `get_census_item` offers; nothing already recorded moves."""
+        if mode is not None:
+            if mode not in ("radius", "ranked"):
+                return {"error": f"Unknown candidate mode {mode!r}; expected 'radius' or 'ranked'."}
+            self.candidate_mode = mode
+        if k is not None:
+            if not float(k) > 0:
+                return {"error": "The radius multiple k must be positive."}
+            self.candidate_radius_k = float(k)
+        return self.get_candidate_settings()
+
+    @staticmethod
+    def _census_search_drift(state, frame):
+        drift = (state.get("search_drift_by_frame") or {}).get(frame)
+        return (float(drift[0]), float(drift[1])) if drift else (0.0, 0.0)
+
+    def _census_radius_px(self, state):
+        radius = float(state.get("cell_radius_px") or 0.0)
+        if radius <= 0:
+            radius = float(self._registration().get("median_cell_radius_px") or 0.0)
+        return float(self.candidate_radius_k) * radius
+
+    @staticmethod
+    def _label_centroids(labels):
+        """`{label: (x, y)}` -- pixel means, the same convention as
+        `census._centroids`, in one vectorised pass."""
+        from scipy import ndimage
+        ids = [int(v) for v in np.unique(labels) if v]
+        if not ids:
+            return {}
+        centres = ndimage.center_of_mass(np.ones_like(labels), labels, ids)
+        return {label: (float(c[1]), float(c[0])) for label, c in zip(ids, centres)}
+
+    @classmethod
+    def _census_radius_candidates(cls, item, before_labels, after_labels, drift, radius_px):
+        """Every f+1 cell whose centroid is within `radius_px` of the anchor's
+        f centroid plus the pair's measured drift, nearest first (Round 25 D2).
+
+        Nothing is excluded -- not even `shown`, the tracker's current answer.
+        The ranked version drops it ("offering what the user already sees is
+        offering nothing"); here it is a reference point: the user sees which
+        rank the tracker's own answer holds. It is flagged, not hidden.
+
+        No cap and no quota: the maintainer's specification is that the list
+        makes no choices, at the price of more pages.
+        """
+        anchor = int(item["label"])
+        shown = None if item.get("shown_label") is None else int(item["shown_label"])
+        ys, xs = np.nonzero(before_labels == anchor)
+        if not len(ys):
+            return []
+        cx, cy = float(xs.mean()) + drift[0], float(ys.mean()) + drift[1]
+        ranked = sorted((float(np.hypot(x - cx, y - cy)), label)
+                        for label, (x, y) in cls._label_centroids(after_labels).items())
+        out = []
+        for distance, label in ranked:
+            if distance > radius_px:
+                break
+            out.append({
+                "label": int(label), "reason": "radius", "detail": round(distance, 1),
+                "rank": len(out) + 1, "is_tracker_answer": label == shown,
+                "why": (f"{round(distance, 1)} px from the anchor at frame {int(item['frame'])}"
+                        + (" (the tracker's answer)" if label == shown else "")),
+            })
+        return out
+
+    @staticmethod
+    def _census_anchor_window(before_labels, after_labels, item, candidates, drift,
+                              radius_px, pad):
+        """The ONE window the blink and every candidate tile share (Round 25 B).
+
+        Centred on the anchor's centroid carried into f+1 by the measured drift,
+        and square with side `max(2R + 2*pad, whatever contains the anchor, the
+        tracker's answer and every offered candidate)`. The floor is what keeps
+        the radius version honest: a cell offered because it lies within R must
+        not be cropped out of its own tile. Clamped at the image edge, which can
+        move the centre but never shrinks the window below the image size.
+
+        Round 23 C2 gave each tile its own window centred on the candidate; the
+        maintainer's click-test showed the cost -- the green anchor and the red
+        candidate never sat at the same place in the view, so every comparison
+        needed a mental re-alignment. Same size is still the point (crops are
+        encoded 1:1 and scaled by CSS), and now same centre too.
+        """
+        from scipy import ndimage
+        anchor = int(item["label"])
+        ys, xs = np.nonzero(before_labels == anchor)
+        cx, cy = float(xs.mean()) + drift[0], float(ys.mean()) + drift[1]
+        reach = 0.0
+        boxes = [(ys.min(), ys.max(), xs.min(), xs.max()),
+                 (ys.min() + drift[1], ys.max() + drift[1], xs.min() + drift[0], xs.max() + drift[0])]
+        wanted = [int(c["label"]) for c in candidates]
+        if item.get("shown_label") is not None:
+            wanted.append(int(item["shown_label"]))
+        slices = ndimage.find_objects(after_labels)
+        for label in wanted:
+            if 0 < label <= len(slices) and slices[label - 1] is not None:
+                sy, sx = slices[label - 1]
+                boxes.append((sy.start, sy.stop - 1, sx.start, sx.stop - 1))
+        for y0, y1, x0, x1 in boxes:
+            reach = max(reach, abs(y0 - cy), abs(y1 - cy), abs(x0 - cx), abs(x1 - cx))
+        half = int(np.ceil(max(radius_px + pad, reach + 8)))
+        height, width = after_labels.shape
+        side_h, side_w = min(2 * half + 1, height), min(2 * half + 1, width)
+        top = min(max(0, int(round(cy)) - half), height - side_h)
+        left = min(max(0, int(round(cx)) - half), width - side_w)
+        return (top, top + side_h, left, left + side_w)
+
+    def _census_tile_images(self, frame, before_labels, after_labels, item, candidates,
+                            window, drift, anchor_view):
+        """Candidate tiles: frame f+1 cropped to the shared window, the candidate
+        filled red, and -- when `anchor_view` -- the anchor's outline (carried by
+        the same drift as the window's centre) drawn over it.
+
+        The outline is a view preference and can be switched off, because it is
+        most in the way exactly when it is closest: a high-IoU candidate's
+        boundary runs right beside the anchor's, and that is when the
+        candidate's own shape most needs to be readable (Round 25 B3).
+        """
+        from PIL import Image
+        top, bottom, left, right = window
+        loaded = self._load_frame(frame + 1)
+        base = loaded[2] if loaded and loaded[2] is not None else None
+        if base is None:
+            base = np.zeros(after_labels.shape + (3,), dtype=np.uint8)
+        base_crop = np.asarray(base)[top:bottom, left:right]
+        labels_crop = after_labels[top:bottom, left:right]
+        outline = None
+        if anchor_view:
+            anchor_mask = (before_labels == int(item["label"])).astype(np.int32)
+            if drift[0] or drift[1]:
+                anchor_mask = tracking_benchmark.shift_labels(anchor_mask, drift[0], drift[1])
+            outline = rendering.cell_boundary_mask(anchor_mask[top:bottom, left:right])
+        red = rendering._hex_to_rgb("#ff6b6b")
+        blue = rendering._hex_to_rgb(self.ANCHOR_OUTLINE_COLOR)
+        images = []
+        for candidate in candidates:
+            tile = base_crop.copy()
+            tile[labels_crop == int(candidate["label"])] = red
+            if outline is not None:
+                tile[outline] = blue
+            images.append(rendering.encode_png_base64(Image.fromarray(tile)))
+        return images
+
+    def get_census_candidate_images(self, position: int, anchor_view: bool = True) -> dict:
+        """Re-render the tiles of an item ALREADY offered, with the anchor view
+        on or off. Reads the cached label list and window; never re-runs a
+        generator, so switching the view cannot change what is offered -- and
+        the returned `labels` let the caller assert exactly that (Round 25 B3).
+        """
+        state = getattr(self, "_census", None)
+        if not state:
+            return {"error": "Start a census first."}
+        offered = state.get("candidates", {}).get(int(position))
+        window = state.get("windows", {}).get(int(position))
+        if offered is None or window is None:
+            return {"error": f"Item {position} has not been shown yet."}
+        item = state["queue"][int(position)]
+        frame = item["frame"]
+        masks = state["masks"]
+        images = self._census_tile_images(
+            frame, masks[frame], masks[frame + 1], item, offered, window,
+            self._census_search_drift(state, frame), anchor_view)
+        return {"position": int(position), "anchor_view": bool(anchor_view),
+                "labels": [entry["label"] for entry in offered], "images": images}
+
     def _census_candidates(self, item, before_labels, after_labels, window,
-                           drift=(0.0, 0.0), limit: int = 12):
+                           drift=(0.0, 0.0), limit: int = 12, render: bool = True):
         """The alternatives offered when the verdict is "wrong", seeded from the
         **anchor** rather than from the tracker's answer.
 
@@ -2798,9 +3062,13 @@ class EpiQuantAPI:
         # thing this panel exists for.
         for rank, candidate in enumerate(merged, start=1):
             candidate["rank"] = rank
-            candidate["image"] = self._census_crop(
-                frame + 1, after_labels, candidate["label"],
-                self._window_like(window, after_labels, candidate["label"]), "#ff6b6b")
+            # `render=False` from `get_census_item` since Round 25 B: the tiles
+            # are cropped there, all in the blink's own anchor-centred window,
+            # so these per-candidate `_window_like` crops would be thrown away.
+            if render:
+                candidate["image"] = self._census_crop(
+                    frame + 1, after_labels, candidate["label"],
+                    self._window_like(window, after_labels, candidate["label"]), "#ff6b6b")
             # Every tile states its BASIS in the same words. They used to read
             # "13.4 px", "16.5 px from the link", "26.1 px" -- three tiles, two
             # different origins, and only one of them saying which. A user
@@ -2966,6 +3234,7 @@ class EpiQuantAPI:
         # of the tile it drew, and a mismatch there is exactly the kind of thing
         # that would never surface.
         reason, rank = "", None
+        offered_mode = state.get("offered_mode", {}).get(int(position), "")
         if chosen_label is not None:
             for entry in state.get("candidates", {}).get(int(position), []):
                 if entry["label"] == int(chosen_label):
@@ -2976,11 +3245,12 @@ class EpiQuantAPI:
                                   verdict, chosen_label, ms_elapsed, labeller=state["labeller"],
                                   chosen_reason=reason, chosen_rank=rank,
                                   register=state["register"],
-                                  environment_threshold=state.get("environment_threshold"))
+                                  environment_threshold=state.get("environment_threshold"),
+                                  candidate_mode=offered_mode)
         except ValueError as error:
             return {"error": str(error)}
         return {"saved": True, "next": int(position) + 1, "total": len(queue),
-                "chosen_reason": reason, "chosen_rank": rank}
+                "chosen_reason": reason, "chosen_rank": rank, "candidate_mode": offered_mode}
 
     # --- Correction mode ------------------------------------------------------
     #
@@ -3007,6 +3277,13 @@ class EpiQuantAPI:
         if not 0 <= int(position) < len(queue):
             return {"error": f"Position {position} is outside the queue."}
         item = queue[int(position)]
+        if (chosen_label is not None and item.get("shown_label") is not None
+                and int(chosen_label) == int(item["shown_label"])):
+            # Radius mode offers the tracker's own answer (Round 25 D2). Picking
+            # it means "the link was right", which is not an edit -- queueing it
+            # would report a pending correction that changes nothing.
+            return {"error": f"Cell {chosen_label} is already the tracker's answer at frame "
+                             f"{item['frame'] + 1}; there is nothing to correct."}
         if item.get("track_id") is None:
             return {"error": f"The cell at frame {item['frame']} belongs to no track, so there is "
                              "no link to correct here."}
@@ -3950,14 +4227,19 @@ class EpiQuantAPI:
         Measured once per project rather than assumed per dataset: the rule is
         drift magnitude > 20% of the median cell radius.
 
-        Validated on the three REAL MOVIES in `test_data/` -- `embryos_GBE_GAP43`
-        (ratio 0.50, register), `AS_dorsal view_E-cad` (0.099, no) and
-        `AS_LE_lateral view_E-cad` (0.092, no). An earlier version of this
-        docstring named `pupae` and `cp_dataset` instead; both are separate-image
-        collections, so a cross-frame drift over them is meaningless.
+        Measured on the FOUR real movies in `test_data/` -- `embryos_GBE_GAP43`
+        (ratio 0.50, register; 0.529 re-measured 2026-09-13 after its latest
+        correction), `embryos_GBE_OE_GAP43` (**0.121**, no: 2.79 px drift against
+        a 23.0 px radius, measured Round 25 -- this docstring said "three movies"
+        until then, and the fourth had never been measured), `AS_dorsal
+        view_E-cad` (0.099, no) and `AS_LE_lateral view_E-cad` (0.092, no). An
+        earlier version named `pupae` and `cp_dataset` instead; both are
+        separate-image collections, so a cross-frame drift over them is
+        meaningless.
 
-        The threshold has never been exercised near 0.2 (observed: 0.50 / 0.099
-        / 0.092), so `radius_fraction` is an untested free parameter.
+        The threshold has still not been exercised close to 0.2 (observed: 0.53 /
+        0.12 / 0.099 / 0.092; OE's 0.12 is the nearest), so `radius_fraction` is
+        a lightly tested free parameter.
         """
         if self._registration_cache is None:
             masks = {}
@@ -4106,11 +4388,130 @@ if __name__ == "__main__":
         assert depth4["overlap"] == 1 and depth4["coverage"] >= 5, depth4
         print("  a source with one entry gives its quota back: %s" % depth4)
 
+        # --- D2 / B2 / B3 (R25): the radius generator, the shared window, the
+        # anchor view.
+        import base64 as _b64, io as _io
+        from PIL import Image as _Image
+
+        def _png_size(data_url):
+            return _Image.open(_io.BytesIO(_b64.b64decode(data_url.split(",")[-1]))).size
+
+        r_before = np.zeros((260, 320), dtype=int)
+        r_before[100:120, 140:160] = 1                     # anchor, centroid (149.5, 109.5)
+        r_after = np.zeros((260, 320), dtype=int)
+        r_after[100:120, 144:164] = 5                      # moved by the drift (4, 0): distance 0
+        r_after[100:120, 174:194] = 6                      # 30 px
+        r_after[100:120, 108:128] = 9                      # 36 px, the other side
+        r_after[100:120, 200:220] = 7                      # 56 px -- beyond R = 3 x 13 = 39
+        r_item = {"label": 1, "shown_label": 6, "frame": 5, "item_id": "r1", "track_id": 3,
+                  "is_repeat": False, "reference_label": None, "true_label": None}
+        r_drift, r_radius = (4.0, 0.0), 39.0
+        radius_list = EpiQuantAPI._census_radius_candidates(r_item, r_before, r_after, r_drift, r_radius)
+        assert [c["label"] for c in radius_list] == [5, 6, 9], radius_list
+        assert [c["detail"] for c in radius_list] == sorted(c["detail"] for c in radius_list)
+        assert [c["is_tracker_answer"] for c in radius_list] == [False, True, False], radius_list
+        print("D2 (R25): radius mode offers every centroid within R of the registered")
+        print("  anchor, nearest first, and keeps the tracker's answer (flagged):",
+              [(c["label"], c["detail"], c["is_tracker_answer"]) for c in radius_list])
+
+        r_window = EpiQuantAPI._census_anchor_window(r_before, r_after, r_item, radius_list,
+                                                      r_drift, r_radius, 28)
+        r_side = (r_window[1] - r_window[0], r_window[3] - r_window[2])
+        assert min(r_side) >= 2 * r_radius + 2 * 28, (r_side, r_window)
+        assert abs((r_window[0] + r_window[1] - 1) / 2 - 109.5) <= 1 and \
+            abs((r_window[2] + r_window[3] - 1) / 2 - 153.5) <= 1, r_window
+        print("B2 (R25): the shared window is %dx%d px, centred on the registered anchor"
+              % r_side, "(floor 2R + 2*pad = %d)." % (2 * r_radius + 2 * 28))
+
+        rprobe = EpiQuantAPI()
+        rprobe._load_frame = lambda frame: None
+        rprobe.tracking_data = None
+        rprobe._census = {"queue": [r_item], "masks": {5: r_before, 6: r_after},
+                          "register": False, "drift_by_frame": None,
+                          "search_drift_by_frame": {5: r_drift}, "cell_radius_px": 13.0,
+                          "candidates": {}, "windows": {}, "offered_mode": {}}
+        shown_on = rprobe.get_census_item(0, 28, True)
+        shown_off = rprobe.get_census_item(0, 28, False)
+        labels_on = [c["label"] for c in shown_on["candidates"]]
+        labels_off = [c["label"] for c in shown_off["candidates"]]
+        assert labels_on == labels_off == [5, 6, 9], (labels_on, labels_off)
+        assert shown_on["candidate_search"]["window"] == shown_off["candidate_search"]["window"]
+        sizes = {_png_size(shown_on["before"]), _png_size(shown_on["after"])} | \
+            {_png_size(c["image"]) for c in shown_on["candidates"]}
+        assert len(sizes) == 1, sizes
+        assert any(a["image"] != b["image"] for a, b in
+                   zip(shown_on["candidates"], shown_off["candidates"])), "outline must show"
+        rerender = rprobe.get_census_candidate_images(0, False)
+        assert rerender["labels"] == labels_on, rerender["labels"]
+        assert rerender["images"] == [c["image"] for c in shown_off["candidates"]]
+        print("B3 (R25): anchor view on and off offer the SAME labels %s; only the" % labels_on)
+        print("  tiles differ, the blink and every tile share one %s px size, and" % (sizes.pop(),))
+        print("  the render-only call re-draws without re-running the generator.")
+
+        # The ranked version is untouched and still selectable.
+        assert rprobe.set_candidate_settings("ranked")["mode"] == "ranked"
+        ranked_item = rprobe.get_census_item(0, 28, True)
+        assert ranked_item["candidate_mode"] == "ranked", ranked_item["candidate_mode"]
+        assert 6 not in [c["label"] for c in ranked_item["candidates"]], "ranked still excludes shown"
+        assert rprobe.set_candidate_settings("nonsense").get("error")
+        print("D1 (R25): 'ranked' is still there and still excludes the tracker's answer.")
+
         # --- C2: pages are ceil(n / 3) on the ACTUAL list, never padded.
         for count, expected in ((1, 1), (3, 1), (4, 2), (5, 2), (6, 2), (7, 3), (12, 4)):
             assert -(-count // 3) == expected, (count, expected)
         print("C2: %d candidates -> %d page(s); 5 gives 2 pages, not a padded 3."
               % (5, -(-5 // 3)))
+
+        # --- S (R24): a -1 in a `Cells_info` column is a failed measurement
+        # and leaves the PCA matrix; a -1 in any other table is a value and
+        # stays. Before Round 24 `dropna` was the only filter, so the first row
+        # below entered StandardScaler with a -1 perimeter.
+        fp = EpiQuantAPI()
+        fp.cells_info = pd.DataFrame({
+            "Cell Index": ["Cell1_1", "Cell1_2", "Cell1_3", "Cell1_4"],
+            "Cell Area": [100.0, 120.0, 140.0, 160.0],
+            "Cell Perimeter": [-1.0, 44.0, 48.0, 52.0],
+        })
+        fp.cells_shape = pd.DataFrame(
+            {"signed_shape": [0.5, -1.0, 0.2, 0.1]},
+            index=pd.Index(["Cell1_1", "Cell1_2", "Cell1_3", "Cell1_4"], name="Cell Index"),
+        )
+        fp.cells_tissue = None
+        kept, _ = fp._feature_frame(["basic"], ["Cell Area", "Cell Perimeter", "signed_shape"])
+        assert list(kept.index) == ["Cell1_2", "Cell1_3", "Cell1_4"], list(kept.index)
+        assert kept.loc["Cell1_2", "signed_shape"] == -1.0, kept
+        print("S (R24): Cells_info -1 sentinel dropped (Cell1_1); a -1 in the shape")
+        print("  table is a value and kept (Cell1_2).")
+
+        # --- O (R24): a project extracted before the two basic columns came
+        # back. Its basic family must stay ready and run the same default
+        # columns; the restored ones are reported `unavailable`, not `missing`
+        # (which is what disables a whole family). Before this, basic went
+        # not-ready and its boxes disappeared under "run shape descriptors first".
+        restored = ["Fitted Ellipse Angle", "Circularity"]
+        old = EpiQuantAPI()
+        rng_o = np.random.default_rng(0)
+        old.cells_info = pd.DataFrame(
+            {c: rng_o.uniform(5, 50, 6) for c in data_input.CELLS_INFO_COLUMNS if c not in restored})
+        old.cells_info.insert(0, "Cell Index", [f"Cell1_{i}" for i in range(1, 7)])
+        old.cells_shape = old.cells_tissue = None
+        basic = old.get_feature_options()["families"]["basic"]
+        assert basic["ready"] and basic["missing"] == [], basic
+        assert sorted(basic["unavailable"]) == sorted(restored), basic["unavailable"]
+        default_old, _ = old._feature_frame(["basic"], None)
+        assert list(default_old.columns) == pca_kmeans.family_columns(["basic"]), list(default_old.columns)
+        try:
+            old._feature_frame(["basic"], ["Cell Area", "Circularity"])
+            raise AssertionError("an absent column must be refused")
+        except ValueError as exc:
+            assert "Re-run Extract" in str(exc), str(exc)
+        fresh = EpiQuantAPI()
+        fresh.cells_info = old.cells_info.assign(**{c: 1.0 for c in restored})
+        fresh.cells_shape = fresh.cells_tissue = None
+        assert fresh.get_feature_options()["families"]["basic"]["unavailable"] == []
+        print("O (R24): a 15-column pre-R24 table keeps basic ready with the default")
+        print("  columns; the restored two are `unavailable` (disabled), and asking for one")
+        print("  says to re-run Extract rather than to run shape descriptors.")
 
         print("\nAll api self-tests passed.")
         raise SystemExit(0)
@@ -4348,6 +4749,11 @@ if __name__ == "__main__":
                 # fills -- a unit test on `append_verdict` cannot see that wire.
                 shown = api.get_census_item(1)
                 offered = shown.get("candidates") or []
+                geometry = shown.get("candidate_search") or {}
+                print(f"  candidates ({shown.get('candidate_mode')}): {len(offered)} within "
+                      f"R = {geometry.get('radius_px')} px (k {geometry.get('k')} x "
+                      f"{geometry.get('cell_radius_px')} px cell radius), drift "
+                      f"{geometry.get('drift_px')}, shared window {geometry.get('window_px')} px.")
                 print(f"  candidate depth reached per source: {shown.get('candidate_depth')} "
                       f"({len(offered)} offered) -- depth, not list length.")
                 if offered:
@@ -4375,7 +4781,12 @@ if __name__ == "__main__":
                 assert api.submit_census_verdict(0, "correct", None, 1.0).get("error"), \
                     "a correction session must not write ground truth"
                 first = api.get_census_item(0)
-                api.queue_census_edit(0, first["candidates"][0]["label"])
+                # Not `candidates[0]`: radius mode keeps the tracker's own answer,
+                # often at rank 1, and "correcting" to it changes nothing (R25).
+                alternative = next(c for c in first["candidates"] if not c.get("is_tracker_answer"))
+                assert api.queue_census_edit(0, first["shown_label"]).get("error"), \
+                    "queueing the tracker's own answer must be refused as a no-op"
+                api.queue_census_edit(0, alternative["label"])
                 preview = api.preview_census_edits()
                 snapshot = api.tracking_data.copy(deep=True)
                 applied = api.apply_census_edits()
@@ -4469,7 +4880,11 @@ if __name__ == "__main__":
                 print("  no correction queue on this movie:", started["error"])
             else:
                 item = api.get_census_item(0)
-                chosen = item["candidates"][0]["label"]
+                # The first candidate that is NOT the tracker's own answer:
+                # radius mode keeps that answer in the list, and "correcting" a
+                # link to the cell it already points at writes nothing (R25).
+                chosen = next(c["label"] for c in item["candidates"]
+                              if not c.get("is_tracker_answer"))
                 target_frame = item["frame"] + 1
                 target_column = f"Frame{target_frame}"
                 track = item["track_id"]

@@ -790,6 +790,10 @@ unchanged.
 
 ## Three columns deleted from `Cells_info.xlsx` (2026-08-18)
 
+> **Partly reversed in Round 24 (2026-09-11):** `Fitted Ellipse Angle` and
+> `Circularity` are back (17 columns), as default-off Basic features; `P-Value`
+> stays deleted. See the Round 24 section.
+
 **Changes the output schema, 18 columns -> 15 -- approved by the user.** They
 appeared in every exported table while being offered in no feature family, which
 was actively confusing.
@@ -1417,6 +1421,183 @@ with zero residual difference from the original table.
 > frame 24: 1, frame 29: 1`). Three applications, one rule; it is not re-argued
 > in each round section.
 
+### Round 25: a brute-force candidate set beside the ranked one, one shared window, and the datasets written down (2026-09-13)
+
+**The maintainer asked for a version that makes no choices, kept beside the old
+one so the click-test can decide.** `CANDIDATE_MODE = "radius"`, switchable per
+session from a **Candidates** select in the census row: every f+1 cell whose
+centroid lies within `R = k x median cell radius` (k = 3, adjustable) of the
+anchor's centroid carried by the pair's **measured** drift, nearest first, with
+nothing excluded — including the tracker's own answer, which is flagged rather
+than hidden so the user sees its rank. The Round 20–23 `ranked` merge is
+untouched. Every verdict now records `candidate_mode`. Picking the tracker's own
+answer is recorded as `correct`, and `queue_census_edit` refuses it as a no-op —
+the harness's correction blocks had assumed `candidates[0]` was an alternative,
+which radius mode breaks whenever the tracker's answer ranks first.
+
+**One window for the blink and every tile, centred on the registered anchor.**
+Round 23 gave each tile its own window centred on the candidate, and the
+click-test showed the cost: green anchor and red candidate never sat in the same
+place, so every comparison needed a mental re-alignment. The window is now square
+with side `max(2R + 2*pad, what holds the anchor, the tracker's answer and every
+candidate)` — asserted, because a cell offered for lying within R must not be
+cropped out of its own tile — clamped at the image edge. **Enable anchor view**
+(default on, session-only, modelled on Enable inset view) draws the anchor's
+outline on each tile; switching it calls a render-only endpoint that re-uses the
+cached label list and returns it, so the frontend checks the list did not change.
+
+**Measured, this session's own extract + track** (`exclude_edge_cells`, motion
+compensation, tracking `drift_mode=none`, k = 3). Lengths, ranks and distances
+only — there is no reference:
+
+| | WT | OE (corrected 2026-09-13) |
+|---|---|---|
+| drift / radius / ratio | 6.87 / 13.0 px = 0.529 (register) | 2.79 / 23.0 px = **0.121 (no)** |
+| R, shared window | 39 px, 135x135 | 69 px, 195–197 px |
+| environment queue | 64 | **8** |
+| radius list length | median 8.5 (5–13) | median 5.5 (2–11) |
+| tracker's answer rank (radius) | 1:19, 2:15, 3:9, 4:5, 5:5, 6:3, 7:2, 9:2; outside R: 4 | rank 1 in 8 of 8 |
+| ranked list length | median 12 | median 11.5 |
+| ranked candidates lying outside R | 291, in 63 of 64 items | 54, in all 8 |
+
+On WT the radius list is **shorter** than the ranked one, the opposite of what
+was expected: the ranked merge hands unused quota to whichever source still has
+entries and fills to 12 with cells beyond R. The maintainer's frame-34 screenshot
+could not be re-found — frame 34 is not in corrected OE's queue under this
+tracking — so all 214 tracked 34→35 links were probed instead: 1 has both top
+ranked tiles below 0.01 overlap/coverage, none shows the screenshot's 36.6 px
+`pointed` tile, and the tracker's answer is the nearest cell on all 214.
+Consistent with the screenshot having been a segmentation problem, not proof of
+it. **No clicks have been recorded against either version yet**, so there is no
+`chosen_rank` distribution; the §D3 prediction stays an argument.
+
+**A silent CSV defect, found while adding the column.** `append_verdict` appended
+rows keyed by the current `FIELDS` beneath whatever header the file already had,
+so a `ground_truth_links.csv` started before Round 23 received that round's four
+new columns one heading off. A file whose header differs is now rewritten under
+the current one first (old rows kept, new columns blank; an unknown column raises
+rather than being dropped).
+
+**Datasets.** `v2/docs/datasets.md` is the checked inventory. Corrected against
+it: `AS_dorsal` has 24 frames, not 25; OE is hand-corrected (2026-09-13) and
+holds 16,958 labels, not 16,981; the vertex-pocket issue is resolved on disk (no
+label of 5 px or less in either GBE movie); `_registration()` now names four
+movies with OE's ratio. And Round 23's reading of `AS_dorsal` cause 3 is
+withdrawn — see the correction beside it below.
+
+**Extract help.** The permanent min-area hint moved, word for word, into a `?`
+popover after the `px` input.
+
+### Round 24: two columns back, vertex pockets out, and the "12 measurement failures" were stale outlines (2026-09-11)
+
+Plan: `rounds/Round 24.md`. Issue 3 (the Fiji pre-processing script) is a
+separate session. Every number below comes from a pipeline run stored outside
+`test_data/` (a scratch capture harness calling `extract_cell_info`,
+`EpiQuantAPI.run_classification` and `track_all_populations` with the API's own
+defaults, per-dataset min cell area pinned, sha256 of every mask file read).
+Baselines were captured after each step and compared cell by cell, not by file
+bytes (xlsx carries timestamps).
+
+**A -1 sentinel no longer reaches PCA.** `_feature_frame` turned only NaN into a
+dropped row, so a `-1` (failed ellipse fit, zero perimeter) entered
+`StandardScaler` as a many-SD outlier. Now masked to NaN, **scoped to the
+`Cells_info` columns** — `-1` is that table's convention only; a raw EFD
+coefficient may legitimately be negative. Measured: `AS_dorsal` 2824 → 2812
+cells into PCA (its 12 sentinel rows); `AS_LE_lateral` and GBE unchanged.
+Regression test: `api.py --self-test` S (fails on the pre-fix code).
+
+**`Fitted Ellipse Angle` and `Circularity` are back in Basic geometrics, both
+default off** (user's decision). Schema 15 → 17 columns, in their v1 slots;
+abbreviations θ / C; display name `Ellipse Angle`; the family note explains all
+three default-off groups (text fixed by the plan). `legacy_13` stays retired
+and `P-Value` stays deleted. Why back: the angle's single-feature AUC on
+`AS_LE_lateral` is **0.9174** — re-measured on the restored product column,
+reference `GT_cell_classification_output` (the maintainer's table, 6,112 of
+6,480 cells; agreement with that table, not an accuracy). Why off: it is
+image-frame orientation, folded, so it misleads on any non-aligned mount; and
+Circularity is Shape Index again (Spearman −1.00), and pruning does not guard
+the pair (off by default; Pearson |r| 0.966 survives any threshold ≥ 0.97).
+*Verified*: default Classify output cell-for-cell identical on `AS_dorsal`,
+`AS_LE_lateral` and GBE; tracks identical on `AS_dorsal`, GBE and OE; every
+pre-existing column identical on all seven datasets; every restored `-1` falls
+on a row QC already flags; Circularity = 4πA/P² within its 2-decimal rounding.
+
+Two things adding columns would have broken, both fixed and tested:
+
+- **Tracking required the whole schema.** `DEFAULT_TRACKING_FEATURES` was
+  `CELLS_INFO_COLUMNS`; all but the centroid had weight 0 and were skipped, but
+  `cells_frame[feature_columns]` still needed them to exist, so a project
+  extracted before this round would have raised `KeyError` at Track. It is now
+  the four columns the cost reads (gate extents + centroid), and the three
+  positional `DEFAULT_TRACKING_WEIGHTS` defaults are `resolve_weights(...)` by
+  name. The cost is bit-identical on a 17-column table with −1/NaN in the new
+  columns, a 15-column table, and with the full schema passed explicitly
+  (`cell_tracking.py --self-test` R24; the old default reproduces the
+  `KeyError`). On real data: `AS_dorsal` tracked from a 15-column table gives
+  the identical 180 tracks.
+- **An old project lost its whole Basic family.** `get_feature_options` marked a
+  family ready only if every column existed. Default-off columns no longer block
+  readiness; absent ones come back as `unavailable` and render disabled with a
+  "re-run Extract" tooltip ("Select all" skips them); asking for one names
+  Extract, not the shape step (`api.py --self-test` O; dev mock follows the
+  real shape and plays a pre-R24 project after "load existing extraction").
+  The `Cells_info.xlsx` round trip (write → load existing → leading-edge
+  write-back) is tested on the 17-column sheet (`data_input.py --self-test`).
+
+**Stale Cellpose outlines (the bbox bug, and more).** Extraction cropped each
+cell to its *outline's* bounding box and measured the mask through that crop.
+On `AS_dorsal` 12 cells have a stored outline of 1–10 px against a 99–240 px
+mask boundary — every file carries `manual_changes`; Cellpose's GUI did not
+re-derive the ring after an edit — so `Cell6_156` was measured as the **13 px**
+of its **1,826 px** mask inside that box, and its centroid, H/V extent, ellipse
+and boundaries all described one pixel. **These are exactly the "12 measurement
+failures" `segmentation_qc` has reported on that dataset since Round 13; there
+were never any others.** Fix: the crop is the union of the outline and mask
+boxes, and a cell whose stored ring has fewer than half the pixels of its
+mask's external contour (image-border pixels not counted) is measured from that
+contour — Cellpose's own convention, pixel-identical to the stored ring on all
+3,761 healthy cells checked. Border pixels are excluded because
+`thin_label_outlines` (TIFF input) has none there: counting them wrongly
+rebuilt `Demo_Seg_QC`'s corner cells (ratios 0.42–0.48), caught by the
+baseline diff, fixed, and now pinned by a test. Measured ratio over all seven
+datasets (43,983 cells): the 12 at 0.00–0.08, the next-lowest 0.97. Each
+rebuilt cell is logged per frame. *Deltas*: `AS_dorsal` QC failures 12 → 0;
+PCA 2812 → 2824 cells, k = 2, the 2,812 common cells ARI 0.983 with the previous
+partition (12 changed); tracks 181 → 180, 15 links replaced by 18, all in frame
+pairs adjacent to a rebuilt cell; puzzle `Cell1564_255` area 11 → 12 (its stray
+mask pixel is now inside the crop). Nothing else moved.
+
+**Tissue Analyzer's vertex pockets are returned to the skeleton.** A background
+sliver enclosed by skeleton lines at a vertex became its own component and so a
+"cell": 201 on `embryos_GBE_OE_GAP43` (189 × 2 px, 12 × 3 px). At the dataset's
+`min_cell_area_px = 3` the twelve 3 px ones reached `Cells_info`, and one took a
+real link (`Cell25_17 → Cell26_43`, 21 px, cost 73.3). `_vertex_pockets` flags a
+label with **no interior pixel** (no 3×3 block of itself) — a shape test, so no
+pixel count to guess — and `_label_binary_mask` hands those pixels to the
+skeleton before gap-closing, which gives them to the adjacent cells. After the
+oversize drop (which is median-relative), labels zeroed not renumbered. On the
+three TIFF datasets it flags exactly those 201 labels and nothing else; the
+smallest real label is 64 px. *OE deltas*: 16,993 → 16,981 rows, exactly the
+plan's twelve, per-frame counts drop only there; 398 neighbours gain 1–3 px
+(centroid shift ≤ 0.39 px); **of 16,524 links exactly one changed** — the bogus
+one; `Cell25_17` is now unmatched, correctly (every frame-26 cell within 31 px
+is claimed by its own predecessor). OE now gives 16,981 cells at any min area
+0–114 (was 17,182 at 0). WT GBE, `AS_dorsal`, `AS_LE_lateral`, pupae, puzzle and
+`Demo_Seg_QC` unchanged. Tests: a synthetic enclosed L-pocket gives 9 cells not
+10 (10 without the fix); a 3×3 block is kept, a 2-px strip is not.
+
+**Min cell area copy.** Behaviour unchanged (`count < N` is dropped); the hint
+and input tooltip now say "keep ≥ N px — a label of exactly N px is kept", the
+comment at `SUGGESTED_MIN_CELL_AREA_PX` says so, and a self-test pins it.
+
+**Manuscript impact.** WT GBE and `AS_LE_lateral` are unchanged in extraction,
+classification and tracking. `AS_dorsal` changes (12 cells now measured) and OE
+changes (one link). Both belong on the list of pending re-measurements for the
+cell-loss benchmark if either dataset is part of it.
+
+**Also noted, not fixed:** `extract_cell_info` still computes a `p_value` it
+never writes (dead since the 2026-08-18 deletion).
+
 ### Round 23: widening the candidate depth did not widen the depth (2026-09-08)
 
 **Round 22 reported the wrong number.** It raised each ranking's own cut from
@@ -1472,6 +1653,17 @@ listed, each counted rather than argued (GBE, 64 items):
   footprint is background in the next frame. Those anchors have a median area of
   455 px against a median cell of 3,218 px: the AS environment queue is
   sampling fragments at the edge of the segmented region, not typical cells.
+
+  > ⚠️ **Corrected Round 25 (§E3): that reading is wrong.** 3,218 px is the
+  > median of **frame 1**; `AS_dorsal` is a movie whose cell count falls
+  > monotonically from 176 to **2** (dorsal closure internalises the
+  > amnioserosa), with median area 3,227 px at frame 1, 774 px at frame 20, 572
+  > px at frame 22 and 258 px at frame 24. A 455 px anchor is a **normal late-
+  > frame cell**, not a fragment, and "no successor" is not a defect — the cell
+  > really is gone. More generally, **any movie-wide statistic on `AS_dorsal`
+  > mixes two states**: either restrict a benchmark to the frames holding >= 100
+  > labels (1–14) and record that range in provenance, or report by segment.
+  > See `v2/docs/datasets.md`.
 - *Edge exclusion desynchronising the label sets* — the fourth member of the
   Round 21 §A family — **is real but tiny**: `exclude_edge_cells` drops rows
   from `Cells_info` and nothing from the mask the candidates are drawn from, so

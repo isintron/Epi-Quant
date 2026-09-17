@@ -66,12 +66,14 @@ PCA_FEATURE_ABBREVIATIONS = {
     "Fitted Ellipse Minor Axis": "Sa",
     "Fitted Ellipse Major Axis": "La",
     "Ellipse Major/Minor Axis Ratio": "La/Sa",
+    "Fitted Ellipse Angle": "θ",
     "Circumscribed Circle Radius": "R_c",
     "Inscribed Circle Radius": "r_i",
     "Center X Coordinate": "Cx",
     "Center Y Coordinate": "Cy",
     "Cell Left Boundary": "Lb",
     "Cell Right Boundary": "Rb",
+    "Circularity": "C",
     # shape_features.py
     "Solidity": "Sol",
     "Convexity": "Cvx",
@@ -109,8 +111,9 @@ PCA_FEATURE_ABBREVIATIONS = {
 #       the specimen was mounted. They exist to feed `Local Nematic Order`,
 #       which is itself rotation-invariant.
 # All of them are still written to the xlsx files; they are just not offered as
-# PCA inputs. (`Fitted Ellipse Angle`, `Circularity` and `P-Value` went further
-# and were deleted from the schema outright -- see `data_input.CELLS_INFO_COLUMNS`.)
+# PCA inputs. (`P-Value` went further and was deleted from the schema outright;
+# `Fitted Ellipse Angle` and `Circularity`, deleted with it, came back in Round 24
+# as default-off `basic` columns -- see `data_input.CELLS_INFO_COLUMNS`.)
 FEATURE_FAMILIES: dict[str, dict] = {
     "basic": {
         "label": "Basic geometrics",
@@ -122,17 +125,35 @@ FEATURE_FAMILIES: dict[str, dict] = {
             "Circumscribed Circle Radius", "Inscribed Circle Radius",
             "Maximum Horizontal Length", "Maximum Vertical Length",
             "Horizontal/Vertical Length Ratio",
+            "Fitted Ellipse Angle", "Circularity",
         ],
         # Bbox extents are measured along the IMAGE axes, so they describe
         # orientation rather than shape: rotating one real fern cell from 0 to
         # 90 degrees swings the ratio from 2.458 to 0.407 while solidity and
         # shape index do not move. Meaningful only when the specimen is
         # deliberately aligned, as in the manuscript's AP/DV convention.
+        # The ellipse angle is image-frame orientation too, and folded (see
+        # `data_input.CELLS_INFO_COLUMNS`). Circularity is off because it is
+        # `hull`'s Shape Index again (C = 4*pi/p^2, Spearman -1.00): ticking both
+        # counts one shape quantity twice. Pruning does not guard it -- it is off
+        # unless `prune_correlation` is passed, and Pearson rates the pair only
+        # |r| = 0.966, so a threshold of 0.97 or above keeps both
+        # (`docs/shape-index-vs-circularity.md`, section 5).
         "default_off": [
             "Maximum Horizontal Length", "Maximum Vertical Length",
             "Horizontal/Vertical Length Ratio",
+            "Fitted Ellipse Angle", "Circularity",
         ],
-        "note": "H/V lengths measure orientation, not shape - tick them only if your specimen is axis-aligned.",
+        "note": (
+            "H/V lengths measure orientation, not shape - tick them only if your "
+            "specimen is axis-aligned. Ellipse Angle is orientation as well, and it "
+            "is stored folded (70 and 110 degrees share one value), so it cannot be "
+            "read back as a direction: it separates cell types well on an "
+            "axis-aligned specimen (AUC 0.92 on AS_LE_lateral) and misleads on any "
+            "other mounting. Circularity is the same quantity as Shape Index in the "
+            "Convex hull family (C = 4*pi/p^2, Spearman -1.00) - tick at most one of "
+            "the two, or PCA counts that shape twice."
+        ),
     },
     "hull": {
         "label": "Convex hull / compactness",
@@ -167,11 +188,11 @@ FEATURE_FAMILIES: dict[str, dict] = {
 # exact PCA input (the manuscript's methodology) and is what the CLI uses;
 # `tracking_only` names the four columns `cell_tracking.build_cost_matrix`
 # actually reads. Everything else is a family in `FEATURE_FAMILIES` above.
-# `legacy_13` is GONE. It named `Fitted Ellipse Angle` and `Circularity`, both
-# removed from the schema on 2026-08-18, so it can no longer be assembled -- and
-# it would not have reproduced v1's numbers anyway once geometry moved to the
-# mask (perimeter ~-5%, circularity ~+10%). `src/` stays frozen and is the
-# reference for exact v1 reproduction.
+# `legacy_13` is GONE, and stays gone although the two columns it lost on
+# 2026-08-18 (`Fitted Ellipse Angle`, `Circularity`) are back since Round 24:
+# it would not reproduce v1's numbers once geometry moved to the mask
+# (perimeter ~-5%, circularity ~+10%), and a preset of that name would claim it
+# does. `src/` stays frozen and is the reference for exact v1 reproduction.
 FEATURE_PRESETS: dict[str, list[str]] = {
     "tracking_only": [
         "Maximum Horizontal Length", "Maximum Vertical Length",
@@ -194,6 +215,7 @@ FEATURE_DISPLAY_NAMES = {
     "Fitted Ellipse Major Axis": "Ellipse Major Axis",
     "Fitted Ellipse Minor Axis": "Ellipse Minor Axis",
     "Ellipse Major/Minor Axis Ratio": "Ellipse Axis Ratio",
+    "Fitted Ellipse Angle": "Ellipse Angle",
     "Approximate Polygon Vertex Count": "Vertex Count",
     "Circumscribed Circle Radius": "Circumscribed Radius",
     "Inscribed Circle Radius": "Inscribed Radius",
@@ -759,7 +781,7 @@ def _self_test() -> None:
 
     # 4. Families are additive, well-formed, and exclude the retired columns.
     RETIRED = {
-        "Fitted Ellipse Angle", "Circularity", "P-Value", "Frame Neighbor Entropy",
+        "P-Value", "Frame Neighbor Entropy",
         "Local Density", "Elongation", "Sin2Theta", "Cos2Theta",
     }
     for name, spec in FEATURE_FAMILIES.items():
@@ -778,6 +800,16 @@ def _self_test() -> None:
     assert base_only == family_columns(["basic"]), "basic must be implicit"
     assert "Horizontal/Vertical Length Ratio" not in base_only, "AP/DV columns must default off"
     assert "Horizontal/Vertical Length Ratio" in family_columns([], include_default_off=True)
+    # Round 24: both restored columns are offered but withheld by default, so
+    # the default Classify input is exactly what it was before they came back.
+    for restored in ("Fitted Ellipse Angle", "Circularity"):
+        assert restored not in base_only, f"{restored} must default off"
+        assert restored in family_columns([], include_default_off=True), f"{restored} must be offered"
+        assert restored in data_input.CELLS_INFO_COLUMNS, f"{restored} must be in the schema"
+        assert restored in PCA_FEATURE_ABBREVIATIONS, f"{restored} needs an abbreviation for the loading plots"
+    # The note is the only place the user can read WHY a box is unticked.
+    basic_note = FEATURE_FAMILIES["basic"]["note"]
+    assert "Ellipse Angle" in basic_note and "Circularity" in basic_note, basic_note
     combined = family_columns(["hull", "lobe"])
     assert combined[: len(base_only)] == base_only, "families must stack on top of basic, in order"
     assert len(combined) == len(set(combined)), "stacking must not duplicate columns"
@@ -789,7 +821,7 @@ def _self_test() -> None:
 
     # The retired columns must not reappear anywhere.
     assert "legacy_13" not in FEATURE_PRESETS, "legacy_13 was retired with the columns it named"
-    for retired in ("Fitted Ellipse Angle", "Circularity", "P-Value"):
+    for retired in ("P-Value",):
         assert retired not in data_input.CELLS_INFO_COLUMNS, f"{retired} is back in the schema"
         assert retired not in data_input.ML_FEATURE_COLUMNS, f"{retired} is back in ML_FEATURE_COLUMNS"
         assert retired not in PCA_FEATURE_ABBREVIATIONS, f"{retired} still has an abbreviation"

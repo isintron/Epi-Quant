@@ -652,12 +652,18 @@ function handleFamilyChange() {
     const boxes = spec.columns
       .map((column) => {
         const off = spec.default_off.includes(column);
+        // Absent from this project's table (extracted before the column
+        // existed): shown so the option is discoverable, never ticked.
+        const unavailable = (spec.unavailable || []).includes(column);
         const remembered = state.featureSelection[column];
-        const on = remembered === undefined ? !off : remembered;
+        const on = !unavailable && (remembered === undefined ? !off : remembered);
         const id = `feature-cb-${column.replace(/[^A-Za-z0-9]/g, "-")}`;
         // `value` stays the real column name; only the visible text is shortened.
         const shown = (spec.display && spec.display[column]) || column;
-        return `<label class="checkbox-label" title="${column}"><input type="checkbox" id="${id}" value="${column}"${on ? " checked" : ""}> ${shown}</label>`;
+        const title = unavailable
+          ? `${column} - not in this project's Cells_info.xlsx; re-run Extract to use it`
+          : column;
+        return `<label class="checkbox-label" title="${title}"><input type="checkbox" id="${id}" value="${column}"${on ? " checked" : ""}${unavailable ? " disabled" : ""}> ${shown}</label>`;
       })
       .join("");
     group.innerHTML =
@@ -674,7 +680,7 @@ function handleFamilyChange() {
   host.querySelectorAll(".link-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const group = btn.closest(".feature-group");
-      group.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+      group.querySelectorAll("input[type=checkbox]:not(:disabled)").forEach((cb) => {
         cb.checked = btn.dataset.action === "all";
         state.featureSelection[cb.value] = cb.checked;
       });
@@ -1407,8 +1413,33 @@ function censusShow(which) {
   }
 }
 
+// Round 25 B3: the anchor's outline on every candidate tile, modelled on
+// "Enable inset view". Default on; the choice survives re-selection for the
+// rest of the session (deliberately not persisted to disk -- it is a view
+// preference, not a setting anything downstream reads). A missing box means ON,
+// so the dev mock and any path that never renders the control cannot silently
+// turn it off.
+function anchorViewEnabled() {
+  const box = document.getElementById("enable-anchor-view-checkbox");
+  return !box || box.checked;
+}
+
+// Round 25 D1: push the Candidates / R controls to the backend. Returns false
+// (and says so) if the backend refused them.
+async function applyCandidateSettings() {
+  const mode = document.getElementById("census-candidate-mode-select").value;
+  const k = parseFloat(document.getElementById("census-radius-k-input").value);
+  document.getElementById("census-radius-k-wrap").style.display = mode === "radius" ? "" : "none";
+  const applied = await window.EpiQuantAPI.set_candidate_settings(mode, Number.isNaN(k) ? null : k);
+  if (applied && applied.error) {
+    setStatus("census-status", applied.error, "error");
+    return false;
+  }
+  return true;
+}
+
 async function loadCensusItem(position) {
-  const item = await window.EpiQuantAPI.get_census_item(position, 28);
+  const item = await window.EpiQuantAPI.get_census_item(position, 28, anchorViewEnabled());
   if (item && item.error) {
     setStatus("census-status", item.error, "error");
     document.getElementById("census-panel").style.display = "none";
@@ -1439,6 +1470,7 @@ async function handleStartCensus() {
   const frame = parseInt(document.getElementById("census-frame-input").value, 10);
   const labeller = document.getElementById("census-labeller-input").value;
   setStatus("census-status", "Building the queue…", "");
+  if (!(await applyCandidateSettings())) return;
   const started = await window.EpiQuantAPI.start_census(
     kind, kind === "frame_pair" ? frame : null, 0.15, 0.10, 0, labeller, mode);
   if (started && started.error) {
@@ -1524,10 +1556,16 @@ function renderCensusCandidates() {
   // with `limit=12` actually binding, GBE's environment queue is 11 or 12 long
   // on 109 of 109 items and `AS_dorsal`'s on 54 of 55. A phrase that fires on
   // every item is not a signal, so it is gone rather than always-on.
+  const search = (censusState.item && censusState.item.candidate_search) || {};
+  // Radius mode says what the list IS: everything within R, nothing chosen.
+  const basis = search.mode === "radius"
+    ? ` All ${candidates.length} cell(s) within ${search.radius_px} px ` +
+      `(${search.k} × ${search.cell_radius_px} px cell radius) of the registered anchor, nearest first.`
+    : "";
   hint.textContent =
     `Which cell is it? 1–${shown.length}` +
     (pages > 1 ? `, 4 for the next page` : "") + ", or 0 for none of these. " +
-    `Showing ${start + 1}–${start + shown.length} of ${candidates.length}.`;
+    `Showing ${start + 1}–${start + shown.length} of ${candidates.length}.${basis}`;
   box.appendChild(hint);
 
   // Tiles in their own row, so the question above them and the buttons below
@@ -1541,6 +1579,9 @@ function renderCensusCandidates() {
     img.src = candidate.image;
     const caption = document.createElement("span");
     caption.textContent = `${i + 1} — cell ${candidate.label}`;
+    // Radius mode keeps the tracker's own answer in the list (Round 25 D2) and
+    // marks it, so the user sees which rank it holds instead of it vanishing.
+    if (candidate.is_tracker_answer) wrap.classList.add("census-candidate-tracker");
     // The evidence on its OWN line (Round 23 C1): `1 — cell 40 (44.6 px from
     // the tracker's answer)` on one line puts the choice and its justification
     // in one run of text, and the tile is narrow, so it wrapped mid-phrase.
@@ -1578,12 +1619,18 @@ async function submitCensus(verdict, chosenLabel = null) {
   if (!censusState.active || !censusState.item) return;
   const elapsed = Date.now() - censusState.shownAt;
   const position = censusState.position;
+  // Picking the tracker's own answer (offered in radius mode) is not a
+  // correction: the link was right. Recorded as `correct` WITH the chosen label,
+  // so its source and rank still land in the verdict file (Round 25 D2).
+  const pickedTrackerAnswer = verdict === "wrong" && chosenLabel !== null
+    && chosenLabel === censusState.item.shown_label;
+  if (pickedTrackerAnswer) verdict = "correct";
 
   // Correction mode never calls `submit_census_verdict` — the backend refuses
   // it, and relying on that refusal rather than on this branch is the point:
   // the two write paths must not depend on the UI to stay apart.
   if (censusState.mode === "correct") {
-    if (verdict === "wrong") {
+    if (verdict === "wrong" && !pickedTrackerAnswer) {
       const queued = await window.EpiQuantAPI.queue_census_edit(position, chosenLabel);
       if (queued && queued.error) {
         setStatus("census-status", queued.error, "error");
@@ -2794,6 +2841,33 @@ function init() {
   });
 
   document.getElementById("census-start-btn").addEventListener("click", handleStartCensus);
+  // Switching generator or R re-fetches the current item: that IS a different
+  // candidate set, unlike the anchor view below.
+  ["census-candidate-mode-select", "census-radius-k-input"].forEach((id) => {
+    document.getElementById(id).addEventListener("change", async () => {
+      if (!(await applyCandidateSettings())) return;
+      if (!censusState.active || !censusState.item) return;
+      const reopen = censusState.awaitingCandidate;
+      await loadCensusItem(censusState.position);
+      if (reopen) beginCensusWrong();
+    });
+  });
+  // The anchor view only re-draws. It must not re-run the generator, and the
+  // backend's render-only call returns the label list so that is checked here
+  // rather than assumed (Round 25 B3).
+  document.getElementById("enable-anchor-view-checkbox").addEventListener("change", async (e) => {
+    const item = censusState.item;
+    if (!censusState.active || !item || !(item.candidates || []).length) return;
+    const drawn = await window.EpiQuantAPI.get_census_candidate_images(censusState.position, e.target.checked);
+    if (drawn && drawn.error) { setStatus("census-status", drawn.error, "error"); return; }
+    const before = item.candidates.map((c) => c.label);
+    if (drawn.labels.length !== before.length || drawn.labels.some((l, i) => l !== before[i])) {
+      setStatus("census-status", "Anchor view changed the candidate list — refusing to redraw.", "error");
+      return;
+    }
+    drawn.images.forEach((image, i) => { item.candidates[i].image = image; });
+    if (censusState.awaitingCandidate) renderCensusCandidates();
+  });
   document.getElementById("census-kind-select").addEventListener("change", (e) => {
     document.getElementById("census-frame-wrap").style.display =
       e.target.value === "frame_pair" ? "inline-block" : "none";
@@ -2832,6 +2906,7 @@ function init() {
   });
   wirePopover("agreement-help-btn", "agreement-help-close", "agreement-help-popover");
   wirePopover("census-help-btn", "census-help-close", "census-help-popover");
+  wirePopover("min-cell-area-help-btn", "min-cell-area-help-close", "min-cell-area-help-popover");
   wirePopover("drift-help-btn", "drift-help-close", "drift-help-popover");
   document.getElementById("agreement-register-input").addEventListener("change", async (e) => {
     await window.EpiQuantAPI.set_register_reference(e.target.checked);

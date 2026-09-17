@@ -44,6 +44,10 @@
     censusVerdicts: [],
     trackingRunDriftMode: null,   // set when the mock "runs" tracking
     minCellArea: 0,
+    // True after "load existing extraction": the mock then plays a project
+    // extracted before Round 24, whose Cells_info.xlsx lacks the two restored
+    // basic columns, so dev mode reaches the disabled-checkbox path too.
+    preR24CellsInfo: false,
   };
 
   // A tiny distinguishable PNG per key, so two census crops are not the same
@@ -131,6 +135,7 @@
       return { extraction: false, classification: false, tracking: false, shape: false, tissue: false };
     },
     async load_existing_extraction() {
+      mockState.preR24CellsInfo = true;
       return { frame_count: mockState.frameCount, cell_count: 500 };
     },
     async load_existing_classification() {
@@ -140,6 +145,7 @@
       return { track_count: mockState.trackNumbers.length, duplicates_cleaned: 0 };
     },
     async start_extraction(_maskType, _bgRatio, _excludeEdge) {
+      mockState.preR24CellsInfo = false;
       (async () => {
         for (let p = 0; p <= 100; p += 25) {
           await delay(120);
@@ -183,13 +189,14 @@
     async get_feature_options() {
       const ready = mockState.hasShape;
       const family = (label, columns, extra = {}) => ({
-        label, columns, default_off: [], base: false, exclusive: false, note: "",
+        label, columns, default_off: [], unavailable: [], base: false, exclusive: false, note: "",
         // Mirrors pca_kmeans.FEATURE_DISPLAY_NAMES: cosmetic only, the real
         // column name stays the checkbox value.
         display: Object.fromEntries(columns.map((c) => [c, ({
           "Cell Area": "Area",
           "Cell Perimeter": "Perimeter",
           "Ellipse Major/Minor Axis Ratio": "Ellipse Axis Ratio",
+          "Fitted Ellipse Angle": "Ellipse Angle",
           "Maximum Horizontal Length": "Max Horizontal Length",
           "Maximum Vertical Length": "Max Vertical Length",
           "Horizontal/Vertical Length Ratio": "H/V Length Ratio",
@@ -203,10 +210,20 @@
           // hides exactly the bug the mock exists to catch.
           basic: family("Basic geometrics",
             ["Cell Area", "Cell Perimeter", "Ellipse Major/Minor Axis Ratio",
-             "Maximum Horizontal Length", "Maximum Vertical Length", "Horizontal/Vertical Length Ratio"],
+             "Maximum Horizontal Length", "Maximum Vertical Length", "Horizontal/Vertical Length Ratio",
+             "Fitted Ellipse Angle", "Circularity"],
             { base: true, ready: true, missing: [],
-              default_off: ["Maximum Horizontal Length", "Maximum Vertical Length", "Horizontal/Vertical Length Ratio"],
-              note: "H/V lengths measure orientation, not shape - tick them only if your specimen is axis-aligned." }),
+              default_off: ["Maximum Horizontal Length", "Maximum Vertical Length", "Horizontal/Vertical Length Ratio",
+                            "Fitted Ellipse Angle", "Circularity"],
+              unavailable: mockState.preR24CellsInfo ? ["Fitted Ellipse Angle", "Circularity"] : [],
+              note: "H/V lengths measure orientation, not shape - tick them only if your "
+                + "specimen is axis-aligned. Ellipse Angle is orientation as well, and it "
+                + "is stored folded (70 and 110 degrees share one value), so it cannot be "
+                + "read back as a direction: it separates cell types well on an "
+                + "axis-aligned specimen and misleads on any other mounting."
+                + "Circularity is the same quantity as Shape Index in the "
+                + "Convex hull family - tick at most one of the two,"
+                + "or PCA counts that shape twice." }),
           hull: family("Convex hull / compactness", ["Solidity", "Convexity", "Shape Index"],
             { note: "Solidity and Convexity are the only clean lobing measures." }),
           lobe: family("Convolution / lobe",
@@ -547,7 +564,27 @@
       census.undo = null;
       return { restored: true };
     },
-    async get_census_item(position, _pad) {
+    async get_candidate_settings() {
+      return { mode: mockState.candidateMode || "radius", k: mockState.candidateK || 3,
+               modes: ["radius", "ranked"] };
+    },
+    async set_candidate_settings(mode, k) {
+      if (mode !== null && mode !== undefined && !["radius", "ranked"].includes(mode)) {
+        return { error: `Unknown candidate mode '${mode}'; expected 'radius' or 'ranked'.` };
+      }
+      if (k !== null && k !== undefined && !(k > 0)) return { error: "The radius multiple k must be positive." };
+      if (mode) mockState.candidateMode = mode;
+      if (k) mockState.candidateK = k;
+      return mockApi.get_candidate_settings();
+    },
+    // Render-only, like the real call: same labels, different tiles.
+    async get_census_candidate_images(position, anchorView) {
+      const item = await mockApi.get_census_item(position, 28, anchorView);
+      if (item.error) return item;
+      return { position, anchor_view: !!anchorView, labels: item.candidates.map((c) => c.label),
+               images: item.candidates.map((c) => c.image) };
+    },
+    async get_census_item(position, _pad, anchorView = true) {
       const census = mockState.census;
       if (!census) return { error: "Start a census first." };
       if (position < 0 || position >= census.queue.length) {
@@ -566,11 +603,29 @@
         // How far each source was actually searched. The real API returns it
         // so a depth can be read from the product rather than only from a
         // script -- Round 22 reported a list length as if it were this.
-        candidate_depth: { reference: 1, overlap: 2, coverage: 1, nearest: 1, pointed: 1 },
+        candidate_depth: (mockState.candidateMode || "radius") === "radius"
+          ? { radius: 7 } : { reference: 1, overlap: 2, coverage: 1, nearest: 1, pointed: 1 },
+        candidate_mode: (mockState.candidateMode || "radius") === "radius"
+          ? `radius:k=${mockState.candidateK || 3}` : "ranked",
+        anchor_view: !!anchorView,
+        candidate_search: { mode: mockState.candidateMode || "radius", k: mockState.candidateK || 3,
+                            radius_px: 39 * (mockState.candidateK || 3) / 3, cell_radius_px: 13,
+                            drift_px: [6.1, 1.2], window: [0, 135, 0, 135], window_px: [135, 135] },
         // Five candidates, so dev mode exercises PAGINATION (2 pages, not a
         // padded 3) and the per-tile "why" labels. A three-candidate mock
         // would leave both unreachable.
-        candidates: [
+        candidates: ((mockState.candidateMode || "radius") === "radius" ? [
+          // Seven, so radius mode exercises THREE pages, and one of them is the
+          // tracker's own answer -- the real radius list keeps and flags it.
+          { label: 45, reason: "radius", why: `3.2 px from the anchor at frame ${item.frame}` },
+          { label: item.shown_label, reason: "radius", is_tracker_answer: true,
+            why: `9.8 px from the anchor at frame ${item.frame} (the tracker's answer)` },
+          { label: 46, reason: "radius", why: `14.0 px from the anchor at frame ${item.frame}` },
+          { label: 47, reason: "radius", why: `21.5 px from the anchor at frame ${item.frame}` },
+          { label: 48, reason: "radius", why: `27.9 px from the anchor at frame ${item.frame}` },
+          { label: 49, reason: "radius", why: `33.0 px from the anchor at frame ${item.frame}` },
+          { label: 50, reason: "radius", why: `38.4 px from the anchor at frame ${item.frame}` },
+        ] : [
           // Every basis spelled out the same way (Round 21 C3), and naming a
           // PLACE rather than "the cell" / "the link" (Round 23 C3): a tile
           // reading "12.4 px" next to one reading "18.1 px from the link"
@@ -583,8 +638,10 @@
           { label: 42, reason: "coverage", why: `covers 61% of the anchor at frame ${item.frame}` },
           { label: 43, reason: "nearest", why: `12.4 px from the anchor at frame ${item.frame}` },
           { label: 44, reason: "pointed", why: "18.1 px from the tracker's answer" },
-        ].map((c, i) => ({ ...c, rank: i + 1,
-                           image: mockCrop(`c${c.label}`, "#ff6b6b", 4 + i * 3) })),
+        ]).map((c, i) => ({ ...c, rank: i + 1,
+                            // Anchor view changes the TILE, never the label list.
+                            image: mockCrop(`c${c.label}${anchorView ? "+a" : ""}`,
+                                            "#ff6b6b", 4 + i * 3) })),
       };
     },
     async submit_census_verdict(position, verdict, chosenLabel, msElapsed) {
@@ -606,7 +663,9 @@
                                       chosen_rank: picked ? picked.rank : null });
       return { saved: true, next: position + 1, total: census.queue.length,
                chosen_reason: picked ? picked.reason : "",
-               chosen_rank: picked ? picked.rank : null };
+               chosen_rank: picked ? picked.rank : null,
+               candidate_mode: (mockState.candidateMode || "radius") === "radius"
+                 ? `radius:k=${mockState.candidateK || 3}` : "ranked" };
     },
     async get_census_summary() {
       const rows = mockState.censusVerdicts || [];

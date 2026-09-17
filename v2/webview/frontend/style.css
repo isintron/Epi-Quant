@@ -617,6 +617,15 @@ details summary {
 /* The evidence line, under the choice line rather than beside it (Round 23 C1).
    Secondary colour and a size down, so the two read as label and footnote
    rather than as one wrapped sentence. */
+/* Round 25 D2: the tracker's own answer, kept in the radius list and marked. */
+.census-candidate-tracker img {
+  outline: 2px solid #ffcc00;
+}
+.census-candidate-tracker > span:first-of-type::after {
+  content: " · tracker";
+  color: #b8860b;
+}
+
 .census-candidate-why {
   font-size: 11px;
   color: var(--muted, #9aa0a6);

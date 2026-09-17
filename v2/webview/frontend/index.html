@@ -67,12 +67,26 @@
            Unlike "Exclude edge cells" this removes the label from the MASK,
            because every consumer downstream reads the mask, not the table. -->
       <label>Minimum cell area
-        <input type="number" id="min-cell-area-input" class="small-input" value="0" min="0" max="500" step="1">px
+        <input type="number" id="min-cell-area-input" class="small-input" value="0" min="0" max="500" step="1"
+               title="Keep labels of at least N px; a label of exactly N px is kept. 0 = off.">px
       </label>
-      <span class="hint" id="min-cell-area-hint"><b>Exclude edge cells</b> drops cells touching the
-        image border, whose geometry is truncated. <b>Minimum cell area</b> drops labels below the
-        given size &mdash; segmentation can leave a few-pixel gap at a cell vertex that would
-        otherwise be read as a cell. <code>0</code> = off.</span>
+      <!-- Round 25 A: this text used to be a permanent hint taking three lines
+           at the top of the panel. Same `?` + popover pattern as qc/overlap/
+           drift/agreement/census. The wording is unchanged on purpose: the
+           "at least N px ... to drop 3 px labels enter 4" sentence is Round 24
+           issue 2's direct product. Do not simplify it. -->
+      <button id="min-cell-area-help-btn" class="help-btn" aria-label="What do these two options do?">?</button>
+    </div>
+    <div id="min-cell-area-help-popover" class="popover" style="display:none">
+      <div class="popover-head">
+        <strong>Exclude edge cells &amp; minimum cell area</strong>
+        <button id="min-cell-area-help-close" class="help-btn" aria-label="Close">&times;</button>
+      </div>
+      <p id="min-cell-area-hint"><b>Exclude edge cells</b> drops cells touching the
+        image border, whose geometry is truncated. <b>Minimum cell area</b> keeps labels of
+        <b>at least</b> N px and drops smaller ones &mdash; a label of exactly N px is kept, so to
+        drop 3&nbsp;px labels enter 4. Segmentation can leave a few-pixel gap at a cell vertex that
+        would otherwise be read as a cell. <code>0</code> = off.</p>
     </div>
     <details>
       <summary>Advanced options</summary>
@@ -653,6 +667,18 @@
           <option value="environment_flagged">Cells the environment score flags for repair</option>
         </select>
       </label>
+      <!-- Round 25 D1: both candidate generators, switchable, until the
+           click-test decides. Every verdict records which one it saw. -->
+      <label>Candidates
+        <select id="census-candidate-mode-select">
+          <option value="radius" selected>Radius &mdash; every cell near the anchor</option>
+          <option value="ranked">Ranked &mdash; Round 23 multi-source merge</option>
+        </select>
+      </label>
+      <label id="census-radius-k-wrap">R =
+        <input type="number" id="census-radius-k-input" class="small-input" min="0.5" max="10" step="0.5" value="3"
+               title="Search radius, in median cell radii (R = k &times; radius), so it carries between magnifications.">
+        &times; cell radius</label>
       <label id="census-frame-wrap" style="display:none">Frame
         <input type="number" id="census-frame-input" class="small-input" min="0" value="1"></label>
       <label>Your name <input type="text" id="census-labeller-input" class="small-input" placeholder="optional"></label>
@@ -668,6 +694,11 @@
            the tiles and the buttons were all flex siblings on one line, so the
            question floated level with the tiles and tile 3 wrapped to its own
            row below the text -- which is what made the panel too tall to fit. -->
+      <!-- Round 25 B3: modelled on "Enable inset view". A view preference,
+           default on, session-only. -->
+      <div class="field-row">
+        <label class="checkbox-label"><input type="checkbox" id="enable-anchor-view-checkbox" checked> Enable anchor view</label>
+      </div>
       <div id="census-candidates" style="display:none"></div>
       <div class="field-row">
         <button id="census-correct-btn" class="secondary-btn">J &mdash; correct</button>

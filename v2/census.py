@@ -67,9 +67,40 @@ VERDICTS = ("correct", "wrong", "unjudgeable")
 FIELDS = (
     "session_id", "item_id", "source_item_id", "frame", "label", "track_id",
     "shown_label", "true_label", "is_decoy", "is_repeat", "verdict",
-    "chosen_label", "chosen_reason", "chosen_rank", "ms_elapsed", "labeller",
-    "source", "register", "environment_threshold", "timestamp_utc",
+    "chosen_label", "chosen_reason", "chosen_rank", "candidate_mode", "ms_elapsed",
+    "labeller", "source", "register", "environment_threshold", "timestamp_utc",
 )
+#: `candidate_mode` (Round 25 D1) says WHICH candidate generator offered the list
+#: a verdict was given against -- `ranked` (the Round 20-23 multi-source merge) or
+#: `radius:k=3` (every cell within k median cell radii of the registered anchor).
+#: The two coexist until the maintainer's clicks decide between them, and a
+#: verdict that does not say which one it saw cannot vote.
+
+
+def _migrate_header(path: str, header: list) -> None:
+    """Rewrite `path` under the current `FIELDS`, keeping every row.
+
+    `append_verdict` used to open the file in append mode and write rows keyed by
+    the CURRENT `FIELDS` beneath whatever header the file already had. When Round
+    23 added four columns, any `ground_truth_links.csv` started earlier began
+    receiving rows whose values sat under the wrong headings -- no error, and a
+    `DictReader` then paired `chosen_reason` with a timestamp. Found in Round 25
+    while adding a fifth column. Old rows get blanks for the new columns; an
+    unknown column raises rather than being dropped, because a verdict file is
+    not ours to lose data from.
+    """
+    unknown = [name for name in header if name not in FIELDS]
+    if unknown:
+        raise ValueError(f"{path} has columns this version does not know: {unknown}; "
+                         "refusing to rewrite it and lose them")
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    tmp = path + ".migrating"
+    with open(tmp, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDS, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, path)
 
 DEFAULT_DECOY_RATE = 0.15
 DEFAULT_REPEAT_RATE = 0.10
@@ -413,7 +444,8 @@ def append_verdict(path: str, session_id: str, item: dict, verdict: str,
                    chosen_label: Optional[int], ms_elapsed: float,
                    labeller: str = "", chosen_reason: str = "",
                    chosen_rank: Optional[int] = None, register: Optional[bool] = None,
-                   environment_threshold: Optional[float] = None) -> dict:
+                   environment_threshold: Optional[float] = None,
+                   candidate_mode: str = "") -> dict:
     if verdict not in VERDICTS:
         raise ValueError(f"unknown verdict {verdict!r}; expected one of {VERDICTS}")
     row = {
@@ -439,6 +471,7 @@ def append_verdict(path: str, session_id: str, item: dict, verdict: str,
         # alone.
         "chosen_reason": chosen_reason or "",
         "chosen_rank": "" if chosen_rank is None else int(chosen_rank),
+        "candidate_mode": candidate_mode or "",
         "ms_elapsed": round(float(ms_elapsed), 1),
         "labeller": labeller,
         # Which SET this item was drawn from. Without it a file of verdicts is
@@ -457,6 +490,11 @@ def append_verdict(path: str, session_id: str, item: dict, verdict: str,
     if directory:
         os.makedirs(directory, exist_ok=True)
     exists = os.path.exists(path)
+    if exists:
+        with open(path, newline="", encoding="utf-8") as handle:
+            header = next(csv.reader(handle), [])
+        if header and header != list(FIELDS):
+            _migrate_header(path, header)
     with open(path, "a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)
         if not exists:
@@ -662,6 +700,29 @@ if __name__ == "__main__":
           "(register=%s, environment_threshold=%s)."
           % (saved[0]["chosen_reason"], saved[0]["chosen_rank"],
              saved[0]["register"], saved[0]["environment_threshold"]))
+
+    # --- R25: a file started under an OLDER header is migrated, not appended
+    # to blindly. Before this, Round 23's four new columns were written beneath
+    # a Round 22 header, so every value after `chosen_label` sat one heading off.
+    legacy_fields = [f for f in FIELDS if f not in
+                     ("chosen_reason", "chosen_rank", "candidate_mode", "register",
+                      "environment_threshold")]
+    legacy_path = os.path.join(tempfile.mkdtemp(), "ground_truth_links.csv")
+    with open(legacy_path, "w", newline="", encoding="utf-8") as handle:
+        old_writer = csv.DictWriter(handle, fieldnames=legacy_fields)
+        old_writer.writeheader()
+        old_writer.writerow({f: ("old-session" if f == "session_id" else
+                                 "correct" if f == "verdict" else "") for f in legacy_fields})
+    append_verdict(legacy_path, "s2", queue[0], "wrong", 7, 500.0, chosen_reason="radius",
+                   chosen_rank=3, candidate_mode="radius:k=3", register=False)
+    migrated = read_verdicts(legacy_path)
+    assert list(migrated[0].keys()) == list(FIELDS), list(migrated[0].keys())
+    assert migrated[0]["session_id"] == "old-session" and migrated[0]["chosen_reason"] == "", migrated[0]
+    assert migrated[1]["chosen_reason"] == "radius" and migrated[1]["chosen_rank"] == "3", migrated[1]
+    assert migrated[1]["candidate_mode"] == "radius:k=3" and migrated[1]["verdict"] == "wrong", migrated[1]
+    print("R25: a verdict file written under an older header is rewritten under the")
+    print("  current one before appending -- old rows keep their values, new columns")
+    print("  land under their own headings (before: one heading off, silently).")
 
     # --- D3 (R18): the environment-flagged set, and the refusal to pool.
     env_scores = {1: {1: 0.9, 2: 0.4, 3: 0.2, 4: 0.55, 5: 1.0}}

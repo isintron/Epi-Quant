@@ -548,8 +548,10 @@ def morphology_outlier(
     # output while being offered nowhere in Classify); it is exactly recoverable
     # from the two columns above, verified against the old column to within its
     # own 2-decimal rounding (max diff 0.005) with every sentinel row
-    # reproduced. `where=` keeps the -1/0 sentinel rows out of the division;
-    # they fall out of `valid` below either way.
+    # reproduced. Round 24 restored the column as a default-off Classify
+    # feature; it is still computed here, so a project extracted while the
+    # column was absent scores the same. `where=` keeps the -1/0 sentinel rows
+    # out of the division; they fall out of `valid` below either way.
     circularity = np.divide(
         4 * np.pi * area, perimeter ** 2,
         out=np.full_like(area, -1.0, dtype=float), where=perimeter > 0,
@@ -622,10 +624,10 @@ def measurement_failures(cells_info: pd.DataFrame, frame_number: int) -> Dict[in
         return {}
 
     # `Circularity`, `P-Value` and `Fitted Ellipse Angle` were removed from the
-    # schema on 2026-08-18. Dropping them here loses no detection: they were
-    # -1 exactly when a column that remains already was, and re-running this
-    # over `AS_dorsal view_E-cad` with and without them found the same 12
-    # failures across all 24 frames.
+    # schema on 2026-08-18 (the first and last came back in Round 24). Leaving
+    # them out here loses no detection: they are -1 exactly when a column
+    # listed below already is, and re-running this over `AS_dorsal view_E-cad`
+    # with and without them found the same 12 failures across all 24 frames.
     sentinel_negative = ["Cell Perimeter", "Fitted Ellipse Major Axis",
                          "Fitted Ellipse Minor Axis", "Ellipse Major/Minor Axis Ratio"]
     sentinel_zero = ["Approximate Polygon Vertex Count", "Circumscribed Circle Radius", "Inscribed Circle Radius"]
@@ -725,8 +727,8 @@ if __name__ == "__main__":
     print("  -> cells separated by a thin gap are still bridged and scored.")
 
     # --- morphology_outlier: naturally-varying cells plus one merged blob.
-    # `morphology_outlier` now derives circularity from area and perimeter (the
-    # stored `Circularity` column was removed from the schema), so fixtures give
+    # `morphology_outlier` derives circularity from area and perimeter rather
+    # than reading the stored `Circularity` column, so fixtures give
     # the perimeter that PRODUCES the circularity they mean to test.
     def perimeter_for(area, circularity):
         return float(np.sqrt(4 * np.pi * area / circularity))
