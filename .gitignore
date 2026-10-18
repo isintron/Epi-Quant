@@ -14,6 +14,7 @@ docs/
 CLAUDE.md
 CLAUDE.local.md
 人机协同点击测试指南.md
+Claude outputs/
 
 # Python
 __pycache__/

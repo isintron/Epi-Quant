@@ -299,6 +299,8 @@ def render_tracking_overlay(
     nematic_axes: Optional[list] = None,
     agreement_states: Optional[dict] = None,
     agreement_colors: Optional[dict] = None,
+    extracted_labels: Optional[set] = None,
+    unextracted_color: str = "#ff00ff",
 ) -> Image.Image:
     """Tint each cell by whether it's matched (present in `tracking_data`'s
     `Frame{frame_number}` column) or unmatched, generalizing v1's
@@ -309,6 +311,18 @@ def render_tracking_overlay(
     cell's centroid, at `label_font_size` (via `ImageFont.load_default`'s
     `size` argument, supported since Pillow 10.1 -- no bundled font file
     needed).
+
+    **Two different states used to share `unmatched_color` (Round 26 C).** A
+    cell can be absent from the tracking table because the LAP gave it to the
+    sentinel or never offered it -- a tracking outcome -- or because it has no
+    `Cells_info` row at all, having been filtered out at extraction, which is
+    not a tracking outcome and cannot be fixed by anything the correction UI
+    does. Drawn in one colour, the second reads as the first: that is what sent
+    a maintainer looking for a LAP bug in `Cell1_64`, whose real cause was the
+    edge filter (`docs/edge-flicker-diagnosis.md`). Pass `extracted_labels`
+    (the raw labels that DO have a row in this frame) and a cell outside it is
+    drawn in `unextracted_color` instead. Omit it and the colouring is exactly
+    as before -- two states, one colour.
 
     `track_color_mode`: `"uniform"` (default) uses `matched_color`/
     `unmatched_color` as above. `"identity"` instead gives each matched
@@ -390,6 +404,10 @@ def render_tracking_overlay(
         cell_index = f"Cell{frame_number}_{cell_id}"
         track_id = matched_lookup.get(cell_index)
         is_matched = track_id is not None
+        # "Unmatched" only means something if the cell was a candidate at all.
+        absent_color = (unextracted_color
+                        if extracted_labels is not None and int(cell_id) not in extracted_labels
+                        else unmatched_color)
 
         if track_color_mode == "environment":
             # Unscoreable cells stay untinted (base image shows through) --
@@ -411,7 +429,7 @@ def render_tracking_overlay(
                     colour = 0.45 * colour + 0.55 * region.mean(axis=0)
                 img[outlines == cell_id] = colour.round().astype(np.uint8)
             elif tint_other_cells:
-                img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)
+                img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else absent_color)
         elif track_color_mode == "agreement":
             # `{raw_label: "agrees"|"disagrees"|"unjudgeable"|"broken"}` from
             # `tracking_benchmark.classify_links`. THREE meaningful states, and
@@ -423,17 +441,17 @@ def render_tracking_overlay(
             if state is not None and state in agreement_rgb:
                 img[outlines == cell_id] = agreement_rgb[state]
             elif tint_other_cells:
-                img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)
+                img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else absent_color)
         elif track_color_mode == "lifecycle":
             state = (lifecycle_states or {}).get(cell_index)
             if state is not None and state in lifecycle_rgb:
                 img[outlines == cell_id] = lifecycle_rgb[state]
             elif tint_other_cells:
-                img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)
+                img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else absent_color)
         elif is_matched and track_color_mode == "identity":
             img[outlines == cell_id] = identity_color_by_track[track_id]
         else:
-            img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else unmatched_color)
+            img[outlines == cell_id] = _hex_to_rgb(matched_color if is_matched else absent_color)
 
         if label_cells:
             positions = np.where(outlines == cell_id)
@@ -670,6 +688,32 @@ if __name__ == "__main__":
 
     if args.self_test:
         import pandas as pd
+
+        # --- R26 C: "unmatched" was two states in one colour.
+        # A cell the LAP did not link (a row exists; a correction can fix it)
+        # and a cell Extract never emitted (no row; nothing to correct) looked
+        # identical, which is what sent a maintainer looking for a LAP bug in a
+        # cell the edge filter had removed before tracking ever saw it.
+        edge_tracking = pd.DataFrame({"Index": [1], "Frame1": ["Cell1_1"]})
+        grid = np.zeros((30, 30), dtype=np.int32)
+        grid[2:10, 2:10] = 1       # matched
+        grid[2:10, 15:25] = 2      # has a row, not linked
+        grid[15:25, 2:10] = 3      # no row at all
+        base = np.zeros((30, 30, 3), dtype=np.uint8)
+        painted = np.asarray(render_tracking_overlay(
+            grid, base, 1, edge_tracking, "#ffd633", "#3388ff", label_cells=False,
+            extracted_labels={1, 2}, unextracted_color="#ff00ff"))
+        assert tuple(painted[5, 5]) == _hex_to_rgb("#ffd633"), painted[5, 5]
+        assert tuple(painted[5, 20]) == _hex_to_rgb("#3388ff"), painted[5, 20]
+        assert tuple(painted[20, 5]) == _hex_to_rgb("#ff00ff"), painted[20, 5]
+        # Omitting the set must reproduce the old behaviour exactly, so a caller
+        # that cannot tell the two apart does not start claiming it can.
+        legacy = np.asarray(render_tracking_overlay(
+            grid, base, 1, edge_tracking, "#ffd633", "#3388ff", label_cells=False))
+        assert tuple(legacy[20, 5]) == tuple(legacy[5, 20]) == _hex_to_rgb("#3388ff"), legacy[20, 5]
+        print("R26 C: a cell with no Cells_info row is drawn in its own colour (magenta),")
+        print("  not in the unmatched blue a correction could act on; without")
+        print("  `extracted_labels` the overlay is byte-identical to before.")
 
         # --- C2 (R17): the main overlay and the inset must resolve a label the
         # same way. They did not -- the inset drew RAW segmentation labels,

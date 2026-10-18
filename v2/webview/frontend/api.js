@@ -25,6 +25,10 @@
       { cluster_label: 1, cell_type: "cluster_2", color: "#377eb8", count: 30, hidden: false },
     ],
     trackNumbers: [1, 2, 3, 4, 5],
+    // The two Round 27 census sets re-solve the frame pairs, so they need the
+    // feature table; the real API refuses without it and so does the mock.
+    extracted: false,
+    inspection: null,
     hasLeadingEdge: false,
     hasShape: false,
     trackingCost: { mode: "hybrid", overlap_weight: 1.0, centroid_weight: 1.0,
@@ -136,6 +140,7 @@
     },
     async load_existing_extraction() {
       mockState.preR24CellsInfo = true;
+      mockState.extracted = true;
       return { frame_count: mockState.frameCount, cell_count: 500 };
     },
     async load_existing_classification() {
@@ -146,6 +151,7 @@
     },
     async start_extraction(_maskType, _bgRatio, _excludeEdge) {
       mockState.preR24CellsInfo = false;
+      mockState.extracted = true;
       (async () => {
         for (let p = 0; p <= 100; p += 25) {
           await delay(120);
@@ -459,14 +465,24 @@
       if (kind === "frame_pair" && (frame === null || frame === undefined)) {
         return { error: "A frame_pair census needs a frame number." };
       }
-      if (!["geometry_flagged", "frame_pair", "environment_flagged"].includes(kind)) {
+      // The two Round 27 sets re-solve the frame pairs, so the real API refuses
+      // them without an extraction; the mock refuses for the same reason rather
+      // than silently succeeding where the product would not.
+      if (!["geometry_flagged", "frame_pair", "environment_flagged",
+            "forward_backward", "low_margin"].includes(kind)) {
         return { error: `Unknown census kind '${kind}'.` };
+      }
+      if (["forward_backward", "low_margin"].includes(kind) && !mockState.extracted) {
+        return { error: "Extract the movie before building this set." };
       }
       const sessionMode = mode || "census";
       if (!["census", "correct"].includes(sessionMode)) {
         return { error: `Unknown census mode '${sessionMode}'; expected 'census' or 'correct'.` };
       }
-      const real = kind === "frame_pair" ? 6 : (kind === "environment_flagged" ? 3 : 4);
+      const real = kind === "frame_pair" ? 6
+        : kind === "environment_flagged" ? 3
+        : kind === "forward_backward" ? 5
+        : kind === "low_margin" ? 7 : 4;
       const correcting = sessionMode === "correct";
       const queue = [];
       for (let i = 0; i < real; i += 1) {
@@ -910,8 +926,12 @@
       return mockApi.get_environment_thresholds();
     },
     async get_environment_repair_candidates(_frame, _direction) {
+      // `perfect` and `unscoreable` are part of the real answer (Round 28 C3)
+      // and the mock carries them, or dev mode cannot exercise the line that
+      // reports what the score is not about.
       return { candidates: [{ label: 3, score: 0.33 }, { label: 9, score: 0.5 }],
-               threshold: mockState.repairThreshold, flagged_total: 4, n: 40 };
+               threshold: mockState.repairThreshold, flagged_total: 4, n: 40,
+               perfect: 22, unscoreable: 3 };
     },
     async get_link_agreement(frame) {
       // The mock must be able to produce the SILENT-FAILURE paths too, or it
@@ -958,6 +978,43 @@
     },
     async get_track_frame_range(_track) {
       return { min_frame: 1, max_frame: mockState.frameCount };
+    },
+    async get_track_cell_at_frame(track, frame) {
+      // A gap on one track, so dev mode exercises the "no cell here" path the
+      // real API takes when a track holds nothing at that frame.
+      if (track === mockState.trackNumbers[1] && frame === 2) return null;
+      return `Cell${frame}_${track}`;
+    },
+    async start_track_inspection(labeller) {
+      if (!mockState.trackNumbers.length) return { error: "Track the movie before inspecting it." };
+      mockState.inspection = { session_id: "insp0001", labeller: labeller || "", marks: 0, rows: [] };
+      return { session_id: "insp0001", tracks: mockState.trackNumbers,
+               total: mockState.trackNumbers.length, path: "/mock/GT_cell_track_output/track_inspection.csv" };
+    },
+    async mark_inspection_cell(track, frame, msElapsed) {
+      if (!mockState.inspection) return { error: "Start a visual inspection first." };
+      const cell = await mockApi.get_track_cell_at_frame(track, frame);
+      if (cell === null) return { error: `Track #${track} holds no cell at frame ${frame}.` };
+      mockState.inspection.marks += 1;
+      mockState.inspection.rows.push({ track, frame, cell, msElapsed });
+      return { marked: cell, track_id: track, frame, marks: mockState.inspection.marks };
+    },
+    async finish_track_inspection(inspected, perTrackMs) {
+      if (!mockState.inspection) return { error: "Start a visual inspection first." };
+      const seen = inspected || [];
+      const marks = mockState.inspection.rows;
+      const unseen = mockState.trackNumbers.filter((t) => !seen.includes(t));
+      const dwell = Object.values(perTrackMs || {}).sort((a, b) => a - b);
+      mockState.inspection = null;
+      return {
+        kind: "track_inspection", session_id: "insp0001",
+        tracks_total: mockState.trackNumbers.length, tracks_inspected: seen.length,
+        tracks_not_inspected: unseen, marks: marks.length,
+        tracks_with_marks: new Set(marks.map((m) => m.track)).size,
+        median_seconds_per_track: dwell.length
+          ? Math.round(dwell[Math.floor(dwell.length / 2)] / 100) / 10 : null,
+        marks_by_track: {}, path: "/mock/GT_cell_track_output/track_inspection.csv",
+      };
     },
     async get_trajectory_overlay(_track, _frame, _renderMode) {
       return MOCK_PNG;

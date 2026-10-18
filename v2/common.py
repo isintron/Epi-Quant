@@ -69,13 +69,72 @@ def save_modified_rows(data: pd.DataFrame, file_path: str) -> pd.DataFrame:
     return data
 
 
+def _self_test() -> None:
+    """`save_modified_rows` maps columns BY POSITION, so widening the schema is
+    the operation that can break it silently (Round 26 B4).
+
+    It builds `{name: position}` from the DataFrame it is handed and writes each
+    value at that position in the sheet. That is correct only while the sheet's
+    column order equals the frame's -- and a correction round trip is exactly
+    where the two meet: Extract writes the sheet, the correction UI re-reads it,
+    edits rows, and writes them back into the same file. Round 26 appended
+    `Edge Distance`, so this asserts the trip by NAME, over the real schema,
+    with a value in the new last column that must not land anywhere else.
+    """
+    import tempfile
+
+    import data_input
+
+    columns = ["Cell Index"] + data_input.CELLS_INFO_COLUMNS
+    rows = []
+    for i in (1, 2, 3):
+        row = {name: float(10 * i + j) for j, name in enumerate(data_input.CELLS_INFO_COLUMNS)}
+        row["Cell Index"] = f"Cell1_{i}"
+        row["Edge Distance"] = float(i)          # 1, 2, 3: the new LAST column
+        rows.append(row)
+    original = pd.DataFrame(rows, columns=columns)
+
+    path = os.path.join(tempfile.mkdtemp(prefix="epiquant_common_"), "Cells_info.xlsx")
+    original.to_excel(path, index=False, sheet_name="Cell")
+
+    edited = pd.read_excel(path, sheet_name="Cell")
+    assert list(edited.columns) == columns, list(edited.columns)
+    edited["modified"] = False
+    edited.loc[1, "Cell Area"] = 999.0
+    edited.loc[1, "Edge Distance"] = 42.0        # the column most at risk
+    edited.loc[1, "modified"] = True
+    save_modified_rows(edited, path)
+
+    back = pd.read_excel(path, sheet_name="Cell")
+    assert list(back.columns) == columns, list(back.columns)
+    assert back.loc[1, "Cell Area"] == 999.0, back.loc[1]
+    assert back.loc[1, "Edge Distance"] == 42.0, back.loc[1]
+    # The untouched rows and every other column of the edited row must be
+    # unmoved -- an off-by-one would show up here, not in the two above.
+    pd.testing.assert_frame_equal(back.drop(index=1), original.drop(index=1), check_dtype=False)
+    unchanged = [c for c in columns if c not in ("Cell Area", "Edge Distance")]
+    pd.testing.assert_series_equal(back.loc[1, unchanged], original.loc[1, unchanged], check_dtype=False)
+    assert not edited["modified"].any(), "the flag must be cleared after saving"
+    print("R26 B4: a correction round trip over the full %d-column schema puts both edits"
+          % len(columns))
+    print("  under their own names (including the appended `Edge Distance`), leaves every")
+    print("  other cell byte-identical, and clears the modified flag.")
+    print("\nAll common self-tests passed.")
+
+
 if __name__ == "__main__":
     import argparse
     import tempfile
 
     parser = argparse.ArgumentParser(description="Standalone debug entry for v2.common")
     parser.add_argument("--base-output-dir", default=None, help="Defaults to a fresh temp dir if omitted")
+    parser.add_argument("--self-test", action="store_true",
+                        help="Run the schema round-trip check and exit.")
     args = parser.parse_args()
+
+    if args.self_test:
+        _self_test()
+        raise SystemExit(0)
 
     base_dir = args.base_output_dir or tempfile.mkdtemp(prefix="epiquant_v2_")
     created = setup_output_dirs(base_dir)

@@ -53,7 +53,8 @@ from scipy.ndimage import minimum_filter as ndimage_minimum_filter
 
 logger = logging.getLogger(__name__)
 
-# 17-column schema written to Cells_info.xlsx. The two row builders in
+# 18-column schema written to Cells_info.xlsx (17 until Round 26 added
+# `Edge Distance`). The two row builders in
 # `extract_cell_info` fill it positionally, so they change with it. Tracking
 # weights are resolved BY NAME (`cell_tracking.WEIGHTED_COLUMNS`), so the order
 # no longer moves them.
@@ -84,6 +85,16 @@ CELLS_INFO_COLUMNS = [
     "Fitted Ellipse Angle", "Circumscribed Circle Radius",
     "Inscribed Circle Radius", "Center X Coordinate", "Center Y Coordinate", "Cell Left Boundary",
     "Cell Right Boundary", "Circularity",
+    # Round 26 B1. APPENDED LAST, deliberately: `common.save_modified_rows` and
+    # the tracking-only path below map columns by POSITION, so inserting
+    # anywhere else would silently shift every column after it.
+    #
+    # A distance, not a flag, so the threshold is not baked into the data: a
+    # different `margin`, or a Schmitt trigger over it, needs no re-extraction.
+    # Like Center X/Y and the Left/Right Boundaries it LOCATES a cell rather
+    # than describing it, which is why it stays out of every feature set (see
+    # `ML_FEATURE_COLUMNS`).
+    "Edge Distance",
 ]
 
 # Default PCA/K-means feature set: every column except the raw positions
@@ -503,7 +514,10 @@ def _close_label_gaps(
     median of 17 px away. That gave 1,303 cells a second, disconnected
     fragment sitting on row 0 -- and since `is_edge_cell` is bounding-box
     based, one such pixel condemned the whole cell, so `exclude_edge_cells`
-    then dropped 17.5% of every frame before tracking ever saw them.
+    then dropped 17.5% of every frame before tracking ever saw them. (Since
+    Round 26 that filter no longer drops rows at all, but the bounding-box
+    sensitivity this paragraph describes is why the pixels must not be
+    teleported in the first place.)
 
     A real drawn boundary is 1-3 px wide, so each of its pixels is within a
     couple of pixels of the cell it belongs to; the default bound closes
@@ -1047,10 +1061,10 @@ def convert_outline_coords_to_npy(
 # whole of Rounds 17-19 has been about inputs diverging from what a run thought
 # it read.
 #
-# A minimum-cell-area filter makes that concrete. `exclude_edge_cells` works by
-# `continue`-ing inside the per-cell loop -- it drops the ROW and leaves the
-# label in the mask, which is harmless for an edge cell. For a 1 px vertex
-# artefact it is not: every consumer downstream reads the MASK, so the label
+# A minimum-cell-area filter makes that concrete. `exclude_edge_cells` used to
+# work by `continue`-ing inside the per-cell loop -- dropping the ROW and
+# leaving the label in the mask, which is harmless for an edge cell (and since
+# Round 26 it drops nothing at all). For a 1 px vertex artefact it is not: every consumer downstream reads the MASK, so the label
 # survives as a fifth neighbour in `adjacency.build_neighbor_graph` (which can
 # stop the four real cells around a vertex being recorded as neighbours of one
 # another -- corrupting T1 detection exactly where T1s happen), is seen by
@@ -1097,6 +1111,29 @@ def set_min_cell_area(area_px: int) -> int:
 
 def get_min_cell_area() -> int:
     return _MIN_CELL_AREA_PX
+
+
+#: Whether the ANALYSIS consumers drop cells near the image border (Round 26).
+#: Module state for the same reason the minimum area is: the property that
+#: matters is that every consumer, and every provenance writer, reads the SAME
+#: answer -- threading it through six call sites is six chances to pass a
+#: different one. Like the area it is not persisted by itself; the project
+#: settings file restores it (`webview/api._load_project_settings`).
+_EXCLUDE_EDGE_CELLS = False
+
+
+def set_edge_exclusion(enabled: bool) -> bool:
+    """Turn the border-cell exclusion on or off for the analysis consumers.
+
+    It never affects tracking. See `drop_edge_cells`.
+    """
+    global _EXCLUDE_EDGE_CELLS
+    _EXCLUDE_EDGE_CELLS = bool(enabled)
+    return _EXCLUDE_EDGE_CELLS
+
+
+def get_edge_exclusion() -> bool:
+    return _EXCLUDE_EDGE_CELLS
 
 
 def apply_min_cell_area(labels, area_px: Optional[int] = None):
@@ -1216,18 +1253,72 @@ def prepare_segmentation_folder(
     )
 
 
-def is_edge_cell(cell_pixels: tuple[np.ndarray, np.ndarray], height: int, width: int, margin: int = 3) -> bool:
+#: The margin `is_edge_cell` has always used, named rather than written out at
+#: each call site. Round 26 deliberately does NOT change it: with the exclusion
+#: moved off the tracking path, what the right number is -- and whether it wants
+#: a Schmitt trigger over it, as the junction-length minimum has -- is a
+#: separate question, to be decided on the numbers Round 26 produces.
+DEFAULT_EDGE_MARGIN_PX = 3
+
+
+def edge_distance(cell_pixels: tuple[np.ndarray, np.ndarray], height: int, width: int) -> int:
+    """How far a cell's bounding box stays clear of the image border, in pixels.
+
+    `min(min_x, min_y, width - max_x, height - max_y)` -- exactly the four
+    quantities `is_edge_cell` compares against its margin, so
+
+        is_edge_cell(pixels, h, w, margin) == (edge_distance(pixels, h, w) <= margin)
+
+    holds for every margin, and the self-test asserts it over a grid of cases.
+
+    **The far edges are measured as `width - max_x`, not `width - 1 - max_x`.**
+    That is one more than the geometric distance -- a cell occupying the last
+    column scores 1, not 0 -- and it is kept because the predicate it has to
+    agree with is a verbatim port of v1 and already asymmetric. Changing the
+    convention here would silently move which cells a given margin excludes,
+    which is a separate decision from Round 26's (see `v2/rounds/Round 26.md`
+    §E: `margin=3` is not being touched this round).
+    """
+    return int(min(np.min(cell_pixels[1]), np.min(cell_pixels[0]),
+                   width - np.max(cell_pixels[1]), height - np.max(cell_pixels[0])))
+
+
+def is_edge_cell(cell_pixels: tuple[np.ndarray, np.ndarray], height: int, width: int,
+                 margin: int = DEFAULT_EDGE_MARGIN_PX) -> bool:
     """True if a cell's pixel positions (as returned by `np.where(outlines == cell_id)`,
     i.e. `(row_indices, col_indices)`) come within `margin` pixels of any image
-    border. Verbatim port of src/gui_main.py:944-954 (already `self`-free)."""
-    min_x = np.min(cell_pixels[1])
-    max_x = np.max(cell_pixels[1])
-    min_y = np.min(cell_pixels[0])
-    max_y = np.max(cell_pixels[0])
+    border. Verbatim port of src/gui_main.py:944-954 (already `self`-free).
 
-    if min_x <= margin or max_x >= width - margin or min_y <= margin or max_y >= height - margin:
-        return True
-    return False
+    **Since Round 26 this no longer decides whether a cell gets a row.**
+    Extraction records `edge_distance` for every cell and the filter moved to
+    the consumers that need it (morphometrics, PCA/K-means) -- tracking does
+    not filter, because a truncated cell's *geometry* is unusable while its
+    centroid and mask are fine. Run per frame on a bounding box, this predicate
+    flipped 136 times across 85 frame pairs on `AS_LE_lateral view_E-cad`, and
+    each flip minted an orphan cell and a new track
+    (`docs/edge-flicker-diagnosis.md`).
+    """
+    return edge_distance(cell_pixels, height, width) <= margin
+
+
+def drop_edge_cells(frame: "pd.DataFrame", margin: Optional[int] = None) -> "pd.DataFrame":
+    """Rows whose cell stays more than `margin` px clear of the image border.
+
+    **The one place the exclusion is applied**, so the consumers that want it
+    cannot disagree about what it means (Round 26 B2). Tracking does not call
+    this: a truncated cell's geometry is wrong, which is what the exclusion is
+    for, but its centroid and mask -- all tracking reads -- are fine.
+
+    A table extracted before Round 26 has no `Edge Distance` column. It is
+    returned unchanged, because such a table had the edge cells dropped at
+    extraction already: filtering again would be right, and raising would make
+    an old project unopenable, but *silently* returning fewer rows than the
+    caller's own count is what neither would do.
+    """
+    if "Edge Distance" not in frame.columns:
+        return frame
+    limit = DEFAULT_EDGE_MARGIN_PX if margin is None else int(margin)
+    return frame[frame["Edge Distance"] > limit]
 
 
 # Arc-length spacing, in pixels, at which a traced boundary's perimeter is
@@ -1288,7 +1379,7 @@ def extract_cell_info(
     tracking_only: bool = False,
     frames: Optional[set] = None,
 ) -> tuple[pd.DataFrame, int]:
-    """Extract the 18-column geometric feature table for every cell across all
+    """Extract the 19-column geometric feature table for every cell across all
     frames in `npy_folder` (Cellpose `.npy` output, each a dict with an
     `'outlines'` labeled mask). Row index = `Cell Index` string
     `Cell{frame}_{cell_id}`.
@@ -1307,7 +1398,18 @@ def extract_cell_info(
     `tracking_only=True` computes only the four columns
     `cell_tracking.build_cost_matrix` actually reads and leaves the rest `NaN`,
     for users who only want to track and never classify. The column set and
-    order are unchanged either way.
+    order are unchanged either way -- `Edge Distance` is filled in both modes,
+    since it costs one `min` over pixels already in hand.
+
+    **`exclude_edge_cells` no longer drops rows here (Round 26 B).** Every cell
+    gets a row and an `Edge Distance`; `exclude_edge_cells <= margin` is applied
+    by the consumers for which a truncated geometry is wrong -- morphometrics
+    and PCA/K-means -- and NOT by tracking, which reads only the centroid and
+    the mask. The parameter is kept so callers and stored settings stay valid,
+    and because which semantics a run used has to be recoverable afterwards; it
+    is recorded in `extract_settings.json` and in the tracking provenance. A
+    `True` here logs that it no longer filters rather than silently doing
+    nothing.
 
     Ported from `bio_extract_cell_info`, src/gui_main.py:956-1092.
     Returns `(cells_info, fig_num)` exactly as v1 did.
@@ -1318,6 +1420,13 @@ def extract_cell_info(
     # bounding-box change above, had become ~60% of total extraction time
     # (measured with cProfile on `AS_dorsal view_E-cad`) -- more than all the
     # image processing combined.
+    if exclude_edge_cells:
+        logger.info(
+            "exclude_edge_cells=True no longer drops rows at extraction (Round 26): every cell "
+            "gets a row and an 'Edge Distance' column, and the filter is applied by the "
+            "morphometric and PCA/K-means consumers instead. Tracking deliberately does not filter."
+        )
+
     row_index: list[str] = []
     row_values: list[np.ndarray] = []
     fig_num = 0
@@ -1453,24 +1562,32 @@ def extract_cell_info(
             # defined in.
             positions = (local[0] + y0, local[1] + x0)
 
-            if exclude_edge_cells:
-                # Tested on the FILLED mask, not on `positions` (which come
-                # from `outlines`). `thin_label_outlines` marks a pixel only
-                # where a 4-neighbour INSIDE the array carries a different
-                # label, so a cell running to the image border has no ring
-                # pixel along that border and its ring can sit many pixels
-                # inside the frame -- on `embryos_GBE_GAP43` the runaway
-                # background component's ring stopped 4-19 px short of every
-                # edge, so a `margin=3` test missed it in 21 of 31 frames.
-                # The filled mask has no such blind spot.
-                edge_source = fill_labels if fill_labels is not None else outlines
-                edge_positions = np.where(edge_source[y0:y1, x0:x1] == cell_id)
-                if edge_positions[0].size == 0:
-                    edge_positions = local
-                if is_edge_cell(
-                    (edge_positions[0] + y0, edge_positions[1] + x0), height, width, margin=3,
-                ):
-                    continue
+            # Measured for EVERY cell, and it no longer decides whether the cell
+            # gets a row (Round 26 B1). The exclusion is scientifically
+            # meaningful for morphometrics -- a truncated cell's geometry is
+            # wrong -- and meaningless for tracking, which reads only the
+            # centroid and the mask, both of which a border cell has intact.
+            # Applied here, per frame and on a bounding box, it flipped 136
+            # times over 85 frame pairs on `AS_LE_lateral view_E-cad`, and each
+            # flip orphaned a cell and started a new track
+            # (`docs/edge-flicker-diagnosis.md`). Filtering now happens where
+            # the geometry is actually used.
+            #
+            # Measured on the FILLED mask, not on `positions` (which come from
+            # `outlines`). `thin_label_outlines` marks a pixel only where a
+            # 4-neighbour INSIDE the array carries a different label, so a cell
+            # running to the image border has no ring pixel along that border
+            # and its ring can sit many pixels inside the frame -- on
+            # `embryos_GBE_GAP43` the runaway background component's ring
+            # stopped 4-19 px short of every edge, so a `margin=3` test missed
+            # it in 21 of 31 frames. The filled mask has no such blind spot.
+            edge_source = fill_labels if fill_labels is not None else outlines
+            edge_positions = np.where(edge_source[y0:y1, x0:x1] == cell_id)
+            if edge_positions[0].size == 0:
+                edge_positions = local
+            cell_edge_distance = edge_distance(
+                (edge_positions[0] + y0, edge_positions[1] + x0), height, width,
+            )
 
             if tracking_only:
                 # Only the four columns `cell_tracking.build_cost_matrix`
@@ -1493,6 +1610,7 @@ def extract_cell_info(
                     np.nan, ap, dv, ap / dv if dv != 0 else -1, np.nan, np.nan,
                     np.nan, np.nan, np.nan, np.nan, np.nan, np.nan,
                     cx, cy, np.min(positions[1]), np.max(positions[1]), np.nan,
+                    cell_edge_distance,
                 ]
                 # Rounded like the full path so the populated columns come out
                 # float64 rather than int64; without it the two modes produce
@@ -1575,6 +1693,7 @@ def extract_cell_info(
                 ratio_long_and_short_axes, cell_ellipse_angle,
                 min_enclosing_circle_radius, max_inner_circle_radius,
                 cx, cy, np.min(positions[1]), np.max(positions[1]), circularity,
+                cell_edge_distance,
             ]
             cell_info = np.round(cell_info, 2)
             row_index.append(f"Cell{fig_id}_{cell_id}")
@@ -1942,8 +2061,58 @@ if __name__ == "__main__":
     print("  identical to the intact file; a TIFF-convention strip on the image border")
     print("  (stored ring 60 of a 136 px contour) is left alone.")
 
+    # --- R26 B1: the edge test became a measurement.
+    # The predicate is a verbatim v1 port and stays, but it is now derived from
+    # the column, so the two cannot drift apart. Asserted over a grid rather
+    # than one case, because the far edges use `width - max_x` (one more than
+    # the geometric distance) and a hand-picked example would hide that.
+    for h, w in ((40, 60), (353, 422)):
+        for y0_, y1_, x0_, x1_ in ((0, 5, 0, 5), (3, 9, 10, 20), (4, 9, 10, 20),
+                                   (10, 20, w - 4, w - 1), (10, 20, 10, 20)):
+            pix = (np.array([y0_, y1_]), np.array([x0_, x1_]))
+            d = edge_distance(pix, h, w)
+            for margin in range(0, 7):
+                assert is_edge_cell(pix, h, w, margin=margin) == (d <= margin), (
+                    pix, h, w, margin, d)
+    print("\nR26: `is_edge_cell(..., margin)` == `edge_distance(...) <= margin` over a grid")
+    print("  of boxes and margins, so the column and the ported predicate cannot diverge.")
+
+    # The flicker itself: the same cell 3 px from the top in one frame and 4 px
+    # in the next. Both frames used to give it opposite fates -- excluded, then
+    # kept -- which minted an orphan and a new track. Now both get a row, and
+    # the distance says which side of any margin each one is on.
+    flicker = _tmp.mkdtemp()
+    for frame, top in ((1, 3), (2, 4)):
+        lab = np.zeros((60, 60), dtype=np.int32)
+        lab[top:30, 10:30] = 1          # bbox starts at row `top`
+        lab[40:50, 40:50] = 2           # an interior cell, far from every border
+        np.save(os.path.join(flicker, "f%04d_seg.npy" % frame),
+                {"masks": lab, "outlines": thin_label_outlines(lab)}, allow_pickle=True)
+    kept, _ = extract_cell_info(flicker, exclude_edge_cells=True)
+    assert list(kept.index) == ["Cell1_1", "Cell1_2", "Cell2_1", "Cell2_2"], list(kept.index)
+    assert kept.loc["Cell1_1", "Edge Distance"] == 3, kept.loc["Cell1_1", "Edge Distance"]
+    assert kept.loc["Cell2_1", "Edge Distance"] == 4, kept.loc["Cell2_1", "Edge Distance"]
+    # 11, not 10: rows 40-49 of a 60-row frame are 10 px clear of the bottom,
+    # and the far edges count `height - max_y` (see `edge_distance`). Asserted
+    # as 11 rather than quietly loosened -- the asymmetry is inherited from the
+    # v1 predicate this column has to agree with.
+    assert kept.loc["Cell1_2", "Edge Distance"] == 11, kept.loc["Cell1_2", "Edge Distance"]
+    # The old behaviour is still expressible, but now at the consumer's choice.
+    assert list(kept.index[kept["Edge Distance"] > 3]) == ["Cell1_2", "Cell2_1", "Cell2_2"]
+    tracking_rows, _ = extract_cell_info(flicker, tracking_only=True)
+    assert list(tracking_rows["Edge Distance"]) == [3, 11, 4, 11], list(tracking_rows["Edge Distance"])
+    print("R26: a cell 3 px from the border in frame 1 and 4 px in frame 2 keeps a row in")
+    print("  BOTH (it used to flip between dropped and kept, orphaning a cell each time);")
+    print("  the tracking-only path fills the column too.")
+
+    # B3: the new column must not reach any feature set.
+    assert CELLS_INFO_COLUMNS[-1] == "Edge Distance", CELLS_INFO_COLUMNS[-1]
+    assert "Edge Distance" not in ML_FEATURE_COLUMNS, "Edge Distance leaked into ML_FEATURE_COLUMNS"
+    print("  and it is the LAST column (positional writers) and in no feature set.")
+
     print("\nR24: Circularity/Fitted Ellipse Angle land in their named slots (C = 4*pi*A/P^2,")
-    print("  angle in 0-90, neighbours intact), and the 17-column sheet round-trips through")
+    print("  angle in 0-90, neighbours intact), and the %d-column sheet round-trips through"
+          % len(CELLS_INFO_COLUMNS))
     print("  load-existing and the leading-edge write-back with every column unchanged.")
 
     print("\nAll data_input self-tests passed.")

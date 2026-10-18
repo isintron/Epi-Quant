@@ -27,12 +27,18 @@ Cell Classification Results" window. This file covers two related things:
    `compute_leading_edge` below reproduces `update_image`'s (canonical,
    both-branch) semantics.
 
-   Reproduced bug-for-bug (NOT one of the 4 agreed fixes, deliberately left
-   as-is): in the "has matching points" branch, v1 assigns the *unsigned*
-   KDTree distance regardless of cluster_label — there is no sign
-   differentiation between the two compared clusters there, unlike the
-   sentinel fallback branch which IS explicitly signed (-1/+1). Flagged here
-   for your future consideration, not silently corrected.
+   FIXED (`signed=True`, the default; reproduced bug-for-bug before this):
+   v1 assigned the *unsigned* KDTree distance in the "has matching points"
+   branch regardless of cluster_label, while the sentinel fallback branch WAS
+   explicitly signed (-1/+1). The two branches therefore disagreed about what
+   the column means, and `cell_tracking.split_by_leading_edge` -- which splits
+   on the sign -- put every cell on the `> 0` side whenever a boundary was
+   found, silently collapsing two populations into one. The distance is now
+   negated for `cluster_pair[0]`, matching the sentinel convention, so the
+   column reads as a signed distance to the interface: negative on the
+   `cluster_pair[0]` side, positive on the `cluster_pair[1]` side, magnitude
+   in pixels. Pass `signed=False` to reproduce v1's exact numeric output --
+   the `src/` comparison harness is the only caller that should.
 
 N-cluster generalization: v1 (and this module until this change) hardcoded
 `cluster_label == 1` as "the large-cell / -1-sentinel side" and `== 0` as
@@ -125,6 +131,7 @@ def compute_leading_edge(
     clustering_data: pd.DataFrame,
     threshold: float = 3,
     cluster_pair: Optional[tuple[int, int]] = None,
+    signed: bool = True,
 ) -> pd.DataFrame:
     """Compute (or recompute) the `leading_edge` column for every cell in
     `frame_number`, given the frame's labeled segmentation mask `outlines`
@@ -155,7 +162,19 @@ def compute_leading_edge(
 
     See module docstring for the exact semantics ported (from
     `update_image`, the canonical batch-computation path) and the
-    deliberately-unfixed unsigned-distance quirk.
+    now-fixed unsigned-distance quirk (see `signed=`).
+
+    COVERAGE CAVEAT: the distance is measured to the contour points where the
+    two clusters come within `threshold` px of each other, so it exists only
+    where the two populations actually touch in the segmentation. Measured on
+    `AS_LE_lateral view_E-cad`: 26-28% of image columns carry a background gap
+    wider than 2 px between amnioserosa and epidermis (up to 56-97 px), and
+    15-23% of columns hold no amnioserosa label at all. Cells sitting on the
+    physical leading edge in those columns get no matching point and no
+    meaningful distance. When the question is "which cells are the front row",
+    use `leading_edge.front_row_cells`, which is defined from the epidermal
+    front itself and needs neither population to touch nor the other
+    population to be segmented at all.
     """
     unique_labels = set(clustering_data["Cluster_Label"].unique())
 
@@ -218,6 +237,8 @@ def compute_leading_edge(
             center_x = int(np.mean(cell_positions[1]))
             cell_center = np.array([center_y, center_x])
             distance, _ = tree.query(cell_center)
+            if signed and cluster_label == large_label:
+                distance = -distance
             cells_info.at[index, "leading_edge"] = distance
     else:
         for index, row in cells_info.iterrows():
@@ -261,6 +282,21 @@ def find_boundary_cells(
     `cluster_pair` resolution mirrors `compute_leading_edge`'s exactly (only
     auto-resolves for a 2-cluster `clustering_data`, else pass explicitly;
     same `ValueError`s).
+
+    BLIND SPOT -- read before using this as "the front row". The test is
+    contour proximity, so a cell only qualifies if the other cluster is
+    segmented right next to it. Measured on `AS_LE_lateral view_E-cad`:
+    26-28% of columns carry a background gap wider than `threshold` between
+    the two populations (up to 56-97 px), and 15-23% of columns hold no
+    amnioserosa label at all, beyond the lateral ends of its patch. On frame
+    30 this put ~30% of the cells within three rows of the edge in the wrong
+    row when neighbour rings were seeded from the result. That is not a
+    threshold to raise -- the gaps are an order of magnitude wider than any
+    workable `threshold`. For "which cells are the front row", use
+    `leading_edge.front_row_cells` / `leading_edge.assign_rows`, which read
+    the front population's own dorsal contour and never touch the other
+    cluster. This function stays as the answer to the narrower question it
+    actually asks: which cells physically abut the other cluster.
     """
     unique_labels = set(clustering_data["Cluster_Label"].unique())
     if cluster_pair is None:

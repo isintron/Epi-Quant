@@ -123,7 +123,8 @@ def environment_scores(
     graph_other: Mapping[int, Set[int]],
     label_to_track_current: Mapping[int, int],
     label_to_track_other: Mapping[int, int],
-) -> Dict[int, float]:
+    with_unscoreable: bool = False,
+):
     """How much each cell's *neighborhood* changed between two frames, as a
     Dice/Sorensen coefficient over its neighbor sets:
     `2*|A intersect B| / (|A| + |B|)`, in `[0, 1]`. Returns
@@ -161,18 +162,33 @@ def environment_scores(
       when its track has no cell in the compared frame, or when neither side
       retains a comparable neighbor. EPySeg scores all of these `0`, which
       conflates "brand-new cell" with "environment completely changed"; the
-      caller can render an absent key distinctly instead.
+      caller can render an absent key distinctly instead. **Pass
+      `with_unscoreable=True` to get `(scores, unscoreable)` instead of just
+      `scores`** -- without it, "this cell scored nothing" and "this cell was
+      never looked at" are the same absence, and a UI cannot tell the user how
+      many cells its number is NOT about (Round 28 C3).
+
+      **Degenerate case, and it is the subject of Round 28:** the Dice
+      coefficient over SMALL sets saturates -- two cells each retaining one
+      comparable neighbour, the same one, score `2*1/2 = 1.0`. So anything
+      that shrinks the neighbour sets (an untracked neighbour; a stale graph
+      built on labels the masks no longer use) pushes scores UP, while the
+      worst cases leave the result entirely rather than scoring 0. Report the
+      share of exact 1.0s and the unscoreable count beside any median, or the
+      median looks healthiest exactly when the inputs are broken.
     - No thresholding happens here. TA treats `>= 0.75` as fine and `<= 0.5`
       as worth examining, but that is a display/triage concern, so raw
       scores are returned.
     """
     track_to_label_other = {track: label for label, track in label_to_track_other.items()}
     scores: Dict[int, float] = {}
+    unscoreable: Dict[int, str] = {}
 
     for label, track in label_to_track_current.items():
         other_label = track_to_label_other.get(track)
         if other_label is None:
-            continue  # this track has no cell in the compared frame
+            unscoreable[label] = "no cell in the compared frame"
+            continue
 
         current_neighbor_tracks = {
             label_to_track_current[n] for n in graph_current.get(label, set())
@@ -185,12 +201,16 @@ def environment_scores(
 
         total = len(current_neighbor_tracks) + len(other_neighbor_tracks)
         if total == 0:
-            continue  # nothing comparable on either side
+            # The WORST case, and it leaves the result rather than scoring 0,
+            # so it cannot pull a median down -- which is exactly why it has to
+            # be counted separately.
+            unscoreable[label] = "no comparable neighbour on either side"
+            continue
 
         shared = len(current_neighbor_tracks & other_neighbor_tracks)
         scores[label] = (2.0 * shared) / total
 
-    return scores
+    return (scores, unscoreable) if with_unscoreable else scores
 
 
 if __name__ == "__main__":

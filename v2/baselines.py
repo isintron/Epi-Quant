@@ -316,6 +316,11 @@ def regenerate(dataset_dir: str, npy_folder: Optional[str] = None, **overrides) 
         # the filter on is indistinguishable from one produced with it off
         # unless the threshold is recorded (Round 21 A2).
         "min_cell_area_px": data_input.get_min_cell_area(),
+        # Round 26: the same movie yields a different row set -- and therefore
+        # different tracks -- depending on whether border cells were dropped at
+        # extraction (before Round 26) or only filtered in analysis (after it).
+        # A table that does not say which cannot be compared with one that does.
+        "exclude_edge_cells": data_input.get_edge_exclusion(),
         "mask_source": os.path.join(dataset_dir, "masks"),
         "parameters": {k: (list(v) if isinstance(v, (list, tuple)) else v)
                        for k, v in parameters.items()},

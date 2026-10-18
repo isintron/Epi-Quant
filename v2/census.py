@@ -177,7 +177,8 @@ def geometry_flagged_items(
 # The sets a queue can be drawn from. `frame_pair` is the only one that gives
 # an unbiased rate; the other two are chosen BY a criterion, so a rate computed
 # over them is a rate over that criterion's blind spots.
-SOURCES = ("geometry_flagged", "frame_pair", "environment_flagged")
+SOURCES = ("geometry_flagged", "frame_pair", "environment_flagged",
+           "forward_backward", "low_margin")
 UNBIASED_SOURCES = ("frame_pair",)
 
 
@@ -227,6 +228,119 @@ def environment_flagged_items(
                 "environment_score": round(score, 3),
                 "source": "environment_flagged",
             })
+    return items
+
+
+def forward_backward_items(
+    tracking_data: pd.DataFrame,
+    cells_info: pd.DataFrame,
+    masks_by_frame: Mapping[int, np.ndarray],
+    drift_mode: str = "none",
+    drift_by_frame: Optional[Mapping[int, tuple]] = None,
+    **cost_kwargs,
+) -> list:
+    """Links the reverse solve does not agree with: forward says a->b, the
+    transposed problem does not say b->a.
+
+    **Not trivially satisfied.** The cost is asymmetric by construction -- the
+    displacement gate and the overlap term's `max(H, V)` bridge both come from
+    the ROW cell -- so swapping the frames (and negating the drift) re-solves a
+    genuinely different problem rather than reading the same answer back.
+
+    **Degenerate case, and it is shared.** A systematically wrong but
+    self-consistent assignment passes in both directions -- shift every
+    identity one step the same way and nothing here fires. That is the SAME
+    blind spot as `environment_dice`, so this queue and `environment_flagged`
+    are **not two independent lines of evidence**. `summarise` already refuses
+    to pool across sources; this is the reason it must keep refusing.
+
+    Reuses `tracking_benchmark._solve_pairs`, which is what
+    `forward_backward_consistency` reports its 1.98 / 1.05 / 0.22% from. A
+    second implementation here would quietly make those three numbers describe
+    something other than this queue.
+    """
+    forward = tracking_benchmark._solve_pairs(
+        cells_info, masks_by_frame, drift_mode=drift_mode,
+        drift_by_frame=drift_by_frame, **cost_kwargs)
+    backward = tracking_benchmark._solve_pairs(
+        cells_info, masks_by_frame, drift_mode=drift_mode,
+        drift_by_frame=drift_by_frame, reverse=True, **cost_kwargs)
+    items = []
+    for frame in sorted(forward):
+        if frame not in masks_by_frame or frame + 1 not in masks_by_frame:
+            continue
+        back = backward.get(frame, {})
+        here = tracking_benchmark.label_to_track(tracking_data, frame)
+        there = tracking_benchmark.label_to_track(tracking_data, frame + 1)
+        inverse = {track: label for label, track in there.items()}
+        centres = _centroids(masks_by_frame[frame])
+        flagged = [(int(a), int(b)) for a, b in forward[frame].items() if back.get(b) != a]
+        flagged.sort(key=lambda pair: (round(centres.get(pair[0], (0.0, 0.0))[1] / 50.0),
+                                       centres.get(pair[0], (0.0, 0.0))[0]))
+        for label, forward_pick in flagged:
+            track = here.get(label)
+            items.append({
+                "frame": frame, "label": label,
+                "track_id": None if track is None else int(track),
+                "tracker_label": inverse.get(track),
+                "reference_label": None, "reference_iou": None, "tracker_iou": None,
+                # What the forward solve said, for the record. NOT a reference:
+                # it is the same cost function, solved one way round.
+                "forward_label": forward_pick,
+                "source": "forward_backward",
+            })
+    return items
+
+
+def low_margin_items(
+    tracking_data: pd.DataFrame,
+    cells_info: pd.DataFrame,
+    masks_by_frame: Mapping[int, np.ndarray],
+    limit: Optional[int] = None,
+    drift_mode: str = "none",
+    drift_by_frame: Optional[Mapping[int, tuple]] = None,
+    **cost_kwargs,
+) -> list:
+    """Assigned links ordered by the solver's own confidence: the gap between
+    the second-smallest and smallest finite cost in that row, smallest first.
+
+    Free and reference-free -- the number is already inside the cost matrix.
+
+    **Degenerate case:** it rewards any cost that merely spreads its values
+    out, and it lives in the cost's own units, so margins are comparable only
+    within one cost scale. A queue built under one `cost_form` cannot be
+    compared with one built under another.
+
+    Ordered by margin rather than in raster order, unlike every other set
+    here: the point of this queue is "least sure first", and that ordering is
+    the whole selection criterion.
+    """
+    margins = tracking_benchmark._solve_pairs(
+        cells_info, masks_by_frame, drift_mode=drift_mode,
+        drift_by_frame=drift_by_frame, want_margins=True, **cost_kwargs)
+    ranked = []
+    for frame in sorted(margins):
+        if frame not in masks_by_frame or frame + 1 not in masks_by_frame:
+            continue
+        for label, margin in margins[frame].items():
+            ranked.append((float(margin), int(frame), int(label)))
+    ranked.sort()
+    if limit is not None:
+        ranked = ranked[:int(limit)]
+    items = []
+    for margin, frame, label in ranked:
+        here = tracking_benchmark.label_to_track(tracking_data, frame)
+        there = tracking_benchmark.label_to_track(tracking_data, frame + 1)
+        inverse = {track: lab for lab, track in there.items()}
+        track = here.get(label)
+        items.append({
+            "frame": frame, "label": label,
+            "track_id": None if track is None else int(track),
+            "tracker_label": inverse.get(track),
+            "reference_label": None, "reference_iou": None, "tracker_iou": None,
+            "assignment_margin": round(margin, 3),
+            "source": "low_margin",
+        })
     return items
 
 
@@ -367,6 +481,80 @@ GT_FOLDER_NAME = "GT_All_cell_tracking"
 GT_TABLE_NAME = "GT_All_cell_merged_tracking_results.xlsx"
 GT_PROVENANCE_NAME = "provenance.json"
 GT_SESSION_CSV = "ground_truth_links.csv"
+
+
+# --- Track-level visual inspection (Round 27 4b) ---------------------------
+#
+# A DIFFERENT kind of evidence from everything above, and kept in a different
+# file for that reason. The census judges one LINK at a time; this records a
+# human watching a whole track play and saying "that cell, in that frame, is
+# wrong". "I watched this track" and "I judged this link" cannot be pooled into
+# one rate, and `summarise` already refuses to pool across sources -- putting
+# these rows in their own file means the question cannot even be asked by
+# accident.
+#
+# What is recorded is a CELL, not a track: `(track_id, frame, cell_index)`. A
+# track marked wrong says only that something in it is wrong; a cell marked
+# wrong says where. One track may be marked many times.
+INSPECTION_FIELDS = (
+    "session_id", "labeller", "track_id", "frame", "cell_index",
+    "ms_elapsed", "source", "timestamp_utc",
+)
+INSPECTION_TABLE_NAME = "track_inspection.csv"
+
+
+def inspection_path(cell_track_output: str) -> str:
+    return os.path.join(gt_dir(cell_track_output), INSPECTION_TABLE_NAME)
+
+
+def append_inspection_mark(path: str, session_id: str, track_id: int, frame: int,
+                           cell_index: str, ms_elapsed: float = 0.0,
+                           labeller: str = "") -> dict:
+    """One marked cell. Appends; the header is written once."""
+    row = {
+        "session_id": session_id,
+        "labeller": labeller,
+        "track_id": int(track_id),
+        "frame": int(frame),
+        "cell_index": str(cell_index),
+        "ms_elapsed": round(float(ms_elapsed), 1),
+        "source": "track_inspection",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+    }
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=INSPECTION_FIELDS)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+    return row
+
+
+def read_inspection(path: str) -> list:
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def summarise_inspection(path: str, session_id: Optional[str] = None) -> dict:
+    """Marks, and how they are spread over tracks. Not a rate: the denominator
+    (how many tracks were inspected) is known only to the session that ran, so
+    it is passed in by the caller and stamped into the provenance instead."""
+    rows = [r for r in read_inspection(path)
+            if session_id is None or r["session_id"] == session_id]
+    by_track: dict = {}
+    for row in rows:
+        by_track.setdefault(int(row["track_id"]), []).append(row)
+    return {
+        "marks": len(rows),
+        "tracks_with_marks": len(by_track),
+        "marks_by_track": {track: len(v) for track, v in sorted(by_track.items())},
+        "cells": [r["cell_index"] for r in rows],
+    }
 
 
 def gt_dir(cell_track_output: str) -> str:

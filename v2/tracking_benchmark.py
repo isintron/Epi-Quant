@@ -523,7 +523,7 @@ def assignment_margin(
         return {"judge": "assignment_margin", "error": "needs cells_info and masks"}
     margins = _solve_pairs(cells_info, masks_by_frame, drift_mode=drift_mode,
                            drift_by_frame=drift_by_frame, want_margins=True, **cost_kwargs)
-    values = [m for frame in margins.values() for m in frame]
+    values = [m for frame in margins.values() for m in frame.values()]
     return {
         "judge": "assignment_margin",
         "median_margin": float(np.median(values)) if values else float("nan"),
@@ -547,7 +547,14 @@ def _solve_pairs(
     **_unused,
 ) -> dict:
     """Solve every frame pair independently; return `{frame: {a: b}}` (raw
-    labels) or, with `want_margins`, `{frame: [margin, ...]}`.
+    labels) or, with `want_margins`, `{frame: {row_label: margin}}`.
+
+    The margins are keyed by their row label rather than returned as a bare
+    list so one implementation serves both consumers: `assignment_margin`
+    takes the median over the values, and `census.low_margin_items` needs to
+    know WHICH link each margin belongs to in order to queue it. Two
+    implementations would be two numbers for the same quantity, and the
+    published ones (11.40 / 21.65 / 31.96 px) would stop meaning anything.
 
     `drift_mode` is deliberately three-way rather than a boolean, because the
     two ways of using the same measured drift are NOT the same experiment:
@@ -621,12 +628,12 @@ def _solve_pairs(
         if want_margins:
             values = cost.to_numpy(dtype=float)
             row_of = {index: i for i, index in enumerate(cost.index)}
-            frame_margins = []
+            frame_margins = {}
             for cell in matched["frame1_cell"]:
                 row = values[row_of[cell]]
                 finite = np.sort(row[np.isfinite(row)])
                 if finite.size >= 2:
-                    frame_margins.append(float(finite[1] - finite[0]))
+                    frame_margins[_raw_label(cell)] = float(finite[1] - finite[0])
             out[frame] = frame_margins
         else:
             out[frame] = {_raw_label(x): _raw_label(y)

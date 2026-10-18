@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import statistics
 import sys
 import threading
 from typing import Optional, Union
@@ -50,11 +51,13 @@ import webview
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import adjacency
+import baselines
 import cell_tracking
 import census
 import common
 import coverage_log
 import data_input
+import efd
 import manual_correction_classification
 import manual_correction_tracking
 import pca_kmeans
@@ -174,6 +177,23 @@ class EpiQuantAPI:
         # byte-identical to the published baseline. Turning it on changes track
         # counts and therefore cell-loss %.
         self.max_frame_gap: int = 0
+        # Round 26 B2. The same checkbox, a different meaning: it no longer
+        # drops rows at Extract, it filters the consumers whose quantities a
+        # truncated cell corrupts (morphometrics, PCA/K-means). Tracking never
+        # filters -- a border cell's centroid and mask are intact, and letting
+        # a per-frame bounding-box test decide membership is what minted 136
+        # orphans over 85 frame pairs on `AS_LE_lateral view_E-cad`.
+        # Persisted with the project and stamped into tracking provenance,
+        # because which semantics produced a given table has to be recoverable.
+        # The value itself lives in `data_input` (module state, like the
+        # minimum cell area) so the consumers and the provenance writers read
+        # one answer rather than this object's copy of it; the property below
+        # is a view onto it.
+        data_input.set_edge_exclusion(False)
+        # How many of the least-confident links the `low_margin` set offers.
+        # Every assigned link has a margin, so without a cap this set is the
+        # whole movie ordered differently -- which is a report, not a queue.
+        self.low_margin_queue_limit: int = 200
         # Environment-score dead band. At or above this the cell is drawn
         # untinted rather than "slightly dark". Tissue Analyzer's own
         # sensitivity (`take_decision`, 0.75); below it a second, lower tier
@@ -248,10 +268,19 @@ class EpiQuantAPI:
         self._confirmed_event_keys: set = set()
         self._rejected_event_keys: set = set()
         self._geometry_lookup: Optional[dict] = None
+        self._extracted_label_cache: Optional[dict] = None
         self._margin_cache: dict = {}
 
         self.matched_color = "#ffd633"
         self.unmatched_color = "#3388ff"
+        # Round 26 C. A cell with no `Cells_info` row is not an unmatched cell:
+        # no correction can attach it, because there is nothing to attach. It
+        # used to render in `unmatched_color` like a genuine LAP miss, which is
+        # what sent a maintainer hunting for a LAP bug whose cause was the edge
+        # filter. Magenta: it has to separate from the yellow/blue pair AND from
+        # the greyscale membrane image, and it should read as "not a grade" --
+        # this is a category, not a worse kind of unmatched.
+        self.unextracted_color = "#ff00ff"
         self.highlight_color = "#ff3333"
         self.border_color = "#ff00ff"
         self.lifecycle_colors = {"lost": "#ff3b30", "new": "#34c759", "both": "#ffffff"}
@@ -340,11 +369,8 @@ class EpiQuantAPI:
     def set_project(self, mask_folder: str, image_folder: str, output_base_dir: str) -> dict:
         self.mask_folder = mask_folder
         self.image_folder = image_folder
-        self._neighbor_graph_cache.clear()  # graphs belong to the old project's masks
-        self._raw_image_cache.clear()
-        self._qc_display_cache.clear()
-        self._margin_cache.clear()
-        self._geometry_lookup = None
+        # Everything cached belongs to the old project's masks.
+        self._invalidate_frame_caches(reason="new project")
         self._junction_min_px = None
         self._junction_min_px_auto = None
         self.output_dirs = common.setup_output_dirs(output_base_dir)
@@ -357,6 +383,67 @@ class EpiQuantAPI:
         restored = self._load_project_settings()
         return {"format": fmt, "output_dirs": self.output_dirs, "settings": restored}
 
+    @property
+    def exclude_edge_cells(self) -> bool:
+        return data_input.get_edge_exclusion()
+
+    @exclude_edge_cells.setter
+    def exclude_edge_cells(self, enabled: bool) -> None:
+        data_input.set_edge_exclusion(enabled)
+
+    def _invalidate_frame_caches(self, frames=None, reason: str = "") -> list:
+        """**The one place a mask change is announced.** Every cache derived
+        from the segmentation is dropped here, and every path that can change
+        what a mask loader returns calls this rather than clearing whatever it
+        happens to remember.
+
+        Round 28 is why. `_neighbor_graph_cache` was cleared in exactly two
+        places -- changing project, and changing the T1 thresholds -- and was
+        documented as needing no invalidation because "the frame's
+        `fill_labels` geometry never changes once a project is loaded". A
+        segmentation correction breaks that sentence, and nothing noticed: the
+        graph stayed keyed to labels the masks no longer used, and the
+        environment score built on it disagreed with the same score after a
+        restart on all three movies. A per-call-site `clear()` would have fixed
+        the one path that was looked at and left the next one to be found the
+        same way.
+
+        `frames=None` means "everything". Per-frame caches can be dropped
+        frame-by-frame; the ones that POOL across frames (the hysteresis chain,
+        the QC display windows fitted from one frame for all, the registration
+        decision measured over the whole movie, and the two `cells_info`
+        lookups) cannot, so they go entirely whatever `frames` says.
+        """
+        per_frame = {
+            "neighbor_graph": self._neighbor_graph_cache,
+            "raw_image": self._raw_image_cache,
+            "margin": self._margin_cache,
+            "border_cells": self._border_cell_cache,
+        }
+        dropped = []
+        for name, cache in per_frame.items():
+            if frames is None:
+                if cache:
+                    dropped.append(f"{name} (all {len(cache)})")
+                cache.clear()
+            else:
+                hit = [f for f in (int(x) for x in frames) if f in cache]
+                for frame in hit:
+                    cache.pop(frame, None)
+                if hit:
+                    dropped.append(f"{name} {hit}")
+        if self._hysteresis_cache:
+            dropped.append("hysteresis (pools across frames)")
+        self._hysteresis_cache.clear()
+        self._qc_display_cache.clear()
+        self._registration_cache = None
+        self._geometry_lookup = None
+        self._extracted_label_cache = None
+        if dropped:
+            logger.info("invalidated mask-derived caches%s: %s",
+                        f" ({reason})" if reason else "", "; ".join(dropped))
+        return dropped
+
     def _settings_path(self) -> Optional[str]:
         if not self.output_dirs:
             return None
@@ -368,16 +455,20 @@ class EpiQuantAPI:
         path = self._settings_path()
         if not path or not os.path.exists(path):
             data_input.set_min_cell_area(0)
-            return {"min_cell_area_px": 0, "restored": False}
+            return {"min_cell_area_px": 0, "restored": False,
+                    "exclude_edge_cells": self.exclude_edge_cells}
         try:
             with open(path, encoding="utf-8") as handle:
                 stored = json.load(handle)
         except (OSError, ValueError) as error:
             logger.warning("could not read %s: %s", path, error)
-            return {"min_cell_area_px": data_input.get_min_cell_area(), "restored": False}
+            return {"min_cell_area_px": data_input.get_min_cell_area(), "restored": False,
+                    "exclude_edge_cells": self.exclude_edge_cells}
         area = int(stored.get("min_cell_area_px", 0) or 0)
         data_input.set_min_cell_area(area)
-        return {"min_cell_area_px": area, "restored": True}
+        self.exclude_edge_cells = bool(stored.get("exclude_edge_cells", False))
+        return {"min_cell_area_px": area, "restored": True,
+                "exclude_edge_cells": self.exclude_edge_cells}
 
     def _save_project_settings(self) -> None:
         path = self._settings_path()
@@ -386,7 +477,8 @@ class EpiQuantAPI:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
-                json.dump({"min_cell_area_px": data_input.get_min_cell_area()},
+                json.dump({"min_cell_area_px": data_input.get_min_cell_area(),
+                           "exclude_edge_cells": bool(self.exclude_edge_cells)},
                           handle, indent=2, sort_keys=True)
                 handle.write("\n")
         except OSError as error:
@@ -435,7 +527,10 @@ class EpiQuantAPI:
         self.npy_folder = data_input.prepare_segmentation_folder(self.mask_folder, image_folder=self.image_folder)
         path = os.path.join(self.output_dirs["cell_classification_output"], "Cells_info.xlsx")
         self.cells_info = pd.read_excel(path, sheet_name="Cell")
-        self._geometry_lookup = None
+        # On a TIFF project this call just reconverted `npy_converted/` from
+        # the TIFFs, so the masks may differ from the ones anything was cached
+        # from.
+        self._invalidate_frame_caches(reason="loaded existing extraction")
         return {"frame_count": self.get_frame_count(), "cell_count": len(self.cells_info)}
 
     def load_existing_classification(self) -> dict:
@@ -495,6 +590,10 @@ class EpiQuantAPI:
         matters is that *every* consumer sees the same labels.
         """
         data_input.set_min_cell_area(area_px)
+        # Not a mask edit, but it changes the label set every loader returns,
+        # which is the same thing as far as anything cached from one is
+        # concerned.
+        self._invalidate_frame_caches(reason="minimum cell area changed")
         self._save_project_settings()
         return {"min_cell_area_px": data_input.get_min_cell_area(),
                 "suggested": data_input.SUGGESTED_MIN_CELL_AREA_PX}
@@ -537,6 +636,11 @@ class EpiQuantAPI:
 
     def _run_extraction(self, mask_type: str, background_area_ratio: float, exclude_edge_cells: bool) -> None:
         try:
+            # Kept as a project setting rather than consumed here: since Round
+            # 26 extraction writes every row and an `Edge Distance`, and this
+            # flag decides whether the ANALYSIS steps filter on it.
+            self.exclude_edge_cells = bool(exclude_edge_cells)
+            self._save_project_settings()
             self.npy_folder = data_input.prepare_segmentation_folder(
                 self.mask_folder,
                 image_folder=self.image_folder,
@@ -551,7 +655,9 @@ class EpiQuantAPI:
                 progress_cb=self._progress_cb("extract"),
             )
             self.cells_info = cells_info.reset_index()
-            self._geometry_lookup = None  # rebuilt lazily from the new table
+            # Extraction has just read the masks off disk; anything cached from
+            # a previous read of them may predate a correction made since.
+            self._invalidate_frame_caches(reason="extraction")
             self._notify("onExtractDone", {"frame_count": frame_count, "cell_count": len(self.cells_info)})
         except Exception as e:
             logger.exception("Extraction failed")
@@ -849,6 +955,25 @@ class EpiQuantAPI:
                 for idx, row in info.iterrows()
             }
         return self._geometry_lookup.get(cell_index)
+
+    def _extracted_labels(self, frame_number: int) -> Optional[set]:
+        """Raw labels that have a `Cells_info` row in `frame_number`.
+
+        `None` when there is no table at all, which `render_tracking_overlay`
+        reads as "cannot tell the two kinds of unmatched apart" and renders the
+        way it always did -- rather than claiming every cell is unextracted.
+        Cached alongside the geometry lookup and cleared with it.
+        """
+        if self.cells_info is None:
+            return None
+        if self._extracted_label_cache is None:
+            self._extracted_label_cache = {}
+            for index in self.cells_info["Cell Index"].astype(str):
+                match = re.match(r"Cell(\d+)_(\d+)$", index)
+                if match:
+                    self._extracted_label_cache.setdefault(
+                        int(match.group(1)), set()).add(int(match.group(2)))
+        return self._extracted_label_cache.get(int(frame_number), set())
 
     def _margin_labels(self, frame_number: int) -> set:
         """Labels touching the image border in `frame_number`, cached.
@@ -1600,6 +1725,16 @@ class EpiQuantAPI:
             )
 
         joined = self._joined_features()
+        if self.exclude_edge_cells:
+            # PCA/K-means run on geometry, and a cell the field of view cut in
+            # half has the wrong geometry -- so this is exactly the consumer the
+            # exclusion exists for. Applied here rather than at extraction so
+            # the same table can be tracked unfiltered (Round 26 B2).
+            before = len(joined)
+            joined = data_input.drop_edge_cells(joined)
+            logger.info("exclude_edge_cells: %d of %d cell(s) are within %d px of the border "
+                        "and are left out of the feature matrix",
+                        before - len(joined), before, data_input.DEFAULT_EDGE_MARGIN_PX)
 
         if "efd" in families:
             # Exclusive by construction: an orthogonal basis is taken whole, and
@@ -1613,7 +1748,14 @@ class EpiQuantAPI:
                     "EFD needs the raw Fourier coefficients. Re-run shape extraction with "
                     "'Raw elliptic-Fourier coefficients' enabled."
                 )
-            columns = [c for c in joined.columns if str(c).startswith("efd_")]
+            efd_order = sum(str(c).startswith("efd_") for c in joined.columns) // 4
+            columns = pca_kmeans.efd_preset(efd_order)
+            missing = [c for c in columns if c not in joined.columns]
+            if missing or efd_order == 0:
+                raise ValueError(
+                    f"The elliptic-Fourier table is incomplete ({len(missing)} of {len(columns)} "
+                    "coefficient columns missing). Re-run shape extraction."
+                )
             standardize_mode = pca_kmeans.FEATURE_FAMILIES["efd"]["standardize"]
         else:
             columns = list(selected_features) if selected_features else pca_kmeans.family_columns(families)
@@ -1644,6 +1786,19 @@ class EpiQuantAPI:
         sentinel_columns = [c for c in columns if c in data_input.CELLS_INFO_COLUMNS]
         if sentinel_columns:
             frame[sentinel_columns] = frame[sentinel_columns].mask(frame[sentinel_columns] == -1)
+        if "efd" in families:
+            # The table holds the RAW coefficients, which change with the cell's
+            # size, its orientation in the image, the traversal direction and
+            # wherever the tracer began the contour. PCA must see the
+            # normalized shape (`efd.efd_features`), never the raw columns:
+            # on the WT/tmc/pyd pickles, raw-coefficient PC1-3 were mixtures of
+            # size (|r| = 0.91 with PC2) and contour start phase, not shape.
+            complete = frame.dropna()
+            normalized = efd.efd_features(complete.to_numpy(dtype=float).reshape(-1, efd_order, 4))
+            frame = pd.DataFrame(
+                np.atleast_2d(normalized), index=complete.index,
+                columns=efd.efd_feature_names(efd_order),
+            ).reindex(frame.index)
         before = len(frame)
         frame = frame.dropna()
         if frame.empty:
@@ -2076,7 +2231,11 @@ class EpiQuantAPI:
         self.cells_info = splice(self.cells_info, fresh_info)
         self.cells_info.to_excel(os.path.join(folder, "Cells_info.xlsx"),
                                  sheet_name="Cell", index=False)
-        self._geometry_lookup = None
+        # The masks for these frames have just been re-read, which is the whole
+        # reason this function exists -- so everything cached from the old ones
+        # goes. This is the path a re-track takes (Round 28 C1).
+        report["caches_dropped"] = self._invalidate_frame_caches(
+            frames=frames, reason=f"re-extracted frames {frames}")
         report["recomputed"].append("geometry")
 
         present = self._computed_feature_families()
@@ -2185,9 +2344,12 @@ class EpiQuantAPI:
             logger.exception("Local re-track failed")
             self._notify("onRetrackError", {"message": str(e)})
 
-    def set_track_colors(self, matched_color: str, unmatched_color: str) -> None:
+    def set_track_colors(self, matched_color: str, unmatched_color: str,
+                         unextracted_color: str = None) -> None:
         self.matched_color = matched_color
         self.unmatched_color = unmatched_color
+        if unextracted_color:
+            self.unextracted_color = unextracted_color
 
     def set_dynamics_colors(self, division: str, delamination: str, t1: str) -> None:
         self.dynamics_colors = {"division": division, "delamination": delamination, "t1": t1}
@@ -2282,9 +2444,10 @@ class EpiQuantAPI:
         scoring <= 0.5 and skips perfect ones outright
         (`optimize_score`: `if current_score >= 1.0: continue`).
         """
-        scores = self._environment_scores(frame_number, direction)
+        scores, unscoreable = self._environment_scores(frame_number, direction, True)
         if not scores:
-            return {"candidates": [], "threshold": float(self.environment_repair_threshold)}
+            return {"candidates": [], "threshold": float(self.environment_repair_threshold),
+                    "unscoreable": len(unscoreable)}
         worst = sorted(
             ((int(label), float(value)) for label, value in scores.items()
              if value <= self.environment_repair_threshold),
@@ -2295,6 +2458,12 @@ class EpiQuantAPI:
             "threshold": float(self.environment_repair_threshold),
             "flagged_total": int(sum(1 for v in scores.values() if v < self.environment_dead_band)),
             "n": len(scores),
+            # Cells that could not be scored at all. Omitted from `scores`
+            # rather than scored 0, so without this they are invisible and
+            # indistinguishable from cells that simply scored well -- the same
+            # "two different kinds of nothing, drawn the same" as Round 26 C.
+            "unscoreable": len(unscoreable),
+            "perfect": int(sum(1 for v in scores.values() if v >= 1.0)),
         }
 
     # --- Docked frame stepper (Round 16 E) -----------------------------------
@@ -2518,6 +2687,23 @@ class EpiQuantAPI:
             items = census.environment_flagged_items(
                 self.tracking_data, scores, masks,
                 threshold=float(self.environment_repair_threshold))
+        elif kind in ("forward_backward", "low_margin"):
+            # Both re-solve the frame pairs, so both need the feature table and
+            # the SAME cost the tracking ran under -- a queue built with a
+            # different cost would be a queue for a different tracker. The
+            # convention follows the run, like every other set here.
+            if self.cells_info is None:
+                return {"error": "Extract the movie before building this set."}
+            info = self.cells_info.set_index("Cell Index")
+            cost = {"overlap_weight": self.overlap_weight,
+                    "centroid_weight": self.centroid_weight,
+                    "drift_mode": run_mode,
+                    "drift_by_frame": drift}
+            if kind == "forward_backward":
+                items = census.forward_backward_items(self.tracking_data, info, masks, **cost)
+            else:
+                items = census.low_margin_items(self.tracking_data, info, masks,
+                                                limit=self.low_margin_queue_limit, **cost)
         else:
             return {"error": f"Unknown census kind {kind!r}."}
         if not items:
@@ -2594,6 +2780,12 @@ class EpiQuantAPI:
                 "motion_compensation": self.motion_compensation,
                 "max_frame_gap": self.max_frame_gap,
                 "drift_mode": self.drift_mode,
+                # Which row set the tracking saw (Round 26 B2): since the
+                # border exclusion moved off the extraction path, a table
+                # produced under the old semantics has fewer cells per frame
+                # than one produced under the new, and nothing else records it.
+                "exclude_edge_cells": self.exclude_edge_cells,
+                "edge_margin_px": data_input.DEFAULT_EDGE_MARGIN_PX,
             },
         }
         try:
@@ -3560,6 +3752,12 @@ class EpiQuantAPI:
                 "motion_compensation": self.motion_compensation,
                 "max_frame_gap": self.max_frame_gap,
                 "drift_mode": self.drift_mode,
+                # Which row set the tracking saw (Round 26 B2): since the
+                # border exclusion moved off the extraction path, a table
+                # produced under the old semantics has fewer cells per frame
+                # than one produced under the new, and nothing else records it.
+                "exclude_edge_cells": self.exclude_edge_cells,
+                "edge_margin_px": data_input.DEFAULT_EDGE_MARGIN_PX,
             },
             resolved_inputs={"mask_folder": self.mask_folder, "npy_folder": self.npy_folder,
                              "image_folder": self.image_folder},
@@ -3672,7 +3870,8 @@ class EpiQuantAPI:
                 mapping.setdefault(int(match.group(1)), int(row[id_col]))
         return mapping
 
-    def _environment_scores(self, frame_number: int, direction: str) -> dict:
+    def _environment_scores(self, frame_number: int, direction: str,
+                            with_unscoreable: bool = False):
         """Per-cell environment score for `frame_number` compared against the
         previous or next frame (Tissue Analyzer's Fig. 3g/h respectively), or
         the worse of the two with `direction="both"`.
@@ -3689,26 +3888,32 @@ class EpiQuantAPI:
 
         Empty dict if the compared frame doesn't exist."""
         if direction == "both":
-            prev_scores = self._environment_scores(frame_number, "prev")
-            next_scores = self._environment_scores(frame_number, "next")
+            prev_scores, prev_out = self._environment_scores(frame_number, "prev", True)
+            next_scores, next_out = self._environment_scores(frame_number, "next", True)
+            # A cell unscoreable on EITHER side is unscoreable for the "worse
+            # of the two" reading: the min over a value and a non-value is not
+            # that value.
+            merged_out = {**prev_out, **next_out}
             if not prev_scores:
-                return next_scores
-            if not next_scores:
-                return prev_scores
-            return {
-                label: min(value, next_scores.get(label, value))
-                for label, value in prev_scores.items()
-            }
+                merged = next_scores
+            elif not next_scores:
+                merged = prev_scores
+            else:
+                merged = {label: min(value, next_scores.get(label, value))
+                          for label, value in prev_scores.items()}
+            return (merged, merged_out) if with_unscoreable else merged
 
         other_frame = frame_number - 1 if direction == "prev" else frame_number + 1
         graph_current = self._get_neighbor_graph(frame_number)
         graph_other = self._get_neighbor_graph(other_frame)
         if not graph_current or not graph_other:
-            return {}
-        return adjacency.environment_scores(
+            return ({}, {}) if with_unscoreable else {}
+        scores, unscoreable = adjacency.environment_scores(
             graph_current, graph_other,
             self._label_to_track(frame_number), self._label_to_track(other_frame),
+            with_unscoreable=True,
         )
+        return (scores, unscoreable) if with_unscoreable else scores
 
     def get_tracking_overlay(
         self, frame_number: int, render_mode: str = "mask", show_labels: bool = True,
@@ -3759,6 +3964,8 @@ class EpiQuantAPI:
             dynamics_states=dynamics_states, dynamics_colors=self.dynamics_colors,
             nematic_axes=nematic_axes,
             agreement_states=agreement_states, agreement_colors=self.agreement_colors,
+            extracted_labels=self._extracted_labels(frame_number),
+            unextracted_color=self.unextracted_color,
         )
         return rendering.encode_png_base64(overlay)
 
@@ -4109,6 +4316,118 @@ class EpiQuantAPI:
             return []
         return sorted(int(v) for v in self.tracking_data.iloc[:, 0].tolist())
 
+    # --- Track-level visual inspection (Round 27 4b) -----------------------
+
+    def get_track_cell_at_frame(self, track_number: int, frame_number: int) -> Optional[str]:
+        """The `Cell{frame}_{label}` this track holds at `frame_number`, or
+        `None` for a gap. Resolved here rather than taken from the frontend:
+        the mark is evidence, and evidence about which cell was on screen must
+        come from the table that put it there."""
+        if self.tracking_data is None:
+            return None
+        column = f"Frame{int(frame_number)}"
+        if column not in self.tracking_data.columns:
+            return None
+        id_col = self.tracking_data.columns[0]
+        rows = self.tracking_data[self.tracking_data[id_col] == int(track_number)]
+        if rows.empty:
+            return None
+        value = rows.iloc[0][column]
+        return None if pd.isna(value) else str(value)
+
+    def start_track_inspection(self, labeller: str = "") -> dict:
+        """Begin a pass over every track. Writes nothing yet -- the file is
+        created by the first mark, and the provenance by `finish`."""
+        if self.tracking_data is None:
+            return {"error": "Track the movie before inspecting it."}
+        tracks = self.get_track_numbers()
+        if not tracks:
+            return {"error": "This tracking table holds no tracks."}
+        self._inspection = {
+            "session_id": coverage_log.new_session_id(),
+            "labeller": labeller,
+            "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "tracks": tracks,
+            "path": census.inspection_path(self.output_dirs["cell_track_output"]),
+            "marks": 0,
+        }
+        return {"session_id": self._inspection["session_id"], "tracks": tracks,
+                "total": len(tracks), "path": self._inspection["path"]}
+
+    def mark_inspection_cell(self, track_number: int, frame_number: int,
+                             ms_elapsed: float = 0.0) -> dict:
+        """Record that the cell this track holds at this frame is wrong."""
+        state = getattr(self, "_inspection", None)
+        if not state:
+            return {"error": "Start a visual inspection first."}
+        cell_index = self.get_track_cell_at_frame(track_number, frame_number)
+        if cell_index is None:
+            return {"error": f"Track #{track_number} holds no cell at frame {frame_number}."}
+        census.append_inspection_mark(
+            state["path"], state["session_id"], int(track_number), int(frame_number),
+            cell_index, ms_elapsed, labeller=state["labeller"])
+        state["marks"] += 1
+        return {"marked": cell_index, "track_id": int(track_number),
+                "frame": int(frame_number), "marks": state["marks"]}
+
+    def finish_track_inspection(self, inspected: list = None,
+                                per_track_ms: dict = None) -> dict:
+        """Close the pass: write the provenance beside the marks, return the
+        summary.
+
+        The provenance is the point. Rounds 18-20 treated tables that had never
+        been visually inspected as ground truth; this file records that someone
+        DID look, under which tracking run, which registration convention and
+        which masks -- and, by naming the tracks left unseen, where the looking
+        stopped.
+        """
+        state = getattr(self, "_inspection", None)
+        if not state:
+            return {"error": "Start a visual inspection first."}
+        tracks = state["tracks"]
+        seen = sorted({int(t) for t in (inspected or [])})
+        unseen = [int(t) for t in tracks if int(t) not in set(seen)]
+        summary = census.summarise_inspection(state["path"], state["session_id"])
+        dwell = {int(k): float(v) for k, v in (per_track_ms or {}).items()}
+        median_dwell = (round(statistics.median(dwell.values()) / 1000.0, 1)
+                        if dwell else None)
+        record = {
+            "written_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "started_utc": state["started_utc"],
+            "session_id": state["session_id"],
+            "labeller": state["labeller"],
+            "kind": "track_inspection",
+            "tracks_total": len(tracks),
+            "tracks_inspected": len(seen),
+            "tracks_not_inspected": unseen,
+            "marks": summary["marks"],
+            "tracks_with_marks": summary["tracks_with_marks"],
+            "median_seconds_per_track": median_dwell,
+            # Which run was looked at, and under which conventions.
+            "judge_registered": bool(self.register_reference),
+            "mask_folder": self.mask_folder,
+            "masks": baselines.mask_fingerprint(self.npy_folder),
+            "min_cell_area_px": data_input.get_min_cell_area(),
+            "exclude_edge_cells": self.exclude_edge_cells,
+            "tracking": {
+                "tracks": int(len(self.tracking_data)),
+                "overlap_weight": self.overlap_weight,
+                "centroid_weight": self.centroid_weight,
+                "motion_compensation": self.motion_compensation,
+                "max_frame_gap": self.max_frame_gap,
+                "drift_mode": self.tracking_drift_mode or self.drift_mode,
+            },
+        }
+        try:
+            os.makedirs(os.path.dirname(state["path"]), exist_ok=True)
+            with open(state["path"] + ".provenance.json", "w", encoding="utf-8") as handle:
+                json.dump(record, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+        except OSError as error:
+            logger.warning("could not write inspection provenance: %s", error)
+        self._inspection = None
+        return {**record, "marks_by_track": summary["marks_by_track"], "path": state["path"]}
+
     def get_track_frame_range(self, track_number: int) -> Optional[dict]:
         if self.tracking_data is None:
             return None
@@ -4159,6 +4478,8 @@ class EpiQuantAPI:
                 label_cells=False, track_color_mode="dynamics",
                 dynamics_states=self._dynamics_states(frame_number),
                 dynamics_colors=self.dynamics_colors, nematic_axes=nematic_axes,
+                extracted_labels=self._extracted_labels(frame_number),
+                unextracted_color=self.unextracted_color,
             )
             return rendering.encode_png_base64(overlay)
 
@@ -4512,6 +4833,51 @@ if __name__ == "__main__":
         print("O (R24): a 15-column pre-R24 table keeps basic ready with the default")
         print("  columns; the restored two are `unavailable` (disabled), and asking for one")
         print("  says to re-run Extract rather than to run shape descriptors.")
+
+        # --- EFD (2026-09-19): Classify must PCA the normalized shape, not the
+        # raw coefficients. Fixture: the same 12 shapes twice, the second copy
+        # rotated, rescaled, started elsewhere and traced the other way. If the
+        # raw columns reached PCA the two copies would differ by O(1).
+        import pyefd
+        rng_e = np.random.default_rng(3)
+        tt = np.linspace(0, 2 * np.pi, 300, endpoint=False)
+        shapes = []
+        for _ in range(12):
+            r = 1 + 0.15 * rng_e.standard_normal(4) @ np.cos(np.outer([2, 3, 4, 5], tt) + rng_e.uniform(0, 6, (4, 1)))
+            shapes.append(np.column_stack([rng_e.uniform(1.5, 3) * r * np.cos(tt), r * np.sin(tt)]) * 20)
+
+        def efd_table(transform):
+            rows = []
+            for i, sh in enumerate(shapes):
+                sh = transform(i, sh)
+                rows.append(pyefd.elliptic_fourier_descriptors(np.vstack([sh, sh[:1]]), order=10).ravel())
+            return pd.DataFrame(rows, columns=pca_kmeans.efd_preset(10), index=[f"Cell1_{i}" for i in range(12)])
+
+        def moved(i, sh):
+            a = rng_e.uniform(0, 2 * np.pi)
+            R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+            return (np.roll(sh, rng_e.integers(300), axis=0) @ R.T * rng_e.uniform(0.5, 2))[::-1]
+
+        feats = []
+        for transform in (lambda i, sh: sh, moved):
+            e_api = EpiQuantAPI()
+            e_api.cells_info = pd.DataFrame(
+                {"Cell Index": [f"Cell1_{i}" for i in range(12)],
+                 **{c: rng_e.uniform(5, 50, 12) for c in data_input.CELLS_INFO_COLUMNS}})
+            e_api.cells_shape = efd_table(transform)
+            e_api.cells_tissue = None
+            frame_e, mode_e = e_api._feature_frame(["efd"], None)
+            assert mode_e == "none" and frame_e.shape == (12, 40), (mode_e, frame_e.shape)
+            feats.append(frame_e.to_numpy())
+        drift = np.abs(feats[0] - feats[1]).max()
+        raw_drift = np.abs(efd_table(lambda i, sh: sh).to_numpy() - efd_table(moved).to_numpy()).max()
+        assert drift < 1e-9, f"EFD Classify features depend on pose: {drift:.3e}"
+        assert raw_drift > 1.0, "fixture did not move the raw coefficients"
+        assert np.allclose(np.sqrt((feats[0][:, :4] ** 2).sum(axis=1)), 1.0), "harmonic 1 must be unit norm"
+        e_api.cells_shape.iloc[0, 5] = np.nan
+        assert len(e_api._feature_frame(["efd"], None)[0]) == 11, "a cell with a NaN coefficient must drop"
+        print(f"EFD (2026-09-19): Classify features are pose-invariant (max drift {drift:.1e};")
+        print(f"  the raw columns moved by {raw_drift:.1f}), unit harmonic-1, NaN rows dropped.")
 
         print("\nAll api self-tests passed.")
         raise SystemExit(0)

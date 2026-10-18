@@ -410,7 +410,119 @@ function onExtractError(data) {
 
 function frameLabel(frame) {
   const idx = state.frameNumbers.indexOf(frame);
-  return idx === -1 ? `Frame ${frame}` : `Frame ${frame} (${idx + 1} / ${state.frameNumbers.length})`;
+  return idx === -1 ? `${frame}` : `${idx + 1} / ${state.frameNumbers.length}`;
+}
+
+// A position reads `12 / 86`, the index into the frames that have data. On a
+// sparse dataset that is NOT the frame number (`get_frame_numbers` can return
+// [1, 9, 19]), so the frame number goes in the title rather than being dropped.
+function setFrameLabel(prefix, frame) {
+  const el = document.getElementById(`${prefix}-frame-label`);
+  if (!el) return;
+  el.textContent = frameLabel(frame);
+  el.title = `Frame ${frame}`;
+}
+
+// --- The player: ONE template, five instances ------------------------------
+//
+// `index.html` carried five hand-copied frame-nav + zoom-controls blocks, and
+// hand-copied markup drifts: the same round that found this also found a
+// legend that had been left out of one lookup table. The JS was already shared
+// (`wireFrameNav`/`wireZoomControls` derive every id from the prefix), so only
+// the markup needed collapsing. Change a word here and all five change.
+//
+// Transport is icons: these five symbols are the one set of controls that
+// needs no words. Everything that is a real setting (fps) keeps its label.
+// Step uses the double-triangle glyphs, not the single ones: a single right
+// triangle next to Play renders as the SAME shape, and two identical-looking
+// buttons side by side is worse than the words they replaced. Checked in the
+// browser, which is where it showed up.
+const PLAYER_BUTTONS = [
+  ["first-frame", "&#9198;", "First frame (Home)"],
+  ["prev-frame", "&#9194;", "Previous frame (Left arrow)"],
+  ["play-pause", "&#9654;", "Play / pause (Space)"],
+  ["next-frame", "&#9193;", "Next frame (Right arrow)"],
+  ["last-frame", "&#9197;", "Last frame (End)"],
+];
+
+function playerMarkup(prefix) {
+  const buttons = PLAYER_BUTTONS.map(([suffix, glyph, title]) =>
+    `<button id="${prefix}-${suffix}" class="icon-btn" title="${title}" aria-label="${title}">${glyph}</button>`
+  ).join("");
+  return `
+    <span class="player-transport">${buttons}</span>
+    <span id="${prefix}-frame-label" class="player-position"></span>
+    <label class="player-rate"><input type="number" id="${prefix}-fps-input"
+      class="small-input fps-input" value="2" min="0.5" max="30" step="0.5"> fps</label>
+    <span class="player-zoom">
+      <button id="${prefix}-zoom-out" class="icon-btn" title="Zoom out" aria-label="Zoom out">&minus;</button>
+      <input type="range" id="${prefix}-zoom-slider" class="zoom-slider" min="25" max="400" step="25" value="100">
+      <span id="${prefix}-zoom-level" class="zoom-level" role="button" tabindex="0"
+            title="Click to reset to 100%">100%</span>
+      <button id="${prefix}-zoom-in" class="icon-btn" title="Zoom in" aria-label="Zoom in">+</button>
+    </span>
+    <button id="${prefix}-player-help-btn" class="help-btn" aria-label="Keyboard shortcuts">?</button>
+    <div id="${prefix}-player-help-popover" class="popover" style="display:none">
+      <div class="popover-head">
+        <strong>Player</strong>
+        <button id="${prefix}-player-help-close" class="help-btn" aria-label="Close">&times;</button>
+      </div>
+      <dl>
+        <dt>&larr; / &rarr;</dt><dd>previous / next frame</dd>
+        <dt>Space</dt><dd>play / pause</dd>
+        <dt>Home / End</dt><dd>first / last frame</dd>
+      </dl>
+      <p>The position reads <b>index / total</b> over the frames that have data; hover it for the
+        frame number. Click the zoom percentage to reset it to 100%.</p>
+      <p>While the magnifier is open the arrows step <b>it</b>, not the movie &mdash; close it
+        (Esc) to get them back. During a census queue the keys belong to the census.</p>
+    </div>`;
+}
+
+// Runs before any wiring: every `getElementById` below depends on these nodes.
+function instantiatePlayers() {
+  document.querySelectorAll("[data-player]").forEach((host) => {
+    host.innerHTML = playerMarkup(host.dataset.player);
+  });
+}
+
+function playerPrefixes() {
+  return Array.from(document.querySelectorAll("[data-player]")).map((el) => el.dataset.player);
+}
+
+// The player on the step currently being shown. `goToStep` displays one step
+// section at a time, so at most one player is laid out; `offsetParent` is the
+// cheapest honest test for "is this actually on screen".
+function activePlayerPrefix() {
+  const host = Array.from(document.querySelectorAll("[data-player]"))
+    .find((el) => el.offsetParent !== null);
+  return host ? host.dataset.player : null;
+}
+
+function playerVisible() {
+  return activePlayerPrefix() !== null;
+}
+
+// Nothing here knows about the census or the magnifier, and nothing here may
+// learn: `KEY_OWNERS` has already decided that this owner is only asked when
+// neither of them wanted the key.
+function playerKeyDown(event) {
+  const prefix = activePlayerPrefix();
+  if (!prefix) return false;
+  const press = (suffix) => {
+    const button = document.getElementById(`${prefix}-${suffix}`);
+    if (!button) return false;
+    button.click();
+    return true;
+  };
+  switch (event.key) {
+    case "ArrowLeft": return press("prev-frame");
+    case "ArrowRight": return press("next-frame");
+    case " ": return press("play-pause");
+    case "Home": return press("first-frame");
+    case "End": return press("last-frame");
+    default: return false;
+  }
 }
 
 // `${prefix}-render-mode` radio group -- "mask" (filled regions, default) or
@@ -444,7 +556,7 @@ function wireColorMode(prefix, onChange) {
 
 async function showExtractFrame(frame) {
   state.extractFrame = frame;
-  document.getElementById("extract-frame-label").textContent = frameLabel(frame);
+  setFrameLabel("extract", frame);
   await refreshExtractImage();
   document.getElementById("extract-qc-status").textContent = "";
 }
@@ -823,7 +935,7 @@ function renderClusterPicker() {
 
 async function showClassifyFrame(frame) {
   state.classifyFrame = frame;
-  document.getElementById("classify-frame-label").textContent = frameLabel(frame);
+  setFrameLabel("classify", frame);
   const img = await window.EpiQuantAPI.get_classification_overlay(frame, getRenderMode("classify"));
   setPreviewImage("classify-overlay-img", img);
 }
@@ -857,7 +969,7 @@ async function handleComputeLeadingEdge() {
 
 async function showCorrectClassFrame(frame) {
   state.correctClassFrame = frame;
-  document.getElementById("correct-class-frame-label").textContent = frameLabel(frame);
+  setFrameLabel("correct-class", frame);
   const img = await window.EpiQuantAPI.get_classification_overlay(frame, getRenderMode("correct-class"));
   setPreviewImage("correct-class-overlay-img", img);
   document.getElementById("correct-class-selected-cell").textContent = "";
@@ -998,12 +1110,33 @@ async function onRetrackDone(data) {
     `${(data.reconciled || []).length} seam reconciliation(s), ${(data.new_tracks || []).length} new track(s). ` +
     `${data.track_count} tracks total.`, "success");
 
-  state.trackNumbers = await window.EpiQuantAPI.get_track_numbers();
+  await refreshTrackNumbers();
 }
 
 function onRetrackError(data) {
   document.getElementById("start-retrack-btn").disabled = false;
   setStatus("retrack-status", `Re-track failed: ${data.message}`, "error");
+}
+
+// The track set and the search dropdown are two views of one fact, and they
+// were updated in different places: `onTrackDone` refreshed both, `onRetrackDone`
+// only the array, and the correction handlers refreshed neither. So a track
+// created by hand (e.g. #501 on `embryos_GBE_GAP43`, which really does have 501
+// tracks) was missing from `state.trackNumbers`, and `loadTrack` answered
+// "Track 501 not found." for a track the backend returns correctly. Two call
+// sites that must agree, one of them fixed and the other not -- `CLAUDE.md`
+// rule 6. There is one function now, and every mutation calls it.
+async function refreshTrackNumbers() {
+  state.trackNumbers = await window.EpiQuantAPI.get_track_numbers();
+  const list = document.getElementById("track-number-list");
+  if (!list) return state.trackNumbers;
+  list.innerHTML = "";
+  state.trackNumbers.forEach((tn) => {
+    const opt = document.createElement("option");
+    opt.value = tn;
+    list.appendChild(opt);
+  });
+  return state.trackNumbers;
 }
 
 async function onTrackDone(data) {
@@ -1014,14 +1147,7 @@ async function onTrackDone(data) {
   enableStep("correct-tracking");
   enableStep("trajectory");
 
-  state.trackNumbers = await window.EpiQuantAPI.get_track_numbers();
-  const list = document.getElementById("track-number-list");
-  list.innerHTML = "";
-  state.trackNumbers.forEach((tn) => {
-    const opt = document.createElement("option");
-    opt.value = tn;
-    list.appendChild(opt);
-  });
+  await refreshTrackNumbers();
 
   state.correctTrackFrame = state.frameNumbers[0] ?? 1;
   await showCorrectTrackFrame(state.correctTrackFrame);
@@ -1038,6 +1164,12 @@ function onTrackError(data) {
 
 // Each colour mode owns one options panel; show that one and hide the rest.
 // (Was a hardcoded two-way toggle before the environment/lifecycle modes.)
+// Every panel that belongs to exactly one colour mode. A control missing from
+// this map is not "always relevant" -- it is a control nothing ever hides: the
+// matched/unmatched legend sat outside the map and stayed on screen under
+// Environment score, explaining colours that view does not use (Round 27 §1a).
+// The `?` that replaced it lives INSIDE `correct-track-uniform-colors`, so it
+// is hidden with the row it explains and cannot drift out of the map again.
 const TRACK_COLOR_MODE_PANELS = {
   uniform: ["correct-track-uniform-colors"],
   identity: ["correct-track-identity-palette"],
@@ -1070,6 +1202,11 @@ function syncTrackingCostControls(cost) {
 
 function syncTrackColorModePanels() {
   const mode = getColorMode("correct-track");
+  // A popover left open while the mode changes would outlive the row that
+  // opened it. Closed here rather than listed above, because the sync sets
+  // `display` and would force this one visible.
+  const colorHelp = document.getElementById("correct-track-color-help-popover");
+  if (colorHelp && mode !== "uniform") colorHelp.style.display = "none";
   Object.entries(TRACK_COLOR_MODE_PANELS).forEach(([panelMode, ids]) => {
     ids.forEach((id) => {
       const el = document.getElementById(id);
@@ -1094,7 +1231,38 @@ async function refreshCorrectTrackImage() {
   );
   setPreviewImage("correct-track-overlay-img", img);
   await refreshAgreementCounts();
+  await refreshEnvironmentCounts(environmentDirection);
   await refreshRegistrationStatus();
+}
+
+// What the environment overlay's colours are, and are not, about. Dice
+// saturates on small neighbour sets -- two cells each keeping one comparable
+// neighbour, the same one, score a perfect 1.0 -- so a healthy-looking median
+// is exactly what a degraded input produces. The share of perfect scores and
+// the count of cells that could not be scored at all are the two numbers that
+// show it, and the unscoreable ones are omitted from the result rather than
+// scored 0, so without this line they are invisible (Round 28 C3).
+async function refreshEnvironmentCounts(direction) {
+  const box = document.getElementById("correct-track-environment-counts");
+  if (getColorMode("correct-track") !== "environment") {
+    box.style.display = "none";
+    return;
+  }
+  const info = await window.EpiQuantAPI.get_environment_repair_candidates(
+    state.correctTrackFrame, direction);
+  box.style.display = "block";
+  if (!info || !info.n) {
+    box.textContent = info && info.unscoreable
+      ? `No cell in this frame could be scored (${info.unscoreable} unscoreable).`
+      : "No environment score for this frame.";
+    return;
+  }
+  const perfect = info.perfect ?? 0;
+  box.textContent =
+    `${info.n} cell(s) scored — ${perfect} of them a perfect 1.0 ` +
+    `(${Math.round(100 * perfect / info.n)}%), ${info.flagged_total ?? 0} below the dead band, ` +
+    `${info.candidates.length} at or below the repair threshold. ` +
+    `${info.unscoreable ?? 0} cell(s) could not be scored at all and are uncoloured.`;
 }
 
 // The counts are always shown alongside the overlay, including how many cells
@@ -1254,7 +1422,7 @@ async function showCorrectTrackFrame(frame) {
   state.correctTrackFrame = frame;
   state.correctTrackShownFrame = frame;
   state.correctTrackShownAt = Date.now();
-  document.getElementById("correct-track-frame-label").textContent = frameLabel(frame);
+  setFrameLabel("correct-track", frame);
   document.getElementById("correct-track-selected-cell").textContent = "";
   document.getElementById("correct-track-reassign").style.display = "none";
   document.getElementById("correct-track-suggest").style.display = "none";
@@ -1276,7 +1444,102 @@ async function showCorrectTrackFrame(frame) {
 const stepperState = { trackId: null, anchor: null, frame: null, held: [], frames: [] };
 
 function stepperVisible() {
-  return !document.getElementById("track-stepper").hidden;
+  const panel = document.getElementById("track-stepper");
+  // `hidden` alone is not enough: leave the magnifier open, switch to another
+  // step, and the attribute is still false while the panel is not on screen --
+  // it would then claim the arrows on a page it is not even visible on. And
+  // `offsetParent` is null for a `position: fixed` element whether or not it
+  // is shown, so the test is "does it occupy any box at all".
+  return !panel.hidden && panel.getClientRects().length > 0;
+}
+
+// Where the magnifier sits and how big it is. Session-only and deliberately
+// NOT persisted to disk, for the same reason "Enable inset view" is not: it is
+// a view preference, and nothing downstream reads it.
+const stepperWindow = { left: null, top: null, width: null, height: null };
+
+// A remembered position is only valid against the window it was taken in. Make
+// the panel smaller, or move it to another screen, and a remembered corner can
+// land outside the viewport -- the magnifier would then open invisibly, with
+// no way for the user to get it back. So every open clamps, and so does every
+// window resize while it is open.
+function clampStepperIntoView() {
+  const panel = document.getElementById("track-stepper");
+  if (!panel || panel.hidden) return;
+  const margin = 8;
+  const rect = panel.getBoundingClientRect();
+  const width = stepperWindow.width || rect.width;
+  const height = stepperWindow.height || rect.height;
+  let left = stepperWindow.left;
+  let top = stepperWindow.top;
+  if (left === null || top === null) return;        // never moved: CSS places it
+  left = Math.min(Math.max(margin, left), Math.max(margin, window.innerWidth - width - margin));
+  top = Math.min(Math.max(margin, top), Math.max(margin, window.innerHeight - height - margin));
+  stepperWindow.left = left;
+  stepperWindow.top = top;
+  Object.assign(panel.style, {
+    left: `${left}px`, top: `${top}px`, right: "auto", bottom: "auto",
+  });
+}
+
+function applyStepperWindow() {
+  const panel = document.getElementById("track-stepper");
+  if (stepperWindow.width) panel.style.width = `${stepperWindow.width}px`;
+  if (stepperWindow.height) panel.style.height = `${stepperWindow.height}px`;
+  if (stepperWindow.left !== null && stepperWindow.top !== null) {
+    Object.assign(panel.style, {
+      left: `${stepperWindow.left}px`, top: `${stepperWindow.top}px`,
+      right: "auto", bottom: "auto",
+    });
+  }
+  clampStepperIntoView();
+}
+
+// Dragging by the head. Pointer events rather than mouse events so a drag that
+// leaves the window still ends (`setPointerCapture`).
+function wireStepperWindow() {
+  const panel = document.getElementById("track-stepper");
+  const head = document.querySelector(".track-stepper-head");
+  if (!panel || !head) return;
+  let dragging = false;
+  let offsetX = 0;
+  let offsetY = 0;
+  head.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || e.target.closest("button")) return;
+    const rect = panel.getBoundingClientRect();
+    dragging = true;
+    offsetX = e.clientX - rect.left;
+    offsetY = e.clientY - rect.top;
+    stepperWindow.width = rect.width;
+    stepperWindow.height = rect.height;
+    head.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  head.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    stepperWindow.left = e.clientX - offsetX;
+    stepperWindow.top = e.clientY - offsetY;
+    applyStepperWindow();
+  });
+  const end = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    if (head.hasPointerCapture(e.pointerId)) head.releasePointerCapture(e.pointerId);
+  };
+  head.addEventListener("pointerup", end);
+  head.addEventListener("pointercancel", end);
+  // The CSS resize handle changes the size without telling anyone, so read it
+  // back when it settles -- otherwise the remembered size is the pre-resize one
+  // and the next open would snap back.
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(() => {
+      if (panel.hidden) return;
+      const rect = panel.getBoundingClientRect();
+      stepperWindow.width = rect.width;
+      stepperWindow.height = rect.height;
+    }).observe(panel);
+  }
+  window.addEventListener("resize", clampStepperIntoView);
 }
 
 // C2c (R17): the inset can be switched off without deselecting the cell.
@@ -1310,6 +1573,7 @@ async function openTrackStepper(trackId, anchorFrame) {
   stepperState.frames = strip.frames || [];
   stepperState.held = strip.held || [];
   document.getElementById("track-stepper").hidden = false;
+  applyStepperWindow();
   document.getElementById("track-stepper-title").textContent =
     `Track #${trackId} — ${stepperState.held.length} of ${stepperState.frames.length} frames`;
   renderFilmstrip();
@@ -1398,6 +1662,15 @@ const censusState = {
   mode: "census", pending: 0,
   candidatePage: 0,
 };
+
+// The three overlay colours always travel together: sending two of them would
+// leave the third at whatever the backend last heard (Round 26 C).
+async function pushTrackColors() {
+  await window.EpiQuantAPI.set_track_colors(
+    document.getElementById("matched-color-input").value,
+    document.getElementById("unmatched-color-input").value,
+    document.getElementById("unextracted-color-input").value);
+}
 
 function censusShow(which) {
   if (!censusState.item) return;
@@ -1716,6 +1989,11 @@ function censusKeyDown(event) {
   if (key === "j") { submitCensus("correct"); return true; }
   if (key === "k") { beginCensusWrong(); return true; }
   if (key === "l") { submitCensus("unjudgeable"); return true; }
+  // Claimed and deliberately ignored. The movie behind this panel must not
+  // page while a link is being judged, and the only way to say that in this
+  // design is to consume the key here. The magnifier still steps on the arrows
+  // when it is open, because it is a HIGHER-priority owner than the census.
+  if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return true;
   return false;
 }
 
@@ -1741,9 +2019,25 @@ function censusKeyUp(event) {
 // order, each returns whether it consumed the key, and an unconsumed key falls
 // through to the next owner. So the census owns J/K/L/space/digits while its
 // queue is up, and the arrows still reach the stepper underneath it.
+// Priority order IS the rule. A handler that re-states it -- `if
+// (stepperVisible()) return;` inside the player, say -- is the self-defence
+// this dispatcher replaced, and the second copy is the one that goes stale.
+//
+// stepper > census is deliberate and is the older decision: "the census owns
+// J/K/L/space/digits while its queue is up, and the arrows still reach the
+// stepper underneath it". The stepper only claims Escape and the arrows and
+// only while it is open, so J/K/L reach the census regardless.
+//
+// The census then SWALLOWS the arrows (see `censusKeyDown`): with the player
+// added as an owner below, an unconsumed arrow would page the movie behind the
+// census panel while the user judges. Swallowing is the census's own decision
+// about its own keys, stated once, in its handler -- not a question the player
+// asks about the census.
 const KEY_OWNERS = [
-  { name: "census", active: () => censusState.active, down: censusKeyDown, up: censusKeyUp },
   { name: "stepper", active: () => stepperVisible(), down: stepperKeyDown, up: null },
+  { name: "census", active: () => censusState.active, down: censusKeyDown, up: censusKeyUp },
+  { name: "inspection", active: () => inspectionActive(), down: inspectionKeyDown, up: null },
+  { name: "player", active: () => playerVisible(), down: playerKeyDown, up: null },
 ];
 
 function typingInAField(target) {
@@ -1813,6 +2107,7 @@ async function handleApplyCensusEdits() {
   censusState.pending = 0;
   document.getElementById("census-undo-btn").style.display = "inline-block";
   const notes = (result.displaced_list || []).map(describeDisplacement).join("");
+  await refreshTrackNumbers();
   setStatus("census-summary", `Applied ${result.applied} correction(s) in one batch.${notes}`, "success");
   await refreshCorrectTrackImage();
 }
@@ -1826,6 +2121,7 @@ async function handleUndoCensusEdits() {
   document.getElementById("census-undo-btn").style.display = "none";
   document.getElementById("census-apply-report").innerHTML = "";
   setStatus("census-summary", "Restored the tracking table to the snapshot taken before Apply.", "success");
+  await refreshTrackNumbers();
   await refreshCorrectTrackImage();
 }
 
@@ -2042,6 +2338,7 @@ async function handleApplyTrackCorrection() {
       cellIndex: correctedCellIndex, trackId: newId,
       detail: isMatched ? "reassign_track" : "add_tracking_id",
     });
+    await refreshTrackNumbers();
     await showCorrectTrackFrame(state.correctTrackFrame);
     setStatus("correct-track-selected-cell", `Applied.${note}`, "success");
   }
@@ -2081,6 +2378,7 @@ async function handleApplySmartStop() {
     return;
   }
   const note = describeDisplacement(result && result.displaced);
+  await refreshTrackNumbers();
   await showCorrectTrackFrame(state.correctTrackFrame);
   setStatus("smart-stop-result", `Merged through frame ${stopFrame}.${note}`, "success");
 }
@@ -2157,6 +2455,7 @@ async function handleSuggestMatch() {
       const note = describeDisplacement(applyResult && applyResult.displaced);
       list.style.display = "none";
       list.innerHTML = "";
+      await refreshTrackNumbers();
       await refreshCorrectTrackImage();
       showSuggestCheckButton(candidate.track_id);
       setStatus("correct-track-selected-cell", `Attached ${selectedCell.cell_index} to track #${candidate.track_id}.${note}`, "success");
@@ -2332,6 +2631,7 @@ async function handleApplyConfirmedMoves() {
   document.getElementById("apply-confirmed-moves-btn").style.display = "none";
   document.getElementById("plan-checks").innerHTML = "";
   state.confirmedMovesPending = null;
+  await refreshTrackNumbers();
   await refreshCorrectTrackImage();
   setStatus("suggest-check-result", `Applied ${moves.length} correction(s).${notes}`, "success");
 }
@@ -2357,23 +2657,30 @@ async function enterTrajectoryStep() {
 // clicked a cell they can see and yanking them to the track's first frame
 // would lose their place. The number input and Prev/Next Track buttons keep
 // the original jump-to-start behaviour.
-async function loadTrack(tn, { preserveFrame = false } = {}) {
-  if (!state.trackNumbers.includes(tn)) {
+// `trusted` skips the membership check for callers whose track number came
+// from the BACKEND in the first place (the inspection pass). That check exists
+// to catch a typo in the number box; against a backend-supplied id it is one
+// more chance for a stale frontend cache to veto something that does exist --
+// and it vetoed silently, which is how the inspection pass could stop dead on
+// its first track (Round 28 A4).
+async function loadTrack(tn, { preserveFrame = false, trusted = false } = {}) {
+  if (!trusted && !state.trackNumbers.includes(tn)) {
     setStatus("trajectory-status", `Track ${tn} not found.`, "error");
-    return;
+    return false;
   }
   state.currentTrackNumber = tn;
   document.getElementById("track-number-input").value = tn;
   const range = await window.EpiQuantAPI.get_track_frame_range(tn);
   if (!range) {
     setStatus("trajectory-status", "No frame data for this track.", "error");
-    return;
+    return false;
   }
   const current = state.trajectoryFrame;
   const keep = preserveFrame && current >= range.min_frame && current <= range.max_frame;
   const frame = keep ? current : range.min_frame;
   state.trajectoryFrame = frame;
   await showTrajectoryFrame(frame);
+  return true;
 }
 
 async function handleTrajectoryImageClick(event) {
@@ -2409,7 +2716,7 @@ function handleNextTrack() {
 
 async function showTrajectoryFrame(frame) {
   state.trajectoryFrame = frame;
-  document.getElementById("trajectory-frame-label").textContent = `Frame ${frame}`;
+  setFrameLabel("trajectory", frame);
   const modeEl = document.querySelector('input[name="trajectory-color-mode"]:checked');
   const colorMode = modeEl ? modeEl.value : "highlight";
   document.getElementById("correct-track-dynamics").style.display = colorMode === "dynamics" ? "flex" : "none";
@@ -2430,6 +2737,231 @@ async function showTrajectoryFrame(frame) {
   }
 }
 
+// --- Visual inspection of every track (Round 27 4b) -------------------
+//
+// Each track loops over its own frames at the player's fps while the user
+// watches; `K` marks the cell currently on screen. The mark is a CELL, not a
+// track -- `(track, frame, cell)` says where the track goes wrong, which a
+// track-level flag does not. The cell index itself is resolved in the backend
+// from the tracking table, not sent from here.
+const inspectionState = {
+  active: false, tracks: [], index: 0, frames: [], frame: null,
+  timer: null, paused: false, marks: 0, seen: new Set(),
+  trackStartedAt: 0, perTrackMs: {}, markStartedAt: 0,
+};
+
+function inspectionActive() {
+  return inspectionState.active;
+}
+
+function inspectionFps() {
+  const input = document.getElementById("trajectory-fps-input");
+  return Math.max(0.5, parseFloat(input && input.value) || 2);
+}
+
+function stopInspectionTimer() {
+  if (inspectionState.timer) clearInterval(inspectionState.timer);
+  inspectionState.timer = null;
+}
+
+function startInspectionTimer() {
+  stopInspectionTimer();
+  if (inspectionState.paused) return;
+  inspectionState.timer = setInterval(async () => {
+    const frames = inspectionState.frames;
+    if (!frames.length) return;
+    const idx = frames.indexOf(inspectionState.frame);
+    // Loops rather than stopping at the end: the point is to watch the track
+    // over and over until you are sure, not to reach its last frame.
+    inspectionState.frame = frames[(idx + 1) % frames.length];
+    await showTrajectoryFrame(inspectionState.frame);
+  }, 1000 / inspectionFps());
+}
+
+function describeInspectionProgress(note) {
+  const track = inspectionState.tracks[inspectionState.index];
+  setStatus("inspection-status",
+    `Track ${inspectionState.index + 1} of ${inspectionState.tracks.length} ` +
+    `(#${track})${inspectionState.paused ? " — paused" : ""}. ` +
+    `K marks this cell, ↑/↓ change track, ←/→ step frames (pauses), Space pauses, Esc ends. ` +
+    `${inspectionState.marks} cell(s) marked.${note ? " " + note : ""}`, "");
+}
+
+async function inspectionGoToIndex(index) {
+  if (!inspectionState.active) return;
+  const tracks = inspectionState.tracks;
+  const next = Math.min(Math.max(0, index), tracks.length - 1);
+  // Dwell time belongs to the track that was on screen, so bank it before moving.
+  const leaving = tracks[inspectionState.index];
+  if (inspectionState.trackStartedAt && leaving !== undefined) {
+    inspectionState.perTrackMs[leaving] =
+      (inspectionState.perTrackMs[leaving] || 0) + (Date.now() - inspectionState.trackStartedAt);
+  }
+  inspectionState.index = next;
+  inspectionState.trackStartedAt = Date.now();
+  inspectionState.markStartedAt = Date.now();
+  const track = tracks[next];
+  inspectionState.seen.add(track);
+  // `trusted`: this id came from the backend's own list (see
+  // `startTrackInspection`), so the frontend cache gets no vote.
+  const loaded = await loadTrack(track, { trusted: true });
+  const range = await window.EpiQuantAPI.get_track_frame_range(track);
+  inspectionState.frames = range
+    ? state.frameNumbers.filter((f) => f >= range.min_frame && f <= range.max_frame)
+    : [];
+  // Always restarts at the track's first frame, so every track is watched from
+  // the same place rather than from wherever the previous one happened to stop.
+  inspectionState.frame = inspectionState.frames[0] ?? null;
+
+  // A pass that cannot show anything must SAY so and stop. It used to keep
+  // advancing its clock and its index with the picture frozen, which from the
+  // outside is indistinguishable from a player that will not play (Round 28 A4).
+  if (!loaded || inspectionState.frame === null) {
+    stopInspectionTimer();
+    const why = !loaded
+      ? `track #${track} could not be loaded`
+      : !range
+        ? `track #${track} has no frame range`
+        : state.frameNumbers.length === 0
+          ? "this project has no frame list loaded - re-run Extract, or reload the project"
+          : `no frame of this project falls in track #${track}'s range ` +
+            `(${range.min_frame}-${range.max_frame}; frames go ` +
+            `${state.frameNumbers[0]}-${state.frameNumbers[state.frameNumbers.length - 1]})`;
+    setStatus("inspection-status",
+      `Visual inspection stopped at track ${next + 1} of ${tracks.length}: ${why}. ` +
+      `Press Finish inspection to write what has been marked so far.`, "error");
+    return;
+  }
+  await showTrajectoryFrame(inspectionState.frame);
+  describeInspectionProgress();
+  startInspectionTimer();
+}
+
+async function startTrackInspection() {
+  const labeller = document.getElementById("inspection-labeller-input").value;
+  const started = await window.EpiQuantAPI.start_track_inspection(labeller);
+  // `null` is a real answer here, not an impossible one: the bridge returns it
+  // when a call does not reach the backend. Reading `.tracks` off it throws
+  // inside a promise, which surfaces only in the console -- the user just sees
+  // a button that did nothing.
+  if (!started || started.error) {
+    setStatus("inspection-status",
+      (started && started.error) || "Could not start the inspection (no response from the backend).",
+      "error");
+    return;
+  }
+  Object.assign(inspectionState, {
+    active: true, tracks: started.tracks, index: 0, marks: 0,
+    seen: new Set(), perTrackMs: {}, paused: false, trackStartedAt: Date.now(),
+  });
+  // The pass walks the BACKEND's list, so bring the frontend's copy (and the
+  // search dropdown) up to the same truth before starting rather than leaving
+  // two lists to disagree for the rest of the session.
+  await refreshTrackNumbers();
+  document.getElementById("start-inspection-btn").style.display = "none";
+  document.getElementById("stop-inspection-btn").style.display = "inline-block";
+  await inspectionGoToIndex(0);
+}
+
+async function markInspectionCell() {
+  const track = inspectionState.tracks[inspectionState.index];
+  const elapsed = Date.now() - (inspectionState.markStartedAt || Date.now());
+  const result = await window.EpiQuantAPI.mark_inspection_cell(
+    track, inspectionState.frame, elapsed);
+  inspectionState.markStartedAt = Date.now();
+  if (!result || result.error) {
+    describeInspectionProgress(`⚠ ${(result && result.error) || "no response from the backend"}`);
+    return;
+  }
+  inspectionState.marks = result.marks;
+  describeInspectionProgress(`Marked ${result.marked}.`);
+}
+
+async function finishTrackInspection() {
+  if (!inspectionState.active) return;
+  stopInspectionTimer();
+  const leaving = inspectionState.tracks[inspectionState.index];
+  if (inspectionState.trackStartedAt && leaving !== undefined) {
+    inspectionState.perTrackMs[leaving] =
+      (inspectionState.perTrackMs[leaving] || 0) + (Date.now() - inspectionState.trackStartedAt);
+  }
+  const summary = await window.EpiQuantAPI.finish_track_inspection(
+    Array.from(inspectionState.seen), inspectionState.perTrackMs);
+  inspectionState.active = false;
+  document.getElementById("start-inspection-btn").style.display = "inline-block";
+  document.getElementById("stop-inspection-btn").style.display = "none";
+  if (!summary || summary.error) {
+    setStatus("inspection-status",
+      (summary && summary.error) || "The inspection ended, but the backend returned no summary.",
+      "error");
+    return;
+  }
+  const unseen = summary.tracks_not_inspected || [];
+  // The tracks NOT reached are part of the result, not an omission from it:
+  // a pass that stopped a third of the way through says something different
+  // from one that finished, and only this line distinguishes them.
+  const unseenNote = unseen.length
+    ? ` Not inspected: ${unseen.length} track(s) (#${unseen[0]}–#${unseen[unseen.length - 1]}).`
+    : " Every track was inspected.";
+  setStatus("inspection-status",
+    `Inspected ${summary.tracks_inspected} of ${summary.tracks_total} track(s). ` +
+    `${summary.marks} cell(s) marked across ${summary.tracks_with_marks} track(s). ` +
+    `Median ${summary.median_seconds_per_track ?? "?"} s per track.${unseenNote} ` +
+    `Written to ${summary.path} with its provenance.`, "success");
+}
+
+// Step one frame inside the current track, and PAUSE. Without the pause the
+// next tick overwrites the frame a few hundred milliseconds later, so the key
+// looks like it did nothing.
+async function inspectionStepFrame(delta) {
+  const frames = inspectionState.frames;
+  if (!frames.length) return;
+  inspectionState.paused = true;
+  stopInspectionTimer();
+  const at = frames.indexOf(inspectionState.frame);
+  const next = Math.min(Math.max(0, (at === -1 ? 0 : at) + delta), frames.length - 1);
+  inspectionState.frame = frames[next];
+  await showTrajectoryFrame(inspectionState.frame);
+  describeInspectionProgress();
+}
+
+function inspectionKeyDown(event) {
+  switch (event.key) {
+    case "k": case "K":
+      markInspectionCell();
+      return true;
+    // Up/Down change TRACK (the maintainer's request). `<` `>` `,` `.` stay as
+    // aliases: the unshifted pair is easier to hold down, and keeping them
+    // costs nothing.
+    case "ArrowDown": case ">": case ".":
+      inspectionGoToIndex(inspectionState.index + 1);
+      return true;
+    case "ArrowUp": case "<": case ",":
+      inspectionGoToIndex(inspectionState.index - 1);
+      return true;
+    // Left/Right MUST be consumed here. Unconsumed they fell through to the
+    // player -- which is visible on the Trajectory step -- so the loop and the
+    // player were animating the same `<img>` from two different places. That
+    // is the conflict, not the choice of keys (Round 28 B2).
+    case "ArrowLeft":
+      inspectionStepFrame(-1);
+      return true;
+    case "ArrowRight":
+      inspectionStepFrame(1);
+      return true;
+    case " ":
+      inspectionState.paused = !inspectionState.paused;
+      if (inspectionState.paused) stopInspectionTimer(); else startInspectionTimer();
+      describeInspectionProgress();
+      return true;
+    case "Escape":
+      finishTrackInspection();
+      return true;
+    default:
+      return false;
+  }
+}
+
 // ---------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------
@@ -2441,14 +2973,16 @@ function stopAutoplay(prefix) {
     state.playIntervals[prefix] = null;
   }
   const playBtn = document.getElementById(`${prefix}-play-pause`);
-  if (playBtn) playBtn.innerHTML = "&#9654; Play";
+  if (playBtn) { playBtn.innerHTML = "&#9654;"; playBtn.title = "Play (Space)"; }
 }
 
 function startAutoplay(prefix, stepFn) {
   const fpsInput = document.getElementById(`${prefix}-fps-input`);
   const fps = Math.max(0.5, parseFloat(fpsInput.value) || 2);
   state.playIntervals[prefix] = setInterval(stepFn, 1000 / fps);
-  document.getElementById(`${prefix}-play-pause`).innerHTML = "&#10074;&#10074; Pause";
+  const playing = document.getElementById(`${prefix}-play-pause`);
+  playing.innerHTML = "&#9208;";
+  playing.title = "Pause (Space)";
 }
 
 // Index of `frame` within `state.frameNumbers` (the actual, possibly sparse,
@@ -2551,7 +3085,13 @@ function wireZoom(prefix, imgId) {
 
   document.getElementById(`${prefix}-zoom-in`).addEventListener("click", () => setZoom(state.zoomLevels[prefix] + 10));
   document.getElementById(`${prefix}-zoom-out`).addEventListener("click", () => setZoom(state.zoomLevels[prefix] - 10));
-  document.getElementById(`${prefix}-zoom-reset`).addEventListener("click", () => setZoom(100));
+  // The percentage is the reset control (Round 27 §4a): one fewer button, and
+  // the thing you want back to 100% is the thing you click.
+  const level = document.getElementById(`${prefix}-zoom-level`);
+  level.addEventListener("click", () => setZoom(100));
+  level.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setZoom(100); }
+  });
   slider.addEventListener("input", () => setZoom(parseInt(slider.value, 10)));
   slider.addEventListener("wheel", (e) => e.stopPropagation()); // let the slider keep its own native wheel-drag; only the image below should scroll frames
 
@@ -2610,6 +3150,12 @@ function wireFrameWheel(prefix, imgId) {
 }
 
 function init() {
+  instantiatePlayers();
+  wireStepperWindow();
+  playerPrefixes().forEach((prefix) => {
+    wirePopover(`${prefix}-player-help-btn`, `${prefix}-player-help-close`,
+                `${prefix}-player-help-popover`);
+  });
   if (window.usingMockApi) {
     document.getElementById("mock-banner").style.display = "block";
   }
@@ -2884,12 +3430,18 @@ function init() {
   document.getElementById("coverage-summary-btn").addEventListener("click", handleShowCoverageSummary);
   document.getElementById("save-tracking-btn").addEventListener("click", handleSaveTrackingCorrections);
   document.getElementById("done-correcting-tracking").addEventListener("click", enterTrajectoryStep);
+  document.getElementById("unextracted-color-input").addEventListener("change", async () => {
+    await pushTrackColors();
+    await showCorrectTrackFrame(state.correctTrackFrame);
+  });
   document.getElementById("matched-color-input").addEventListener("change", async (e) => {
-    await window.EpiQuantAPI.set_track_colors(e.target.value, document.getElementById("unmatched-color-input").value);
+    await window.EpiQuantAPI.set_track_colors(e.target.value, document.getElementById("unmatched-color-input").value,
+                                              document.getElementById("unextracted-color-input").value);
     await showCorrectTrackFrame(state.correctTrackFrame);
   });
   document.getElementById("unmatched-color-input").addEventListener("change", async (e) => {
-    await window.EpiQuantAPI.set_track_colors(document.getElementById("matched-color-input").value, e.target.value);
+    await window.EpiQuantAPI.set_track_colors(document.getElementById("matched-color-input").value, e.target.value,
+                                              document.getElementById("unextracted-color-input").value);
     await showCorrectTrackFrame(state.correctTrackFrame);
   });
 
@@ -2906,6 +3458,12 @@ function init() {
   });
   wirePopover("agreement-help-btn", "agreement-help-close", "agreement-help-popover");
   wirePopover("census-help-btn", "census-help-close", "census-help-popover");
+  wirePopover("census-set-help-btn", "census-set-help-close", "census-set-help-popover");
+  wirePopover("inspection-help-btn", "inspection-help-close", "inspection-help-popover");
+  document.getElementById("start-inspection-btn").addEventListener("click", startTrackInspection);
+  document.getElementById("stop-inspection-btn").addEventListener("click", finishTrackInspection);
+  wirePopover("correct-track-color-help-btn", "correct-track-color-help-close",
+              "correct-track-color-help-popover");
   wirePopover("min-cell-area-help-btn", "min-cell-area-help-close", "min-cell-area-help-popover");
   wirePopover("drift-help-btn", "drift-help-close", "drift-help-popover");
   document.getElementById("agreement-register-input").addEventListener("change", async (e) => {

@@ -2010,7 +2010,8 @@ if __name__ == "__main__":
 
         # --- R24: the Cells_info schema is not tracking's business. The default
         # cost must be the same matrix whether the table carries the whole
-        # 17-column schema -- with -1 and NaN in the unweighted columns, as
+        # schema -- 17 columns when this was written, 18 since Round 26 added
+        # `Edge Distance`, with -1 and NaN in the unweighted columns, as
         # `extract_cell_info` writes them -- or only the four gate columns, or
         # the pre-Round-24 15 columns an old project has on disk. When the
         # default was the whole schema, the last case raised KeyError.
@@ -2034,7 +2035,7 @@ if __name__ == "__main__":
             schema_wide = build_cost_matrix(full1, full2, feature_columns=list(data_input.CELLS_INFO_COLUMNS),
                                             **case).to_numpy()
             assert np.array_equal(schema_wide, ref, equal_nan=True), case
-        print("R24: default cost identical (bit-for-bit) on the 17-column table with -1/NaN in the")
+        print("R24: default cost identical (bit-for-bit) on the full-schema table with -1/NaN in the")
         print("  restored columns, on a 15-column pre-R24 table, and with the full schema passed")
         print("  as feature_columns (weights resolved by name).")
 

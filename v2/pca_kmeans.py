@@ -180,7 +180,13 @@ FEATURE_FAMILIES: dict[str, dict] = {
         "exclusive": True,
         "standardize": "none",
         "columns": [],  # resolved at runtime from the extraction order
-        "note": "Used alone and without standardization - all coefficients together form one basis.",
+        "note": (
+            "Used alone and without standardization - all coefficients together form one basis. "
+            "Coefficients are normalized before PCA (start point, tracing direction, rotation, "
+            "which end of the long axis is front, and size), so the result describes shape only. "
+            "Front/back is decided per cell outline here, which is noisy for nearly symmetric "
+            "cells; for tracked data decide it per track (efd.front_back_by_track)."
+        ),
     },
 }
 
