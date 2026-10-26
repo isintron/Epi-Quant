@@ -146,6 +146,7 @@ def division_candidates(
                     continue
                 candidates.append({
                     "type": "division",
+                    "pattern": "two_newborns",
                     "frame": end,
                     "mother": mother,
                     "daughters": (a_id, b_id),
@@ -156,6 +157,100 @@ def division_candidates(
                         "daughters_adjacent": True,
                     },
                 })
+    return candidates
+
+
+# A mother carried on into one daughter must lose at least this fraction of its
+# area across the split; without it every newborn next to any cell qualifies.
+_CONTINUATION_SHRINK = 0.8
+
+
+def continuation_division_candidates(
+    spans: Mapping[int, dict],
+    metrics: Callable[[str], Optional[tuple]],
+    neighbours: Callable[[int], Optional[Mapping]],
+    last_frame: int,
+    shrink: float = _CONTINUATION_SHRINK,
+) -> list:
+    """Divisions as a ONE-TO-ONE tracker records them: the mother's track runs
+    on into one daughter and only the other daughter is a newborn.
+
+    `division_candidates` needs the mother track to END with two newborns. That
+    is TissueMiner's convention, but Epi-Quant's linker carries the mother into
+    the daughter that overlaps it most -- measured on Etournay et al. 2016
+    (pupal wing), 27 of 27 divisions in `demo` -- so on Epi-Quant's own tracks
+    that detector returns nothing at all (0 candidates on 4,278 divisions).
+
+    A candidate here needs all of: track A present at `f` and `f + 1` whose
+    area drops below `shrink` x across the step; a track B born at `f + 1`
+    that touches A at `f + 1`; B within `_DIVISION_RADIUS_MULTIPLE` of A's
+    position at `f`; and area(A, f+1) + area(B, f+1) within
+    `_DIVISION_AREA_RATIO` of area(A, f) -- the same bounds as the two-newborn
+    pattern. When several A qualify for one B, the one whose area sum is
+    closest to its own is kept.
+
+    Measured on Etournay WT_1-3 (reference: TissueMiner `cell_histories`,
+    Epi-Quant tracking, +/-1 frame): precision 0.69-0.73, recall 0.47-0.62.
+    Candidates, not verdicts -- see the module docstring.
+
+    Returned with `"pattern": "continuation"` and `daughters = (A, B)`: A is
+    both the mother and the continuing daughter, which `build_lineage_table`
+    resolves by splitting A's track at `f`.
+    """
+    births: Dict[int, list] = {}
+    for track_id, span in spans.items():
+        births.setdefault(span["first"], []).append(track_id)
+    track_at: Dict[int, Dict[int, int]] = {}
+    for track_id, span in spans.items():
+        for frame, cell in span["cells"].items():
+            track_at.setdefault(frame, {})[_raw_label(cell)] = track_id
+
+    candidates = []
+    for frame in sorted(births):
+        f = frame - 1
+        if f < 0 or frame > last_frame:
+            continue
+        graph = neighbours(frame)
+        if graph is None:
+            continue
+        for b_id in births[frame]:
+            b_cell = spans[b_id]["cells"][frame]
+            b_info = metrics(b_cell)
+            if b_info is None:
+                continue
+            best = None
+            for label in graph.get(_raw_label(b_cell), ()):
+                a_id = track_at.get(frame, {}).get(label)
+                if a_id is None or a_id == b_id or f not in spans[a_id]["cells"]:
+                    continue
+                before, after = metrics(spans[a_id]["cells"][f]), metrics(spans[a_id]["cells"][frame])
+                if before is None or after is None or after[2] > shrink * before[2]:
+                    continue
+                area_ratio = (after[2] + b_info[2]) / max(before[2], 1.0)
+                if not (_DIVISION_AREA_RATIO[0] <= area_ratio <= _DIVISION_AREA_RATIO[1]):
+                    continue
+                distance = float(np.hypot(b_info[0] - before[0], b_info[1] - before[1]))
+                if distance > _DIVISION_RADIUS_MULTIPLE * max(before[3], 1.0):
+                    continue
+                if best is None or abs(area_ratio - 1.0) < best[0]:
+                    best = (abs(area_ratio - 1.0), a_id, area_ratio, after[2] / max(before[2], 1.0), distance, before[3])
+            if best is None:
+                continue
+            _, a_id, area_ratio, kept, distance, radius = best
+            candidates.append({
+                "type": "division",
+                "pattern": "continuation",
+                "frame": f,
+                "mother": a_id,
+                "daughters": (a_id, b_id),
+                "evidence": {
+                    "area_ratio": round(area_ratio, 3),
+                    "mother_area_kept": round(kept, 3),
+                    "newborn_distance": round(distance, 1),
+                    "mother_radius": round(radius, 1),
+                    "daughters_adjacent": True,
+                },
+            })
     return candidates
 
 
@@ -300,22 +395,64 @@ def build_lineage_table(
         last_frame = max(s["last"] for s in spans.values())
     margin_tracks = margin_tracks or set()
 
-    mother_of: Dict[int, int] = {}
-    daughters_of: Dict[int, tuple] = {}
+    # A "continuation" division (see `continuation_division_candidates`) keeps
+    # the mother's track running into one daughter. The tracking table is left
+    # as it is; HERE the track is split at the division frame, the mother
+    # keeping the track id up to `f` and the continuing daughter getting a
+    # derived id "<track>.<k>" from `f + 1`. Track ids become strings only when
+    # such a split exists, so tables without one are unchanged.
+    cuts: Dict[int, list] = {}
+    for event in confirmed or []:
+        if event["type"] == "division" and event["mother"] in event["daughters"]:
+            cuts.setdefault(event["mother"], []).append(event["frame"])
+    segment_spans: Dict = {}
+    segment_starts: Dict = {}
+    for track_id, span in spans.items():
+        ends = sorted(set(f for f in cuts.get(track_id, []) if span["first"] <= f < span["last"]))
+        if not ends:
+            segment_spans[track_id] = span
+            segment_starts[track_id] = [(span["first"], track_id)]
+            continue
+        bounds = [span["first"]] + [f + 1 for f in ends]
+        segment_starts[track_id] = []
+        for k, start in enumerate(bounds):
+            stop = ends[k] if k < len(ends) else span["last"]
+            seg_id = track_id if k == 0 else f"{track_id}.{k}"
+            cells = {f: c for f, c in span["cells"].items() if start <= f <= stop}
+            segment_spans[seg_id] = {"first": min(cells), "last": max(cells), "cells": cells}
+            segment_starts[track_id].append((start, seg_id))
+
+    def segment(track_id, frame):
+        """The segment of `track_id` that holds `frame`."""
+        chosen = track_id
+        for start, seg_id in segment_starts.get(track_id, [(None, track_id)]):
+            if start is not None and start <= frame:
+                chosen = seg_id
+        return chosen
+
+    if cuts:
+        # a split track's segments inherit its margin status
+        margin_tracks = {seg for t in margin_tracks for _, seg in segment_starts.get(t, [(None, t)])}
+        spans = segment_spans
+
+    mother_of: Dict = {}
+    daughters_of: Dict = {}
     delaminated = set()
     for event in confirmed or []:
+        f = event["frame"]
         if event["type"] == "division":
-            a, b = event["daughters"]
-            daughters_of[event["mother"]] = (a, b)
-            mother_of[a] = event["mother"]
-            mother_of[b] = event["mother"]
+            mother = segment(event["mother"], f)
+            a, b = (segment(d, f + 1) for d in event["daughters"])
+            daughters_of[mother] = (a, b)
+            mother_of[a] = mother
+            mother_of[b] = mother
         elif event["type"] == "delamination":
-            delaminated.add(event["track"])
+            delaminated.add(segment(event["track"], f))
 
     group_of, generation_of = _lineage_groups(spans, mother_of)
 
     rows = []
-    for track_id, span in sorted(spans.items()):
+    for track_id, span in sorted(spans.items(), key=lambda kv: (str(kv[0]).split(".")[0].zfill(12), str(kv[0]))):
         if track_id in mother_of:
             appears = "Division"
         elif span["first"] == first_frame:
@@ -349,7 +486,14 @@ def build_lineage_table(
             "lineage_group": group_of[track_id],
             "generation": generation_of[track_id],
         })
-    return pd.DataFrame(rows)
+    if not cuts:
+        return pd.DataFrame(rows)
+    # With split tracks, ids mix ints and "<track>.<k>" strings; keep the id
+    # columns as objects so pandas cannot turn 1 into 1.0 next to "1.1".
+    table = pd.DataFrame(rows, dtype=object)
+    for column in ("first_frame", "last_frame", "generation"):
+        table[column] = table[column].astype(int)
+    return table
 
 
 if __name__ == "__main__":
@@ -446,5 +590,49 @@ if __name__ == "__main__":
     assert len(set(table[table.track_id.isin([1, 2, 3])].lineage_group)) == 1, "the family shares one group"
     assert table[table.track_id == 4].iloc[0].lineage_group != row1.lineage_group, "unrelated track is its own group"
     print("  -> mother/daughters share one lineage group; generations 0, 1, 1.")
+
+    # --- a division as a 1-to-1 tracker records it: track 1 runs on into one
+    # daughter (shrinking to ~half), track 2 is born next to it.
+    cont = pd.DataFrame({
+        "Index": [1, 2, 3],
+        "Frame1": ["Cell1_10", None, "Cell1_20"],
+        "Frame2": ["Cell2_10", None, "Cell2_20"],
+        "Frame3": ["Cell3_10", "Cell3_11", "Cell3_20"],
+        "Frame4": ["Cell4_10", "Cell4_11", "Cell4_20"],
+    })
+    cont_geo = {
+        "Cell1_10": (10.0, 10.0, 400.0, 12.0), "Cell2_10": (10.0, 10.0, 400.0, 12.0),
+        "Cell3_10": (8.0, 6.0, 200.0, 8.0), "Cell4_10": (8.0, 6.0, 210.0, 8.0),
+        "Cell3_11": (12.0, 14.0, 190.0, 8.0), "Cell4_11": (12.0, 14.0, 200.0, 8.0),
+        "Cell2_20": (90.0, 90.0, 380.0, 12.0), "Cell3_20": (90.0, 90.0, 380.0, 12.0),
+    }
+    cont_graphs = {3: {10: {11}, 11: {10}, 20: set()}}
+    cont_spans = track_spans(cont)
+    assert division_candidates(cont_spans, cont_geo.get, cont_graphs.get, last_frame=4) == [], \
+        "the two-newborn detector cannot see a mother that continues -- the reason this pattern exists"
+    found = continuation_division_candidates(cont_spans, cont_geo.get, cont_graphs.get, last_frame=4)
+    print("\ncontinuation division candidates:", found)
+    assert len(found) == 1 and found[0]["mother"] == 1 and found[0]["daughters"] == (1, 2), found
+    assert found[0]["frame"] == 2 and found[0]["pattern"] == "continuation", found
+    # an unrelated newborn next to a cell that does NOT shrink is not a division
+    steady = dict(cont_geo, **{"Cell3_10": (8.0, 6.0, 390.0, 12.0)})
+    assert continuation_division_candidates(cont_spans, steady.get, cont_graphs.get, last_frame=4) == [], \
+        "a newborn beside a cell that keeps its area is not a division"
+    print("  -> found where the two-newborn detector is blind; rejected when the 'mother' keeps its area.")
+
+    cont_table = build_lineage_table(cont, confirmed=found, last_frame=4)
+    print("\nlineage table (continuation):\n", cont_table.to_string(index=False))
+    by_id = {str(r.track_id): r for r in cont_table.itertuples()}
+    assert set(by_id) == {"1", "1.1", "2", "3"}, by_id.keys()
+    assert by_id["1"].last_frame == 2 and by_id["1"].disappears_by == "Division", by_id["1"]
+    assert by_id["1.1"].first_frame == 3 and by_id["1.1"].appears_by == "Division", by_id["1.1"]
+    assert str(by_id["1.1"].mother_track_id) == "1" and str(by_id["2"].mother_track_id) == "1"
+    assert by_id["1.1"].generation == 1 and by_id["2"].generation == 1 and by_id["1"].generation == 0
+    assert by_id["3"].disappears_by == "Stays" and by_id["3"].lineage_group != by_id["1"].lineage_group
+    assert list(cont["Frame3"]) == ["Cell3_10", "Cell3_11", "Cell3_20"], "the tracking table must not be modified"
+    # no confirmed continuation -> track ids and dtypes exactly as before
+    plain = build_lineage_table(cont, confirmed=[], last_frame=4)
+    assert list(plain.track_id) == [1, 2, 3], plain.track_id
+    print("  -> track 1 split at the division: 1 (mother) and 1.1 (daughter); tracking table untouched.")
 
     print("\nAll lineage self-tests passed.")

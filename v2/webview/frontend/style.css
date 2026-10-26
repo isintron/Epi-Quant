@@ -1,3 +1,6 @@
+/* ===================== INTERFACE COLOURS (themed) =====================
+   Chrome only: background, text, borders, buttons, panels, selected state.
+   These follow the theme. See the block below for the ones that must not. */
 :root {
   --bg: #f5f6f8;
   --panel: #ffffff;
@@ -8,6 +11,71 @@
   --accent-hover: #1d4ed8;
   --danger: #dc2626;
   --success: #16a34a;
+  --hover: #f0f1f3;
+  --input-bg: #ffffff;
+  --track-bg: #e5e7eb;
+  --image-bg: #111;
+  --float-bg: rgba(250, 250, 252, 0.98);
+  --selected-bg: #2563eb;
+  --selected-text: #ffffff;
+}
+
+/* Dark. The selected step used to be `#2563eb` with white text, which is the
+   maintainer's complaint: against the dark panel that blue sits at 3.12:1, so
+   the selected step barely separates from the unselected ones. A brighter
+   blue with DARK text reads as selected instead -- #60a5fa against the panel
+   is 6.35:1, and the label on it is 7.36:1 (the light theme's white-on-blue
+   is 5.17:1). Measured, not eyeballed. */
+html[data-theme="dark"] {
+  --bg: #16181c;
+  --panel: #1e2126;
+  --border: #3a3f46;
+  --text: #e6e8eb;
+  --muted: #9aa1ab;
+  --accent: #60a5fa;
+  --accent-hover: #93c5fd;
+  --danger: #ff6b6b;
+  --success: #4ade80;
+  --hover: #2a2f36;
+  --input-bg: #15181c;
+  --track-bg: #2a2f36;
+  --image-bg: #0b0d10;
+  --float-bg: rgba(30, 33, 38, 0.98);
+  --selected-bg: #60a5fa;
+  --selected-text: #0b1220;
+}
+
+/* ================= DATA COLOURS -- NOT THEMED, EVER ==================
+   These ENCODE something: matched / unmatched / un-extracted, a filmstrip
+   cell that is held, the census candidate the tracker picked, a destructive
+   plan step. If they changed with the theme, the same image would mean two
+   different things in two themes -- and the reader would carry one of those
+   meanings into a figure. They are deliberately literal, never `var(--...)`:
+
+     #ffcc00  census candidate = the tracker's own answer (outline)
+     #34c759  filmstrip: this track holds a cell in this frame
+     #d0d3d8  filmstrip: it does not
+     #0a84ff  filmstrip: the frame being shown
+     #c0392b  a plan step that takes a cell from another track
+     #ff9f0a  swap mode armed
+
+   The overlay's own encodings (matched #ffd633 / unmatched #3388ff /
+   un-extracted #ff00ff, the agreement and dynamics colours, every LUT) are
+   not in this file at all -- they are backend constants, so a theme cannot
+   reach them. Contrast against a dark background is handled by outlines, not
+   by changing the hue. */
+
+input, select, textarea {
+  background: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+/* A colour well shows its own colour; a themed background would fight it. */
+input[type="color"] {
+  padding: 0;
+  background: none;
 }
 
 * { box-sizing: border-box; }
@@ -20,13 +88,54 @@ body {
   padding: 0;
 }
 
-.mock-banner {
+/* Round 29 §4: a badge in the corner, not a bar across the top. KEPT rather
+   than removed -- it is the one thing on screen that distinguishes fixture
+   numbers from this project's, and this repository has lost rounds to taking
+   one thing for another. Full text is in the title attribute. */
+.mock-badge {
+  position: fixed;
+  top: 8px;
+  right: 10px;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 10px;
   background: #fef3c7;
   color: #92400e;
-  text-align: center;
-  padding: 6px 12px;
-  font-size: 13px;
-  border-bottom: 1px solid #fcd34d;
+  border: 1px solid #fcd34d;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: help;
+}
+
+.mock-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #f59e0b;
+}
+
+/* Swap mode has to be visible: the same click means "select" or "exchange"
+   depending on it (Round 29 §6). Cursor on the image, highlight on the label. */
+.image-click-wrap.swap-mode-on {
+  outline: 2px solid #ff9f0a;
+  outline-offset: 2px;
+  cursor: cell;
+}
+
+.swap-mode-label-on {
+  background: #fff3cd;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-weight: 600;
+}
+
+/* A label, not an emphasis (Round 29 §2). */
+.control-group-label-plain {
+  font-weight: 400;
 }
 
 header {
@@ -63,9 +172,10 @@ header h1 {
 }
 
 .step-btn.active {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: white;
+  background: var(--selected-bg);
+  border-color: var(--selected-bg);
+  color: var(--selected-text);
+  font-weight: 600;
 }
 
 main {
@@ -167,11 +277,11 @@ button {
 .primary-btn:hover { background: var(--accent-hover); }
 
 .secondary-btn {
-  background: white;
+  background: var(--panel);
   color: var(--text);
 }
 
-.secondary-btn:hover { background: #f0f1f3; }
+.secondary-btn:hover { background: var(--hover); }
 
 button:disabled {
   opacity: 0.5;
@@ -191,7 +301,7 @@ button:disabled {
 
 .progress-bar {
   height: 8px;
-  background: #e5e7eb;
+  background: var(--track-bg);
   border-radius: 4px;
   overflow: hidden;
   margin: 10px 0;
@@ -305,7 +415,7 @@ button:disabled {
   border-radius: 8px;
   overflow: auto;
   max-height: 520px;
-  background: #111;
+  background: var(--image-bg);
   display: inline-block;
 }
 
@@ -392,12 +502,16 @@ button:disabled {
   font-size: 13px;
   border-radius: 6px;
   border: 1px solid var(--border);
-  background: white;
+  /* Round 32 UI-3: was `background: white`, the one literal left in the top
+     bar, which is why the Clipboard button and the theme dropdown stayed
+     light in the dark theme. The class's specificity also beat the themed
+     `select` rule, so the dropdown could not pick the theme up by itself. */
+  background: var(--panel);
   color: var(--muted);
 }
 
 .nav-action-btn:hover:not(:disabled) {
-  background: #f0f1f3;
+  background: var(--hover);
   color: var(--text);
 }
 
@@ -714,7 +828,7 @@ details summary {
   padding: 8px;
   border: 1px solid var(--border, #d8dbe0);
   border-radius: 6px;
-  background: rgba(250, 250, 252, 0.98);
+  background: var(--float-bg);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
   max-width: none;
   width: 360px;
@@ -772,3 +886,287 @@ details summary {
   outline: 2px solid #0a84ff;
   outline-offset: -1px;
 }
+
+/* ------------------------------------------------------------------
+   Round 34: chart controls, value chips, the export / clipboard menus
+   and the movie-maker dialog.
+
+   Every colour here is a theme variable. Round 32 UI-3's lesson: a menu
+   hardcoded to white text on a white panel is invisible in one theme and
+   nobody notices until someone switches.
+   ------------------------------------------------------------------ */
+
+.chart-panel {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.chart-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.chart-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chart-controls select,
+.chart-controls input {
+  background: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 4px;
+  max-width: 190px;
+}
+
+.chart-wrap {
+  margin: 8px 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px;
+  min-height: 40px;
+  overflow: auto;
+}
+
+/* The figure is rendered at a physical size on the Python side; the browser
+   only scales it to fit, never up past its own pixels. */
+.chart-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0;
+  min-height: 24px;
+}
+
+.value-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px 2px 8px;
+  background: var(--hover);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: grab;
+  user-select: none;
+}
+
+.value-chip.pending {
+  border-style: dashed;
+  color: var(--muted);
+  cursor: default;
+}
+
+.chip-remove {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.chip-remove:hover { color: var(--danger); }
+
+.nav-menu-wrap { position: relative; display: inline-block; }
+
+/* Shared by the clipboard dropdown and the chart right-click menu. */
+.nav-menu {
+  position: absolute;
+  z-index: 60;
+  min-width: 190px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  padding: 4px;
+}
+
+#chart-context-menu { position: absolute; }
+
+.nav-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.nav-menu button:hover { background: var(--hover); }
+
+.popover.dialog {
+  position: fixed;
+  top: 20%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 70;
+  max-width: 520px;
+}
+
+#movie-progress { width: 100%; }
+
+.playground-panel { margin-top: 10px; }
+
+/* ------------------------------------------------------------------
+   Round 35: the value picker, the Figure-settings popover, and the
+   nav-bar select that grew to fill the window.
+   ------------------------------------------------------------------ */
+
+/* 4-4: `input, select { flex: 1; min-width: 120px }` applies to the nav bar
+   too, and the nav bar is a flex row -- so once it wrapped at 1250x845 the
+   theme dropdown was the only flexible item on its line and took the whole
+   width. It is a 3-item menu; it sizes to its content. */
+#theme-select,
+.nav-action-btn select {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.time-window-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+}
+
+.time-window-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.time-window-row input { max-width: 110px; }
+
+/* 2-1: a drawn dropdown, because a native <datalist> option carrying both a
+   value and a label is rendered on two lines by WebKit and cannot be styled. */
+.value-picker-wrap {
+  position: relative;
+  display: inline-flex;
+  flex: 1;
+  min-width: 200px;
+}
+
+.value-picker-input { width: 100%; }
+
+.value-picker-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  z-index: 50;
+  /* Wider than its input: the input is a search box and can be narrow, but
+     a value name clipped mid-word ("Approximate Polygon Vertex Co…") is the
+     same unreadable list this replaced, for a different reason. */
+  min-width: max(100%, 330px);
+  width: max-content;
+  max-width: 480px;
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  padding: 4px;
+}
+
+.value-picker-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 5px 8px;
+  cursor: pointer;
+  font-size: 13px;
+  /* One line per value. Overflow is clipped rather than wrapped: a second
+     line is the defect this replaced. */
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.value-picker-row:hover,
+.value-picker-row.active { background: var(--hover); }
+
+.value-picker-name { color: var(--text); }
+
+.value-picker-meta {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#figure-settings-popover {
+  min-width: 420px;
+}
+
+#figure-settings-popover .field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+#figure-settings-popover label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+#figure-settings-popover select { max-width: 170px; }
+
+#figure-settings-handle { cursor: move; }
+
+.nav-menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 2px;
+}
+
+/* Round 36: a disabled panel says why on hover, so a grey control is never
+   just grey. */
+.radio-label.disabled-reason,
+.checkbox-label.disabled-reason {
+  opacity: 0.55;
+  cursor: help;
+}
+
+#joint-features-popover { min-width: 420px; }
+#joint-features-handle { cursor: move; }
+#group-extract-progress { width: 100%; margin: 4px 0; }

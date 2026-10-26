@@ -113,6 +113,16 @@ def resolve_weights(feature_columns: list) -> list:
 # legitimately has no predecessor (a division, or one entering the field).
 DEFAULT_OVERLAP_WEIGHT = 1.0
 
+# Multiplier on BOTH displacement gates -- the per-cell extent gate
+# (|dx|, |dy| <= max(H, V) of the frame-f cell) and the movie-wide ceiling
+# (largest circumscribed radius). 1.0 is the shipped behaviour. The gates assume
+# a cell moves less than its own size per frame, which holds for coherent
+# epithelia; a sparse, fast-moving population can need more. Measured
+# (2026-10-19): see figures/revision_2026-10/fig_tracking/README.md. The cost
+# itself is unchanged -- the overlap term's max(H, V) bridge keeps the
+# UNSCALED extent, so the scale widens what may be considered, never what wins.
+DEFAULT_GATE_SCALE = 1.0
+
 
 def mask_overlap_fractions(labels1: np.ndarray, labels2: np.ndarray) -> dict:
     """`{(label1, label2): IoU}` for every pair of cells whose masks overlap
@@ -509,6 +519,7 @@ def build_cost_matrix(
     predicted_centroids: Optional[dict] = None,
     cost_form: str = "additive",
     overlap_power: float = 1.0,
+    gate_scale: float = DEFAULT_GATE_SCALE,
 ) -> pd.DataFrame:
     """Build the dissimilarity/cost matrix between every cell in
     `cells_frame1` (rows) and `cells_frame2` (columns), both indexed by
@@ -644,10 +655,11 @@ def build_cost_matrix(
                 features1[i, center_y] = float(predicted[1])
 
     max_distance = np.maximum(features1[:, extent_x], features1[:, extent_y])[:, None]
+    gate = gate_scale * max_distance     # `DEFAULT_GATE_SCALE`; the bridge below keeps max_distance
 
     delta_x = features2[None, :, center_x] - features1[:, None, center_x]
     delta_y = features2[None, :, center_y] - features1[:, None, center_y]
-    implausible = (np.abs(delta_x) > max_distance) | (np.abs(delta_y) > max_distance)
+    implausible = (np.abs(delta_x) > gate) | (np.abs(delta_y) > gate)
 
     # Accumulated in the same column order as the original loop so the
     # floating-point result is bit-identical, not merely close.
@@ -662,7 +674,7 @@ def build_cost_matrix(
     # distance, so lowering `centroid_weight` changes what the solver prefers
     # but never what it is allowed to consider.
     if max_centroid_distance is not None:
-        implausible |= distance > max_centroid_distance
+        implausible |= distance > gate_scale * max_centroid_distance
 
     deficit = np.zeros((len(idx1), len(idx2)), dtype=float)
     if use_overlap:
@@ -689,8 +701,10 @@ def _build_cost_matrix_reference(
     cells_frame1, cells_frame2, feature_columns=None, weights=None, overlaps=None,
     overlap_weight=DEFAULT_OVERLAP_WEIGHT, max_centroid_distance=None,
     centroid_weight=1.0, predicted_centroids=None, cost_form="additive", overlap_power=1.0,
+    gate_scale=DEFAULT_GATE_SCALE,
 ) -> pd.DataFrame:
-    """The original per-pair loop `build_cost_matrix` replaced, kept verbatim.
+    """The original per-pair loop `build_cost_matrix` replaced, kept verbatim
+    (plus `gate_scale`, applied the same way).
 
     Not used in the pipeline -- it exists so the vectorised version can be
     asserted equal to it rather than merely believed to be. It is slow on
@@ -719,15 +733,15 @@ def _build_cost_matrix_reference(
         for j, id2 in enumerate(idx2):
             info2 = list(cells_frame2.loc[id2, feature_columns])
             max_distance = max(info1[extent_x], info1[extent_y])
-            if (abs(info2[center_x] - info1[center_x]) > max_distance
-                    or abs(info2[center_y] - info1[center_y]) > max_distance):
+            if (abs(info2[center_x] - info1[center_x]) > gate_scale * max_distance
+                    or abs(info2[center_y] - info1[center_y]) > gate_scale * max_distance):
                 cells_relation[i, j] = np.nan
                 continue
             distance_sq = 0.0
             for k in scored:
                 distance_sq += weights[k] * (info2[k] - info1[k]) ** 2
             distance = np.sqrt(distance_sq)
-            if max_centroid_distance is not None and distance > max_centroid_distance:
+            if max_centroid_distance is not None and distance > gate_scale * max_centroid_distance:
                 cells_relation[i, j] = np.nan
                 continue
             deficit = 0.0
@@ -902,6 +916,36 @@ def _merge_tracking_pairs(
     return data_final
 
 
+def count_tracks(tracking_data) -> dict:
+    """`{rows, with_cells, empty}` for a tracking table.
+
+    **A row is not a track.** A stored table can carry rows that claim no cell
+    in any frame: `AS_LE_lateral view_E-cad`'s has 145 rows of which 37 are
+    empty, and they are like that on disk -- `dedupe_tracking_data` does not
+    make them. Everything downstream that reads cells (`CellTable.key_table`,
+    every plot) therefore sees 108, while the Track step reported 145, and the
+    two numbers looked like a contradiction.
+
+    One definition, used by every reporter, so they cannot drift apart: a row
+    counts as a track when at least one `Frame{n}` column holds a value. The
+    phantom trailing column `_merge_tracking_pairs` emits is all-NaN and so
+    contributes nothing either way.
+    """
+    import pandas as _pd
+
+    if tracking_data is None or len(tracking_data) == 0:
+        return {"rows": 0, "with_cells": 0, "empty": 0}
+    frame_columns = [c for c in tracking_data.columns
+                     if re.fullmatch(r"Frame\d+", str(c))]
+    if not frame_columns:
+        return {"rows": int(len(tracking_data)), "with_cells": 0,
+                "empty": int(len(tracking_data))}
+    populated = tracking_data[frame_columns].notna().any(axis=1)
+    return {"rows": int(len(tracking_data)),
+            "with_cells": int(populated.sum()),
+            "empty": int((~populated).sum())}
+
+
 def dedupe_tracking_data(tracking_data: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """Repair a tracking table that may have duplicate/ambiguous claims on a
     single physical cell (possible in files written before the
@@ -954,6 +998,7 @@ def track_cells(
     four_quadrant: bool = False,
     drift_mode: str = "none",
     drift_by_frame: Optional[dict] = None,
+    gate_scale: float = DEFAULT_GATE_SCALE,
 ) -> pd.DataFrame:
     """Track cells frame-to-frame across all frames present in `cells_info`
     (indexed by `Cell Index` string; optionally pre-split to a single
@@ -1131,7 +1176,7 @@ def track_cells(
             overlaps=overlaps, overlap_weight=overlap_weight,
             max_centroid_distance=radius_ceiling,
             centroid_weight=pair_centroid_weight, predicted_centroids=predicted,
-            cost_form=cost_form, overlap_power=overlap_power,
+            cost_form=cost_form, overlap_power=overlap_power, gate_scale=gate_scale,
         )
         cost_df.to_excel(os.path.join(frame_output_dir, f"{folder_prefix}Cell_Relation_{fig_id}_{fig_id + 1}.xlsx"))
 
@@ -1164,7 +1209,7 @@ def track_cells(
     if max_frame_gap:
         merged, joins = close_track_gaps(
             merged, cells_info, max_frame_gap=max_frame_gap,
-            feature_columns=feature_columns, max_centroid_distance=radius_ceiling,
+            feature_columns=feature_columns, max_centroid_distance=gate_scale * radius_ceiling,
         )
         if joins:
             logger.info("Gap closing joined %d track segment(s) across up to %d skipped frame(s).",
@@ -1362,6 +1407,12 @@ def close_track_gaps(
     return merged, joins
 
 
+def _label_of(cell_index) -> Optional[int]:
+    """The raw label out of a `Cell{frame}_{label}` string."""
+    match = re.search(r"Cell\d+_(\d+)$", str(cell_index))
+    return int(match.group(1)) if match else None
+
+
 def retrack_frame_range(
     cells_info: pd.DataFrame,
     tracking_data: pd.DataFrame,
@@ -1380,6 +1431,8 @@ def retrack_frame_range(
     drift_mode: str = "none",
     drift_by_frame: Optional[dict] = None,
     max_frame_gap: int = 0,
+    roi_labels_by_frame: Optional[dict] = None,
+    gate_scale: float = DEFAULT_GATE_SCALE,
 ) -> dict:
     """Re-solve tracking for frames `start_frame..end_frame` only, leaving
     every other frame's identities untouched. For use after hand-correcting
@@ -1429,6 +1482,39 @@ def retrack_frame_range(
     Cells inside the range with no anchor (a cell that appears mid-range)
     start a new track numbered `max(Index) + 1`, the same collision-free
     scheme the correction path already uses.
+
+    **`roi_labels_by_frame` limits what is WRITTEN BACK, never what is
+    solved** (Round 29 §9b). Pass `{frame: {raw labels considered inside the
+    region of interest}}` and only links with at least one endpoint in that
+    set replace the stored ones; every other link keeps whatever it had.
+
+    The distinction matters and is the whole design. Restricting the COST
+    MATRIX to an ROI -- the obvious reading of "only re-track near the edit"
+    -- removes every cell outside it from the set of options, so a cell whose
+    true successor lies outside the ROI is forced onto the best cell inside
+    it. That invents errors, precisely where the user has just been working.
+    The frame pair is therefore solved whole, with the same cost `track_cells`
+    uses, and the ROI is applied afterwards. The cost is one full pair solve,
+    which is nothing: a whole 86-frame movie tracks in about five seconds.
+
+    `None` (the default) writes every re-solved link back, which is the
+    behaviour every existing caller gets.
+
+    **Not reachable from the UI, deliberately, and this is the record of that
+    decision** (rule 6 case 2: a knob the product path cannot produce is not
+    implemented). `_run_local_retrack` never passes it, because the app keeps
+    no pre-correction copy of the masks, so it has nothing to diff and cannot
+    work out which pixels changed. Measured before deciding, on
+    `AS_LE_lateral view_E-cad` (.npy; `drift_mode='none'`, the resolved default;
+    93 of 100 injected re-segmentations changed at least one link, ROI = 3 x
+    the 33 px median cell radius): against the links the pipeline produces on
+    the corrected masks, the full write-back recovered them exactly in 93/93,
+    the ROI write-back in 89/93 and was strictly worse in 4 (1-4 stale links
+    left standing, both of whose endpoints lay outside the ROI). Median links
+    changed was 2 either way, and the median solve was 0.045 s vs 0.041 s --
+    so on this movie the ROI bought no measurable reduction in blast radius
+    and no time, and cost a little correctness. Re-measure before wiring it
+    up; a movie with larger frames or heavier drift may well read differently.
     """
     import manual_correction_tracking  # local: avoids a circular import at module load
 
@@ -1538,13 +1624,23 @@ def retrack_frame_range(
             overlaps=overlaps, overlap_weight=overlap_weight,
             max_centroid_distance=radius_fallback,
             centroid_weight=centroid_weight, predicted_centroids=predicted,
-            cost_form=cost_form, overlap_power=overlap_power,
+            cost_form=cost_form, overlap_power=overlap_power, gate_scale=gate_scale,
         )
         sentinel = _no_match_sentinel(cost, radius_fallback, no_link_ratio=no_link_ratio)
         matched = match_frames(cost, sentinel, four_quadrant=four_quadrant)
         matched = matched[matched["Difference"] != sentinel]
         links[frame] = dict(zip(matched["frame1_cell"], matched["frame2_cell"]))
+        # The ROI filters the WRITE-BACK only; `links[frame]` above came from
+        # the full pair, and `previous_matches` below keeps the full solution so
+        # motion compensation still sees every accepted match.
         previous_cells, previous_matches = cells_a, links[frame]
+        if roi_labels_by_frame is not None:
+            here = set(roi_labels_by_frame.get(frame, ()))
+            there = set(roi_labels_by_frame.get(frame + 1, ()))
+            links[frame] = {
+                a: b for a, b in links[frame].items()
+                if _label_of(a) in here or _label_of(b) in there
+            }
 
     def _row_holding(frame: int, cell_index: str):
         col = f"Frame{frame}"
@@ -1629,7 +1725,7 @@ def retrack_frame_range(
         id_col = tracking_data.columns[0]
         _, proposed = close_track_gaps(
             tracking_data.copy(deep=True), cells_info, max_frame_gap=max_frame_gap,
-            feature_columns=feature_columns, max_centroid_distance=radius_fallback,
+            feature_columns=feature_columns, max_centroid_distance=gate_scale * radius_fallback,
         )
         # A chain is all-or-nothing: its links share one surviving root and
         # must be applied in order, so applying only its tail links would merge
@@ -1683,6 +1779,7 @@ def track_all_populations(
     four_quadrant: bool = False,
     drift_mode: str = "none",
     drift_by_frame: Optional[dict] = None,
+    gate_scale: float = DEFAULT_GATE_SCALE,
     feature_columns: Optional[list[str]] = None,
     weights: Optional[list[float]] = None,
 ) -> pd.DataFrame:
@@ -1725,7 +1822,7 @@ def track_all_populations(
         # file-reading fallback for direct callers, which is v1's behaviour.)
         epi_start_index = 1
         if not mes_cells_info.empty:
-            mes_tracking = track_cells(mes_cells_info, output_dir, start_index=1, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
+            mes_tracking = track_cells(mes_cells_info, output_dir, start_index=1, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight, gate_scale=gate_scale,
                                        centroid_weight=centroid_weight, motion_compensation=motion_compensation,
                                        max_frame_gap=max_frame_gap, cost_form=cost_form,
                                        overlap_power=overlap_power, no_link_ratio=no_link_ratio,
@@ -1736,7 +1833,7 @@ def track_all_populations(
             if not mes_tracking.empty:
                 epi_start_index = int(mes_tracking.iloc[:, 0].max()) + 1
         if not epi_cells_info.empty:
-            epi_tracking = track_cells(epi_cells_info, output_dir, start_index=epi_start_index, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
+            epi_tracking = track_cells(epi_cells_info, output_dir, start_index=epi_start_index, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight, gate_scale=gate_scale,
                                        centroid_weight=centroid_weight, motion_compensation=motion_compensation,
                                        max_frame_gap=max_frame_gap, cost_form=cost_form,
                                        overlap_power=overlap_power, no_link_ratio=no_link_ratio,
@@ -1746,7 +1843,7 @@ def track_all_populations(
             all_tracking_data = pd.concat([all_tracking_data, epi_tracking], axis=0, ignore_index=True)
     else:
         cells_info = cells_info.set_index("Cell Index")
-        all_tracking_data = track_cells(cells_info, output_dir, start_index=1, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight,
+        all_tracking_data = track_cells(cells_info, output_dir, start_index=1, progress_cb=progress_cb, npy_folder=npy_folder, overlap_weight=overlap_weight, gate_scale=gate_scale,
                                        centroid_weight=centroid_weight, motion_compensation=motion_compensation,
                                        max_frame_gap=max_frame_gap, cost_form=cost_form,
                                        overlap_power=overlap_power, no_link_ratio=no_link_ratio,
@@ -1974,6 +2071,8 @@ if __name__ == "__main__":
             dict(predicted_centroids=predictions, max_centroid_distance=40.0),
             dict(overlaps=fake_overlaps, overlap_weight=1.0, predicted_centroids=predictions,
                  max_centroid_distance=40.0, overlap_power=2.0),
+            dict(max_centroid_distance=25.0, gate_scale=2.0),
+            dict(overlaps=fake_overlaps, overlap_weight=1.0, gate_scale=0.5),
         ]
         # What is asserted, and why not bit-identity: numpy's vectorised sqrt
         # does not always take the same code path as scalar sqrt, so one entry
@@ -2007,6 +2106,18 @@ if __name__ == "__main__":
         assert 0 < gated < many1.shape[0] * many2.shape[0], gated
         print("  (%d of %d pairs gated in the ceiling case, so the NaN paths are actually exercised)"
               % (gated, many1.shape[0] * many2.shape[0]))
+        # gate_scale widens what may be considered and changes no finite cost
+        base_m = build_cost_matrix(many1, many2, overlaps=fake_overlaps, overlap_weight=1.0, max_centroid_distance=25.0)
+        wide_m = build_cost_matrix(many1, many2, overlaps=fake_overlaps, overlap_weight=1.0, max_centroid_distance=25.0,
+                                   gate_scale=2.0)
+        a0, a1 = base_m.to_numpy(), wide_m.to_numpy()
+        assert np.isnan(a1).sum() < np.isnan(a0).sum(), "a wider gate must admit more pairs"
+        both = ~np.isnan(a0)
+        assert np.array_equal(a0[both], a1[both]), "gate_scale must not change any cost it does not gate"
+        assert build_cost_matrix(many1, many2, gate_scale=1.0).equals(build_cost_matrix(many1, many2)), \
+            "gate_scale=1 must be the shipped behaviour"
+        print("  gate_scale: x2 admits %d more pairs, leaves every existing cost unchanged; x1 = shipped."
+              % (int(np.isnan(a0).sum()) - int(np.isnan(a1).sum())))
 
         # --- R24: the Cells_info schema is not tracking's business. The default
         # cost must be the same matrix whether the table carries the whole
@@ -2355,6 +2466,30 @@ if __name__ == "__main__":
                 continue
             raise AssertionError("%s must raise" % label)
         print("  A1: drift_mode typos, no_link_ratio<=1.0 and overlap_power=0 all raise.")
+
+            # --- count_tracks: a row is not a track. The stored
+        # `AS_LE_lateral view_E-cad` table has 145 rows of which 37 claim no cell
+        # in any frame, so the Track step reported 145 while every plot counted
+        # 108. One definition, so the two reporters cannot disagree.
+        counting = pd.DataFrame({
+            "Index": [1, 2, 3, 4],
+            "Frame1": ["Cell1_1", None, "Cell1_3", None],
+            "Frame2": ["Cell2_1", None, None, None],
+            "Frame3": [None, None, None, None],      # the phantom trailing column
+        })
+        counts = count_tracks(counting)
+        assert counts == {"rows": 4, "with_cells": 2, "empty": 2}, counts
+        # The phantom column must not make an empty row look populated, and must
+        # not turn a populated one empty either.
+        assert count_tracks(counting.drop(columns=["Frame3"])) == counts
+        assert count_tracks(None) == {"rows": 0, "with_cells": 0, "empty": 0}
+        assert count_tracks(pd.DataFrame({"Index": [1, 2]})) == {
+            "rows": 2, "with_cells": 0, "empty": 2}, "no Frame columns at all"
+        # And a table with nothing empty reports no discrepancy to explain.
+        full = pd.DataFrame({"Index": [1, 2], "Frame1": ["Cell1_1", "Cell1_2"]})
+        assert count_tracks(full) == {"rows": 2, "with_cells": 2, "empty": 0}
+        print("count_tracks: 4 rows -> 2 tracks, 2 empty; the phantom trailing "
+              "column changes nothing.")
 
         print("All cell_tracking self-tests passed.")
         raise SystemExit(0)

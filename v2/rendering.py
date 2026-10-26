@@ -530,6 +530,51 @@ def render_score_overlay(
     return Image.fromarray(img)
 
 
+def render_value_map(
+    fill_labels: np.ndarray,
+    base_image: np.ndarray,
+    values: dict,
+    cmap: str = "viridis",
+    vmin: float = 0.0,
+    vmax: float = 1.0,
+    bar_width: int = 18,
+) -> Image.Image:
+    """Any per-cell value painted back onto the frame, with a colour bar.
+
+    `render_score_overlay` already does the tinting; what this adds is the bar
+    and its two end labels, so an exported frame can be read without the UI
+    around it. A cell with no value is left untinted -- "not measured" is not
+    the same as "measured low", and on a `Cells_info_PCA` value that is most of
+    the edge cells.
+
+    `vmin`/`vmax` are the caller's, never this frame's own range: autoscaling
+    each frame of a movie makes every frame look equally variable, which is a
+    statement about the colour map rather than the tissue. For a signed value
+    (a PC score) the caller passes a symmetric window and a diverging map, so
+    zero sits at the middle of the ramp rather than wherever the data does.
+
+    The bar is drawn at the image's own pixel resolution; nothing is upscaled,
+    because enlarging a label image adds no information.
+
+    **No text is drawn into the image** (Round 35 3-1). It used to carry the
+    value's name at the top left and the range at the ends of the bar, in
+    PIL's bitmap default font -- which has no glyph for `µ`, so `µm²` rendered
+    as boxes, and which cannot be edited, translated or restyled once it is
+    pixels. The range belongs in the panel's status line, where it can say
+    whether the scale is this frame's or the whole movie's.
+    """
+    tinted = np.asarray(render_score_overlay(fill_labels, base_image, values,
+                                             lut_name=cmap, vmin=vmin, vmax=vmax))
+    height, width = tinted.shape[:2]
+    bar_total = bar_width + 2
+    canvas = np.zeros((height, width + bar_total, 3), dtype=np.uint8)
+    canvas[:, :width] = tinted
+    ramp = _lut_256(cmap)[(np.linspace(1, 0, height) * 255).astype(int)]
+    canvas[:, width + 2:] = ramp[:, None, :]
+
+    return Image.fromarray(canvas)
+
+
 def _label_centroids(fill_labels: np.ndarray) -> dict[int, tuple[int, int]]:
     """`{label: (cx, cy)}` for every non-background label, in one pass.
 

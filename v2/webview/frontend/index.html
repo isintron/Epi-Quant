@@ -8,8 +8,9 @@
 </head>
 <body>
 
-<div id="mock-banner" class="mock-banner" style="display:none">
-  Dev-mode mock API active (no window.pywebview found) — showing fixture data only.
+<div id="mock-banner" class="mock-badge" style="display:none"
+     title="Dev-mode mock API active (no window.pywebview found) — every number on screen is fixture data, not this project's.">
+  <span class="mock-dot"></span>mock
 </div>
 
 <header>
@@ -22,9 +23,25 @@
     <button class="step-btn" data-step="track" disabled>5. Track</button>
     <button class="step-btn" data-step="correct-tracking" disabled>6. Correct Tracking</button>
     <button class="step-btn" data-step="trajectory" disabled>7. Trajectory</button>
+    <button class="step-btn" data-step="playground" disabled>8. Data Playground</button>
     <!-- Deliberately NOT .step-btn: init() binds goToStep(btn.dataset.step) to
          every .step-btn, which would throw on a button with no data-step. -->
-    <button id="copy-view-btn" class="nav-action-btn" title="Copy the current view to the clipboard" disabled>⧉ Clipboard</button>
+    <span class="nav-menu-wrap">
+      <button id="copy-view-btn" class="nav-action-btn" title="Copy the view, or record a movie" disabled>⧉ Clipboard ▾</button>
+      <div id="copy-view-menu" class="nav-menu" style="display:none">
+        <button data-action="copy">Copy view to clipboard</button>
+        <button data-action="movie">Movie maker…</button>
+      </div>
+    </span>
+    <!-- Round 29 §7. Interface colours only: the overlay encodings (matched /
+         unmatched / un-extracted, the LUTs, the agreement colours) are
+         deliberately identical in both themes, or the same picture would mean
+         two things. -->
+    <select id="theme-select" class="nav-action-btn"
+            title="Interface theme. Data colours (overlay fills, LUTs) are the same in both.">
+      <option value="light" selected>☀ Light</option>
+      <option value="dark">☾ Dark</option>
+    </select>
   </nav>
 </header>
 
@@ -76,6 +93,21 @@
            "at least N px ... to drop 3 px labels enter 4" sentence is Round 24
            issue 2's direct product. Do not simplify it. -->
       <button id="min-cell-area-help-btn" class="help-btn" aria-label="What do these two options do?">?</button>
+    </div>
+    <!-- Round 31 C. Two facts about the ACQUISITION that the masks cannot
+         supply, so they belong with the other project-level inputs rather
+         than inside a later step's panel. Both persist with the project and
+         both may be left empty: empty behaves exactly as before, and a
+         feature that needs microns refuses rather than quietly meaning
+         pixels. -->
+    <div class="field-row">
+      <label title="Seconds between frames. A persistence requirement is stored in seconds, so without this it can only be expressed in frames.">Frame interval
+        <input type="number" id="frame-interval-input" class="small-input" min="0" step="0.1" placeholder="unset">s
+      </label>
+      <label title="Microns per pixel. Nothing falls back to pixels when this is empty; features that need microns stay disabled.">Pixel size
+        <input type="number" id="pixel-size-input" class="small-input" min="0" step="0.001" placeholder="unset">µm/px
+      </label>
+      <span id="acquisition-hint" class="hint-inline"></span>
     </div>
     <div id="min-cell-area-help-popover" class="popover" style="display:none">
       <div class="popover-head">
@@ -263,6 +295,13 @@
         <input type="number" id="prune-correlation" placeholder="off" min="0.5" max="1" step="0.05" class="small-input">
         <span class="hint-inline">Blank = off. 0.95 barely helps size dominance; 0.85 is where it bites.</span>
       </div>
+      <div class="field-row">
+        <label>Components to keep</label>
+        <input type="number" id="variance-threshold" value="0.85" min="0.01" step="0.05" class="small-input">
+        <span class="hint-inline">Below 1 = cumulative variance (0.85 is the default and keeps
+          PC1&ndash;PC2 on most movies); 1 or more = that many components. Raise it to 3 for
+          PC1&ndash;PC3 morphospaces.</span>
+      </div>
     </details>
     <div class="field-row">
       <button id="run-classification-btn" class="primary-btn">Run Classification</button>
@@ -338,6 +377,9 @@
       </label>
       <label><input type="checkbox" id="motion-compensation-input"> Motion compensation</label>
       <label><input type="checkbox" id="gap-closing-input"> Close 1-frame gaps</label>
+      <label title="Multiplies both displacement gates (a cell may move up to about its own size per frame at 1). Leave at 1 for epithelia; raise it only for sparse, fast-moving cells.">Gate scale ×
+        <input type="number" id="gate-scale-input" class="small-input" min="0.5" max="5" step="0.5" value="1">
+      </label>
       <label><input type="checkbox" id="drift-register-input"> Register masks (drift)</label>
       <button id="drift-help-btn" class="help-btn" aria-label="How is this decided?" style="display:none">?</button>
     </div>
@@ -365,7 +407,8 @@
          cell diameter. It decides the near-ties where centroid distance has no information left.
          <em>Centroid only</em> sets the weight to 0; <em>Mask overlap only</em> drops the distance term.
          Either way the plausible-displacement limit still applies, so a distant cell can't win on a
-         sliver of overlap.</p>
+         sliver of overlap. <strong>Gate scale</strong> scales that limit: above 1 loosens it (for movies
+         with large jumps between frames), below 1 tightens it.</p>
       <p><strong>Motion compensation</strong> predicts each cell forward from its own previous
          displacement instead of assuming it stays put, then measures from the prediction. It suits a
          movie with real coherent drift &mdash; a translating tissue, or stage drift.</p>
@@ -463,20 +506,29 @@
       <label class="radio-label"><input type="radio" name="correct-track-env-direction" value="prev" checked> vs previous</label>
       <label class="radio-label"><input type="radio" name="correct-track-env-direction" value="next"> vs next</label>
       <label class="radio-label"><input type="radio" name="correct-track-env-direction" value="both"> vs both (worst)</label>
+      <button id="environment-help-btn" class="help-btn" aria-label="What does the environment score mean?">?</button>
     </div>
-    <p class="hint" id="correct-track-environment-hint" style="display:none">
-      Dark = this cell's neighbours changed a lot between the two frames — worth inspecting for a
-      segmentation or tracking error. Bright = neighbourhood preserved. A low score isn't always an
-      error: a division or delamination lowers it legitimately. Uncoloured cells can't be scored
-      (unmatched, or the track is absent in the compared frame).
-    </p>
+    <div id="correct-track-environment-hint" class="popover" style="display:none">
+      <div class="popover-head">
+        <strong>Environment score</strong>
+        <button id="environment-help-close" class="help-btn" aria-label="Close">&times;</button>
+      </div>
+      <p>Dark = this cell's neighbours changed a lot between the two frames — worth inspecting for a
+        segmentation or tracking error. Bright = neighbourhood preserved. A low score isn't always an
+        error: a division or delamination lowers it legitimately. Uncoloured cells can't be scored
+        (unmatched, or the track is absent in the compared frame).</p>
+      <p><b>It saturates on small neighbour sets.</b> Two cells each keeping one comparable
+        neighbour, the same one, score a perfect 1.0 — so anything that shrinks the neighbour sets
+        pushes scores up, and the cells that cannot be scored at all leave the result rather than
+        scoring 0. Read the counts line below the image, not the colours alone.</p>
+    </div>
     <!-- Round 28 C3: the counts the score is and is NOT about. The Dice
          coefficient saturates on small neighbour sets, so a median near 1.0
          means least when the sets are smallest -- the share of exact 1.0s and
          the unscoreable count are what show that. -->
     <div id="correct-track-environment-counts" class="status-line" style="display:none"></div>
     <div class="field-row" id="correct-track-agreement" style="display:none">
-      <span class="control-group-label">vs overlap reference</span>
+      <span class="control-group-label control-group-label-plain">vs overlap reference</span>
       <label>Agrees <input type="color" id="agreement-agrees-color-input" value="#4a90d9"></label>
       <label>Disagrees <input type="color" id="agreement-disagrees-color-input" value="#ff3b30"></label>
       <label>Can't judge <input type="color" id="agreement-unjudgeable-color-input" value="#a06bd4"></label>
@@ -656,6 +708,21 @@
         <p>Every set is a <b>queue</b>, not a score: choosing what to look at judges nothing.
           Each one is also blind to something, and the blind spots are not independent.</p>
         <dl>
+          <!-- Round 29 §3: brief on purpose. Both of these are explained at
+               length under Visualization methods; what belongs here is what
+               each SELECTS and what it cannot see. -->
+          <dt>Every link the overlap reference disagrees with</dt>
+          <dd>The tracker's successor is not the one the greedy best-overlap reference picks.
+            <b>Blind to:</b> anything both agree on, and the reference's answer depends on the
+            registration convention of the masks it is computed on.</dd>
+          <dt>Cells the environment score flags for repair</dt>
+          <dd>Cells whose neighbour set changed most between the two frames (Dice at or below the
+            repair tier). <b>Blind to:</b> it <b>saturates on small neighbour sets</b> &mdash; two
+            cells each keeping one comparable neighbour, the same one, score a perfect 1.0, so
+            anything that shrinks the sets pushes scores up and the unscoreable cells leave the
+            result rather than scoring 0. It is also invariant under a coherent permutation of
+            identities, <b>the same blind spot as the reverse-solve set below</b>: those two do not
+            corroborate each other.</dd>
           <dt>Links the reverse solve disagrees with</dt>
           <dd>The frame pair is solved again with the frames swapped and the drift negated. A
             link the forward solve makes but the reverse one does not is listed. Not trivially
@@ -718,17 +785,24 @@
     <div id="census-summary" class="status-line"></div>
     <div id="census-apply-report"></div>
 
-    <h3>Review coverage</h3>
-    <p class="hint">Records which frames were displayed and which cells were clicked, so a
-      cell you looked at and left alone can be told apart from one you never saw. Corrections
-      are labelled errors; this is the other half. Nothing here changes the tracking.</p>
-    <div class="field-row">
-      <button id="coverage-summary-btn" class="secondary-btn">Show coverage →</button>
-      <label>Count a frame as reviewed after
-        <input type="number" id="coverage-dwell-input" class="small-input" value="1500" min="0" step="100"> ms</label>
+    <!-- Round 29 §5: the Review coverage UI is retired. `coverage_log.py`
+         STAYS: it is what distinguishes "inspected and left alone" from "never
+         displayed", which is the other half of ground-truth collection and is
+         still callable from a script (see `docs/coverage-log.md`). Removing an
+         entry point is cheap; removing the capability is not. -->
+    <div id="review-coverage-block" hidden>
+      <h3>Review coverage</h3>
+      <p class="hint">Records which frames were displayed and which cells were clicked, so a
+        cell you looked at and left alone can be told apart from one you never saw. Corrections
+        are labelled errors; this is the other half. Nothing here changes the tracking.</p>
+      <div class="field-row">
+        <button id="coverage-summary-btn" class="secondary-btn">Show coverage →</button>
+        <label>Count a frame as reviewed after
+          <input type="number" id="coverage-dwell-input" class="small-input" value="1500" min="0" step="100"> ms</label>
+      </div>
+      <div id="coverage-summary-status" class="status-line"></div>
+      <ul id="coverage-summary-list" class="status-line" style="display:none"></ul>
     </div>
-    <div id="coverage-summary-status" class="status-line"></div>
-    <ul id="coverage-summary-list" class="status-line" style="display:none"></ul>
 
     <div class="field-row">
       <button id="save-tracking-btn" class="secondary-btn">Save Corrections</button>
@@ -803,14 +877,41 @@
         <input type="number" id="t1-exit-input" class="small-input" min="0" max="200" step="1" placeholder="off">
       </label>
       <label>T1 must hold
-        <input type="number" id="t1-persist-input" class="small-input" min="0" max="10" step="1" value="1">
-        frame(s)
+        <input type="number" id="t1-persist-input" class="small-input" min="0" max="40" step="1" value="1">
+        frame(s)<span id="t1-persist-seconds" class="hint-inline"></span>
+      </label>
+      <label class="checkbox-label" title="Draw only gains whose four cells form a complete ring before and after (Benoit et al. 2020). Both counts are always reported.">
+        <input type="checkbox" id="t1-quartet-checkbox"> Quartet check
+      </label>
+      <!-- Round 32 T1-1, corrected Round 33: both interfaces of a T1 must be
+           at least this long. Stored in TRUE pixels (half the shared-border
+           pixel count) and derived from this movie when left empty; microns are
+           shown beside it only when Extract has a pixel size. -->
+      <label class="checkbox-label" title="The shrinking and the newly formed interface must both be at least this long. Leave empty to use the value derived from this movie.">
+        <input type="checkbox" id="t1-length-checkbox"> Interface &ge;
+        <input type="number" id="t1-length-input" class="small-input" min="0" step="1" placeholder="auto">
+        px<span id="t1-length-px" class="hint-inline"></span>
+      </label>
+      <span id="acquisition-readout" class="hint-inline"></span>
+      <!-- Round 31 D: the adjacency menu is gone. It switched two things at
+           once (wall-vs-corner AND gap tolerance), and only the interface
+           graph yields a length, which the cutoff below and the hysteresis
+           band both need. Dilation remains an internal fallback and the
+           provenance records which was used. -->
+      <label title="Four-way vertex cutoff: an interface this short (shared border px) is a corner, not a wall.">Four-way &le;
+        <input type="number" id="t1-interface-input" class="small-input" min="0" max="50" step="1" value="2">
+        px
       </label>
       <button id="save-lineage-btn" class="secondary-btn">Save lineage sheet</button>
       <button id="dynamics-help-btn" class="help-btn" aria-label="What do these mean?">?</button>
     </div>
     <div id="dynamics-t1-counts" class="status-line"></div>
     <div id="dynamics-help-popover" class="popover" style="display:none">
+      <!-- Round 32 UI-4: rewritten without numbers. The percentages and the
+           suggested thresholds that used to be here were the method's own
+           evidence, not anything a user needs to press a button -- and a
+           suggested enter/exit pair is actively misleading, since contact
+           strength differs about fourfold between our own movies. -->
       <div class="popover-head">
         <strong>Cell dynamics</strong>
         <button id="dynamics-help-close" class="help-btn" aria-label="Close">&times;</button>
@@ -819,32 +920,289 @@
          see the evidence and accept or reject it; only confirmed events enter the lineage sheet.</p>
       <dl>
         <dt>Division</dt>
-        <dd>A track ends while two mutually-adjacent tracks begin beside it, their areas summing to
-            roughly the mother's. <strong>Inferred from geometry</strong></dd>
+        <dd>A track ends while two adjacent tracks begin beside it, their areas together roughly the
+            mother's.</dd>
         <dt>Delamination</dt>
-        <dd>A track ends away from the tissue margin with the cell's area shrinking AND ending small
-            relative to its neighbours. Both terms are needed: a cell that vanishes at full size is a
-            broken track, not a cell leaving the epithelium.</dd>
+        <dd>A track ends inside the tissue with the cell shrinking and ending small next to its
+            neighbours &mdash; a cell that vanishes at full size is a broken track instead.</dd>
         <dt>Rearrangement (T1)</dt>
-        <dd>Neighbour exchange &mdash; two cells lose contact while two others gain it. Shown with its
-            orientation axis (blue = bond gained, orange = bond lost); the two reinforce, so a
-            regional mean gives the direction of intercalation. <strong>Hysteresis</strong> takes two
-            numbers, enter/exit (try 25 / 15): a contact counts once it exceeds <em>enter</em>, stops
-            once it drops below <em>exit</em>, and holds its previous verdict in between, so a shrinking
-            bond cannot flicker. A single hard threshold does the opposite &mdash; measured at 20&nbsp;px
-            it raised the one-frame reversal rate from 21% to 32%, worse than no filter. An exchange that has not
-            <em>settled</em> renders faded, with a dashed axis: on a germband dataset <strong>21% of raw
-            events reverse within one frame</strong>. Raise <em>T1 must hold</em> to demand more frames;
-            <strong>0 shows every raw event</strong>, which is what TissueMiner counts. Nothing is ever
-            hidden &mdash; both totals are shown, because a one-frame flicker may be noise or may be a
-            real reversible exchange, and this cannot tell them apart.</dd>
+        <dd>Neighbour exchange: two cells lose contact while two others gain it. Each event carries an
+            axis &mdash; <strong>blue</strong> where a contact is newly formed, <strong>orange</strong>
+            where one is broken. <strong>The two axes of one T1 should be parallel</strong>: that is how
+            a correctly detected exchange looks, and it is what lets a regional average show the
+            direction of intercalation.</dd>
       </dl>
+      <p><strong>Filters</strong> &mdash; each one hides events from the picture; the totals beside
+         them always include everything.</p>
+      <ul>
+        <li><strong>Hysteresis</strong>: two thresholds and a memory, so a shrinking interface cannot
+            flicker in and out.</li>
+        <li><strong>T1 must hold</strong>: how long, in seconds, an exchange must last before it counts
+            as settled. Set the frame interval in Extract to see it in seconds; 0 shows every raw
+            event.</li>
+        <li><strong>Interface length</strong>: both the shrinking and the newly formed interface must be
+            at least this long, in pixels of wall. Left empty, the value is read off this movie &mdash;
+            the length that best separates flicker from exchanges that hold, on the newly formed side.
+            Microns are shown beside it once Extract has a pixel size. On the newly formed side it
+            mostly removes flicker; on the shrinking side it tends to remove exchanges that did hold,
+            so compare the totals before relying on it.</li>
+        <li><strong>Quartet check</strong>: keeps only exchanges whose four cells form a complete ring
+            before and after. It judges the <em>newly formed</em> interface; the broken interface that
+            belongs to a rejected one is hidden along with it.</li>
+      </ul>
       <p class="hint">Cells at the image border are excluded from delamination before anything else
          is tested &mdash; they left the field of view rather than the tissue.</p>
     </div>
     <div class="image-click-wrap"><img id="trajectory-overlay-img" class="frame-preview"></div>
     <div id="trajectory-status" class="status-line"></div>
+
+    <!-- Round 34, 4-1/4-2. Both panels hang off the player's current
+         selection: "Single track" gives the clone-data plot, "Cell dynamics"
+         the cumulative-events curve. -->
+    <div id="trajectory-chart-panel" class="chart-panel">
+      <div class="time-window-row" data-time-window="trajectory"></div>
+      <div id="clone-cell-panel">
+        <h3>Clone cell data</h3>
+        <p class="hint">Click a cell to switch track.</p>
+        <div class="field-row">
+          <label>Add value</label>
+          <span class="value-picker" data-picker="clone"></span>
+          <label>Layout
+            <select id="clone-layout-select">
+              <option value="small_multiples" selected>Small multiples</option>
+              <option value="dual_axis">Two y-axes</option>
+            </select>
+          </label>
+        </div>
+        <div id="clone-value-chips" class="chip-row"></div>
+        <div class="chart-wrap"><img id="clone-cell-chart" class="chart-img" data-chart=""></div>
+        <div id="clone-cell-status" class="status-line"></div>
+      </div>
+      <div id="cumulative-events-panel" style="display:none">
+        <h3>Cumulative dynamics events</h3>
+        <p class="hint" title="T1 is counted once per orange (loss) axis currently drawn, so every
+          filter above applies to the count exactly as it applies to the picture.">Events per
+          tracked cell, accumulated over the time window.</p>
+        <div class="chart-wrap"><img id="cumulative-events-chart" class="chart-img" data-chart=""></div>
+        <div id="cumulative-events-status" class="status-line"></div>
+      </div>
+    </div>
   </section>
+
+  <section id="step-playground" class="step-section">
+    <h2>Data Playground</h2>
+    <div class="time-window-row" data-time-window="playground"></div>
+    <div class="field-row">
+      <span class="control-group-label">Panel</span>
+      <label class="radio-label"><input type="radio" name="playground-panel" value="tracks" checked> Clone multiple cells</label>
+      <label class="radio-label"><input type="radio" name="playground-panel" value="morphospace"> Morphospace</label>
+      <label class="radio-label"><input type="radio" name="playground-panel" value="cellmap"> Cell map</label>
+      <label class="radio-label"><input type="radio" name="playground-panel" value="distributions"> Distributions</label>
+      <label class="radio-label"><input type="radio" name="playground-panel" value="streamlines"> Streamlines</label>
+      <label class="checkbox-label"><input type="checkbox" id="group-comparator-checkbox"> Group comparator</label>
+    </div>
+    <div class="field-row">
+      <label title="Which PCA the Morphospace, Distributions and Cell map read. A joint PCA is
+        built in the Group comparator and is the only way PC values can be compared between
+        folders.">PCA source
+        <select id="pca-source-select"></select>
+      </label>
+      <span id="pca-source-note" class="hint-inline"></span>
+    </div>
+
+    <div id="playground-tracks" class="playground-panel">
+      <div class="field-row">
+        <label>Add value</label>
+        <span class="value-picker" data-picker="tracks"></span>
+        <label title="Tracks present for less than this fraction of the time window are left out.
+          Keeping only complete tracks selects the sample by the tracker having succeeded on it,
+          so the kept and total counts are always reported.">Min. coverage
+          <input type="number" id="tracks-coverage-input" class="small-input" min="0" max="100" step="5" value="90">%</label>
+        <label class="checkbox-label"><input type="checkbox" id="tracks-by-cluster-checkbox"> By cluster</label>
+      </div>
+      <div id="tracks-value-chips" class="chip-row"></div>
+      <div class="chart-wrap"><img id="tracks-chart" class="chart-img" data-chart=""></div>
+      <div id="tracks-status" class="status-line"></div>
+      <div id="group-dynamics-wrap" style="display:none">
+        <div class="field-row">
+          <label>Between-group comparison
+            <select id="group-dynamics-select">
+              <option value="dtw">DTW distance distributions</option>
+              <option value="oscillation">Detrended amplitude and ACF</option>
+              <option value="distance">Euclidean distance and heading angle</option>
+            </select>
+          </label>
+          <button id="group-dynamics-btn" class="secondary-btn">Compute</button>
+        </div>
+        <div class="chart-wrap"><img id="group-dynamics-chart" class="chart-img" data-chart=""></div>
+        <div id="group-dynamics-status" class="status-line"></div>
+      </div>
+    </div>
+
+    <div id="playground-distributions" class="playground-panel" style="display:none">
+      <div class="field-row">
+        <label>Value</label>
+        <span class="value-picker" data-picker="dist"></span>
+        <label class="checkbox-label"
+               title="Draw the columns aligned and join each individual across them, with no
+                 jitter. Use it when the same individuals appear in every group.">
+          <input type="checkbox" id="dist-paired-checkbox"> Paired</label>
+      </div>
+      <div class="chart-wrap"><img id="dist-chart" class="chart-img" data-chart=""></div>
+      <div id="dist-status" class="status-line"></div>
+    </div>
+
+    <div id="playground-morphospace" class="playground-panel" style="display:none">
+      <div class="field-row">
+        <label>x <select id="morphospace-x"></select></label>
+        <label>y <select id="morphospace-y"></select></label>
+        <label class="checkbox-label"><input type="checkbox" id="morphospace-hulls" checked> 95% hulls</label>
+        <label class="checkbox-label"><input type="checkbox" id="morphospace-boundary" checked> k-means boundary</label>
+        <label class="checkbox-label"><input type="checkbox" id="morphospace-exemplars"> Exemplar cells</label>
+      </div>
+      <div class="chart-wrap"><img id="morphospace-chart" class="chart-img" data-chart=""></div>
+      <div id="morphospace-status" class="status-line"></div>
+    </div>
+
+    <div id="playground-cellmap" class="playground-panel" style="display:none">
+      <div class="field-row">
+        <label>Value</label>
+        <span class="value-picker" data-picker="cellmap"></span>
+        <label>Colour map <select id="cellmap-colormap"></select></label>
+        <label class="checkbox-label"
+               title="Use the whole movie's 1st-99th percentile for the colour scale, so a
+                 frame's colours mean the same thing in every frame. Off, each frame is scaled
+                 to its own range.">
+          <input type="checkbox" id="cellmap-fixed-scale" checked> Fixed scale</label>
+      </div>
+      <div class="player" data-player="cellmap"></div>
+      <div class="image-click-wrap"><img id="cellmap-img" class="frame-preview chart-img" data-chart=""></div>
+      <div id="cellmap-status" class="status-line"></div>
+    </div>
+
+    <div id="playground-streamlines" class="playground-panel" style="display:none">
+      <div class="field-row">
+        <label>From frame <input type="number" id="streamlines-start" class="small-input"></label>
+        <label>To frame <input type="number" id="streamlines-end" class="small-input"></label>
+        <label title="As tracked: use the coordinate system the tracking run was made in.
+          On: subtract the measured frame-to-frame drift even if tracking did not.
+          Off: use raw coordinates.">Registration
+          <select id="streamlines-registration">
+            <option value="as_tracked" selected>As tracked</option>
+            <option value="on">On</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        <button id="streamlines-draw-btn" class="secondary-btn">Draw</button>
+      </div>
+      <div class="chart-wrap"><img id="streamlines-chart" class="chart-img" data-chart=""></div>
+      <div id="streamlines-status" class="status-line"></div>
+    </div>
+
+    <div id="group-comparator" class="playground-panel" style="display:none">
+      <h3>Group comparator</h3>
+      <!-- Text and tooltip are both set by `describeGroupMode` in app.js, which
+           keeps them in step with the mode; written here the tooltip went
+           stale (it described Clusters while Multi-groups was selected) and
+           carried this markup's indentation into the popup. -->
+      <p class="hint" id="group-comparator-note">Clusters of the current project.</p>
+      <div class="field-row">
+        <label>Mode
+          <select id="group-mode-select">
+            <option value="clusters" selected>Clusters comparison</option>
+            <option value="folders">Multi-groups comparison</option>
+          </select>
+        </label>
+      </div>
+      <div id="group-folders" style="display:none">
+        <div class="field-row">
+          <label>Group name <input type="text" id="group-name-input" class="small-input" placeholder="WT"></label>
+          <button id="group-add-folder-btn" class="secondary-btn">Add folder</button>
+          <button id="group-add-btn" class="secondary-btn">Add group</button>
+          <button id="group-extract-btn" class="secondary-btn"
+                  title="Run Extract, with this session's settings, on every folder above that
+                    has no Cells_info.xlsx yet. Folders that already have one are left alone.">
+            Extract missing</button>
+        </div>
+        <progress id="group-extract-progress" value="0" max="100" style="display:none"></progress>
+        <div id="group-extract-status" class="status-line"></div>
+        <div id="group-list" class="chip-row"></div>
+        <div class="field-row">
+          <label>Comparison name <input type="text" id="joint-name-input" class="small-input"
+                 placeholder="WT_vs_pyd" pattern="[A-Za-z0-9_-]+"></label>
+          <button id="joint-pca-btn" class="secondary-btn">Build joint PCA</button>
+          <button id="joint-features-btn" class="secondary-btn">Feature families…</button>
+        </div>
+        <div id="joint-pca-status" class="status-line"></div>
+      </div>
+    </div>
+
+    <div id="joint-features-popover" class="popover dialog draggable" style="display:none">
+      <div class="popover-head" id="joint-features-handle">
+        <strong>Feature families for the joint PCA</strong>
+        <button id="joint-features-close" class="help-btn" aria-label="Close">&times;</button>
+      </div>
+      <p class="hint">The same families the Classify step offers. Every folder in the comparison
+        must have the tables they come from.</p>
+      <div id="joint-feature-families" class="family-picker"></div>
+      <div id="joint-feature-groups"></div>
+      <div id="joint-features-status" class="status-line"></div>
+    </div>
+  </section>
+
+  <div id="movie-maker-dialog" class="popover dialog" style="display:none">
+    <div class="popover-head">
+      <strong>Movie maker</strong>
+      <button id="movie-maker-close" class="help-btn" aria-label="Close">&times;</button>
+    </div>
+    <p class="hint">Each frame is rendered on the Python side with the step's current display
+      settings. Floating UI &mdash; the inset view, legends, popovers &mdash; is drawn by the
+      browser and will <strong>not</strong> appear in the frames.</p>
+    <div class="field-row">
+      <label>Source
+        <select id="movie-source-select">
+          <option value="current">Current step's view</option>
+          <option value="cellmap">Data playground: Cell map</option>
+        </select>
+      </label>
+      <label>From <input type="number" id="movie-start-input" class="small-input"></label>
+      <label>To <input type="number" id="movie-end-input" class="small-input"></label>
+    </div>
+    <div class="field-row">
+      <button id="movie-start-btn" class="primary-btn">Render frames</button>
+      <button id="movie-cancel-btn" class="secondary-btn" style="display:none">Cancel</button>
+    </div>
+    <progress id="movie-progress" value="0" max="100" style="display:none"></progress>
+    <div id="movie-status" class="status-line"></div>
+  </div>
+
+  <div id="chart-context-menu" class="nav-menu" style="display:none">
+    <button data-menu="settings">Figure settings…</button>
+    <div class="nav-menu-sep"></div>
+    <button data-export="png">Save PNG</button>
+    <button data-export="svg">Save SVG</button>
+    <button data-export="xlsx">Save data</button>
+  </div>
+
+  <!-- 1-1: the settings that used to occupy a bar on every panel. Session
+       level, so one popover serves every chart in every step. -->
+  <div id="figure-settings-popover" class="popover dialog draggable" style="display:none">
+    <div class="popover-head" id="figure-settings-handle">
+      <strong>Figure settings</strong>
+      <button id="figure-settings-close" class="help-btn" aria-label="Close">&times;</button>
+    </div>
+    <div class="field-row">
+      <label>Style <select id="figure-style-select"></select></label>
+      <label>Font <select id="figure-font-select"></select></label>
+      <label>Size <select id="figure-sizepreset-select"></select></label>
+    </div>
+    <div class="field-row">
+      <label>Font size <select id="figure-fontsize-select"></select></label>
+      <label>Lines <select id="figure-linewidth-select"></select></label>
+      <label>Error <select id="figure-error-select"></select></label>
+    </div>
+    <div id="figure-settings-note" class="status-line"></div>
+  </div>
 
 </main>
 

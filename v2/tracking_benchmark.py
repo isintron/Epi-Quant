@@ -544,6 +544,7 @@ def _solve_pairs(
     reverse: bool = False,
     want_margins: bool = False,
     feature_columns: Optional[list] = None,
+    gate_scale: float = cell_tracking.DEFAULT_GATE_SCALE,
     **_unused,
 ) -> dict:
     """Solve every frame pair independently; return `{frame: {a: b}}` (raw
@@ -619,7 +620,7 @@ def _solve_pairs(
         cost = cell_tracking.build_cost_matrix(
             first, second, overlaps=overlaps, overlap_weight=overlap_weight,
             max_centroid_distance=ceiling, centroid_weight=centroid_weight,
-            predicted_centroids=predicted,
+            predicted_centroids=predicted, gate_scale=gate_scale,
         )
         sentinel = cell_tracking._no_match_sentinel(cost, ceiling)
         matched = cell_tracking.match_frames(cost, sentinel)
@@ -732,6 +733,7 @@ def track_in_memory(
     four_quadrant: bool = False,
     drift_mode: str = "none",
     drift_by_frame: Optional[Mapping[int, tuple]] = None,
+    gate_scale: float = cell_tracking.DEFAULT_GATE_SCALE,
 ) -> pd.DataFrame:
     """`cell_tracking.track_cells` without the per-frame-pair Excel writes.
 
@@ -809,7 +811,7 @@ def track_in_memory(
             overlaps=overlaps, overlap_weight=overlap_weight,
             max_centroid_distance=ceiling,
             centroid_weight=pair_centroid_weight, predicted_centroids=predicted,
-            cost_form=cost_form, overlap_power=overlap_power,
+            cost_form=cost_form, overlap_power=overlap_power, gate_scale=gate_scale,
         )
         sentinel = cell_tracking._no_match_sentinel(cost, ceiling, no_link_ratio=no_link_ratio)
         matched = cell_tracking.match_frames(cost, sentinel, four_quadrant=four_quadrant)
@@ -1397,10 +1399,13 @@ if __name__ == "__main__":
     # that preceded them. This is the third re-pin in three rounds and every
     # one has been an INPUT change, never the code -- verified each time by
     # running HEAD against the same inputs.
-    # The SEGMENTATION these numbers describe. Hand-corrected 2026-09-07
-    # (7,452 labels, down from 7,457).
-    GBE_MASKS = "2a0a819abe94a52b15a8c22943960ee4"
-    GBE_EXTRACTION = "73fd7dedb97f3bc7"
+    # The SEGMENTATION these numbers describe. Re-pinned 2026-10-19 against the
+    # hand-corrected masks (31 frames, 7,743 labels) and the extraction adopted
+    # from `GT_cell_classification_output/Cells_info.xlsx` (v2/baseline_data was
+    # rebuilt from the GT copy). Previous: masks 2a0a819abe94a52b15a8c22943960ee4,
+    # extraction 73fd7dedb97f3bc7 (2026-09-07, 7,452 labels).
+    GBE_MASKS = "cec19179d0d1be008b7187c27d3479b1"
+    GBE_EXTRACTION = "5665b7fcca3051c5"
     extraction = hashlib.sha256(cells_info.to_csv().encode()).hexdigest()[:16]
 
     if "embryos_GBE_GAP43" in project:
@@ -1433,42 +1438,46 @@ if __name__ == "__main__":
         #   2026-09-05     : 4.83 / 94.92 / 0.26, judged 5487, total 7221
         #   2026-09-06     : 4.64 / 95.10 / 0.25, judged 5492, total 7233  (7,457 labels)
         #   2026-09-07a    : 4.73 / 95.01 / 0.25, judged 5492, total 7229  (7,452 labels)
-        # Now 7,449 labels. Five re-segmentations in four days; the two guards
-        # above are what keep each of these from reading as a code regression.
-        # Both guards above now cover this: the extraction AND the masks.
-        assert abs(a["wrong_rate"] - 4.66) < 0.05, a
-        assert abs(a["correct_rate"] - 95.08) < 0.05, a
-        assert abs(a["broken_rate"] - 0.25) < 0.05, a
-        assert abs(a["n_judged"] - 5492) < 25, a
-        assert abs(a["n_total"] - 7226) < 25, a
+        #   2026-09-07b    : 4.66 / 95.08 / 0.25, judged 5492, total 7226  (7,449 labels)
+        # Now (2026-10-19) the GT extraction, 7,743 cells / 7,743 labels.
+        # Both guards above cover this: the extraction AND the masks.
+        assert abs(a["wrong_rate"] - 4.50) < 0.05, a
+        assert abs(a["correct_rate"] - 95.27) < 0.05, a
+        assert abs(a["broken_rate"] - 0.23) < 0.05, a
+        assert abs(a["n_judged"] - 5775) < 25, a
+        assert abs(a["n_total"] - 7519) < 25, a
         # 0.9015, not the 0.9094 the Round 10 plan quoted. Every definition
         # tried lands in 0.897-0.903 (per-frame mean 0.8992, keeping untracked
         # neighbours 0.8999, dilation_px 1 and 3 giving 0.9007 and 0.9025), so
         # the plan's figure could not be reproduced and this asserts the
         # measured one. Fitting code to a number whose definition cannot be
         # recovered is the failure mode this whole module exists to prevent.
-        assert abs(b["dice"] - 0.9015) < 0.002, b
+        # Re-pinned 2026-10-19 on the GT extraction (0.9015 before).
+        assert abs(b["dice"] - 0.9059) < 0.002, b
         print("  -> reproduces the Round 9/10 reference numbers.")
 
         # Round 11: the registration finding. These are the numbers that show
         # the UNREGISTERED reference is operating at its own validity limit --
         # a median self-overlap of 0.377 against its own 0.3 threshold.
         assert decision["register"] is True, decision
-        assert abs(plain["median_best_iou"] - 0.377) < 0.01, plain
-        assert abs(fixed["median_best_iou"] - 0.709) < 0.01, fixed
-        assert abs(plain["median_margin"] - 0.224) < 0.01, plain
-        assert abs(fixed["median_margin"] - 0.661) < 0.01, fixed
+        # Re-pinned 2026-10-19 on the GT extraction (0.377 / 0.709 / 0.224 / 0.661 before).
+        assert abs(plain["median_best_iou"] - 0.382) < 0.01, plain
+        assert abs(fixed["median_best_iou"] - 0.714) < 0.01, fixed
+        assert abs(plain["median_margin"] - 0.231) < 0.01, plain
+        assert abs(fixed["median_margin"] - 0.668) < 0.01, fixed
         # Also re-pinned 2026-09-05 with the rest of this block; previously
         # 5483 / 6818 on the extraction that was replaced.
-        assert plain["judgeable"] == 5489 and abs(fixed["judgeable"] - 6821) < 10, (plain, fixed)
+        # 2026-10-19: 5489 / 6821 -> 5771 / 7112 (GT extraction, 7,743 cells).
+        assert plain["judgeable"] == 5771 and abs(fixed["judgeable"] - 7112) < 10, (plain, fixed)
 
         registered_score = iou_agreement(tracking, masks, register=True, drift_by_frame=drift)
         print("\nsame tracking, registered reference: %.2f%% wrong (was %.2f%%), n=%d judged"
               % (registered_score["wrong_rate"], a["wrong_rate"], registered_score["n_judged"]))
         # Re-pinned 2026-09-07 (14.01 -> 13.99 -> 13.75 -> 13.88 across four
         # segmentations of the same movie).
-        assert abs(registered_score["wrong_rate"] - 13.77) < 0.2, registered_score
-        print("  -> the SAME tracking scores 4.66%% or 13.77%% depending only on the")
+        # 2026-10-19: 13.77 -> 13.31 on the GT extraction.
+        assert abs(registered_score["wrong_rate"] - 13.31) < 0.2, registered_score
+        print("  -> the SAME tracking scores 4.50%% or 13.31%% depending only on the")
         print("     registration convention of the reference. Never report one alone.")
 
         consistency = forward_backward_consistency(cells_info=cells_info, masks_by_frame=masks)
@@ -1476,8 +1485,9 @@ if __name__ == "__main__":
         print("\nreference-free: forward-backward %.2f%% inconsistent | assignment margin %.2f px"
               % (consistency["inconsistency_rate"], margin_score["median_margin"]))
         # Re-pinned 2026-09-07 (1.98 -> 2.55 -> 2.41 -> 2.17 across four).
-        assert abs(consistency["inconsistency_rate"] - 1.83) < 0.1, consistency
-        assert abs(margin_score["median_margin"] - 11.35) < 0.2, margin_score
+        # 2026-10-19: 1.83 -> 2.23 on the GT extraction.
+        assert abs(consistency["inconsistency_rate"] - 2.23) < 0.1, consistency
+        assert abs(margin_score["median_margin"] - 11.73) < 0.2, margin_score  # 11.35 before 2026-10-19
 
     if args.diagnostics:
         print("\ngap growth along chained mutual-best-IoU links:")

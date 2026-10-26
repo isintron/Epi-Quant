@@ -9,11 +9,11 @@ Note: this module does NOT produce a `leading_edge` column — that is computed
 downstream, from segmentation contours rather than PCA/K-means output, in
 `manual_correction_classification.compute_leading_edge`.
 
-Bug Fix #2 (see v2/README.md changelog): v1's feature-abbreviation dict had
-`'Cell Left Boundary'` as a dict key twice (the second one was meant to be
-`'Cell Right Boundary'`), so Python's duplicate-key overwrite silently gave
-Right Boundary no abbreviation at all (its full column name leaked onto the
-PCA contribution chart's x-axis instead). Fixed here.
+Bug Fix #2 (see v2/README.md changelog) fixed a duplicate key in v1's
+feature-abbreviation dict, which silently left `Cell Right Boundary` with no
+abbreviation. The dict itself is gone as of Round 34: loading tables now carry
+full feature names, because `S` stood for both `Cell Area` and
+`Local Nematic Order` and the table did not say which.
 
 N-cluster generalization (was previously hardcoded to exactly 2 clusters
 named 'mes cell'/'epi cell'): v1's original biology (Drosophila dorsal
@@ -39,6 +39,7 @@ classic AS/LE case happens to be the population MINORITY, not majority).
 
 import logging
 import os
+import re
 from typing import Optional, Union
 
 import matplotlib
@@ -48,52 +49,10 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
-
-# Bug Fix #2: 'Cell Right Boundary' now has its own entry instead of being
-# silently shadowed by a duplicate 'Cell Left Boundary' key.
-PCA_FEATURE_ABBREVIATIONS = {
-    "Cell Area": "S",
-    "Maximum Horizontal Length": "AP",
-    "Maximum Vertical Length": "DV",
-    "Horizontal/Vertical Length Ratio": "AP/DV",
-    "Cell Perimeter": "P",
-    "Approximate Polygon Vertex Count": "N",
-    "Fitted Ellipse Minor Axis": "Sa",
-    "Fitted Ellipse Major Axis": "La",
-    "Ellipse Major/Minor Axis Ratio": "La/Sa",
-    "Fitted Ellipse Angle": "θ",
-    "Circumscribed Circle Radius": "R_c",
-    "Inscribed Circle Radius": "r_i",
-    "Center X Coordinate": "Cx",
-    "Center Y Coordinate": "Cy",
-    "Cell Left Boundary": "Lb",
-    "Cell Right Boundary": "Rb",
-    "Circularity": "C",
-    # shape_features.py
-    "Solidity": "Sol",
-    "Convexity": "Cvx",
-    "Shape Index": "p",
-    "Lobe Count": "N_lobe",
-    "Max Concavity Depth": "d_max",
-    "Mean Neck Width": "w_neck",
-    "Elongation": "e",
-    "Sin2Theta": "sin2θ",
-    "Cos2Theta": "cos2θ",
-    "EFD Irregularity": "irr",
-    # tissue_features.py
-    "Neighbor Count": "n_nb",
-    "Local Hexagonal Fraction": "f_hex",
-    "Local Nematic Order": "S",
-    "Local Mean Shape Index": "<p>",
-    "Local Mean Solidity": "<Sol>",
-    "Local Density": "ρ",
-    "Frame Neighbor Entropy": "H",
-}
 
 # Feature families for the Classify step. **Additive, not exclusive**: Basic
 # geometrics is the always-on base and any further family is added on top of it.
@@ -145,14 +104,10 @@ FEATURE_FAMILIES: dict[str, dict] = {
             "Fitted Ellipse Angle", "Circularity",
         ],
         "note": (
-            "H/V lengths measure orientation, not shape - tick them only if your "
-            "specimen is axis-aligned. Ellipse Angle is orientation as well, and it "
-            "is stored folded (70 and 110 degrees share one value), so it cannot be "
-            "read back as a direction: it separates cell types well on an "
-            "axis-aligned specimen (AUC 0.92 on AS_LE_lateral) and misleads on any "
-            "other mounting. Circularity is the same quantity as Shape Index in the "
-            "Convex hull family (C = 4*pi/p^2, Spearman -1.00) - tick at most one of "
-            "the two, or PCA counts that shape twice."
+            "H/V lengths measure orientation - tick them only if your specimen is axis-aligned. "
+            "Ellipse Angle is orientation as well, and it is stored folded (70 and 110 degrees share one value), "
+            "so it cannot be read back as a direction. Circularity is the same quantity as Shape Index in the "
+            "Convex hull family - tick at most one of the two, or PCA counts that shape twice."
         ),
     },
     "hull": {
@@ -185,7 +140,7 @@ FEATURE_FAMILIES: dict[str, dict] = {
             "Coefficients are normalized before PCA (start point, tracing direction, rotation, "
             "which end of the long axis is front, and size), so the result describes shape only. "
             "Front/back is decided per cell outline here, which is noisy for nearly symmetric "
-            "cells; for tracked data decide it per track (efd.front_back_by_track)."
+            "cells; for tracked data decide it per track."
         ),
     },
 }
@@ -365,6 +320,223 @@ def prune_correlated(
     return features.loc[:, kept], dropped
 
 
+_EFD_COEFFICIENT = re.compile(r"^efd_(\d+)_([abcd])$")
+_CELL_INDEX = re.compile(r"^Cell(\d+)_(\d+)$")
+
+
+def pca_feature_label(column) -> str:
+    """The full name a loading table shows for a feature column.
+
+    Only the EFD coefficients need translating -- `efd_1_a` is the cosine term
+    of the x projection of harmonic 2, which nobody reads off the column name.
+    Everything else is already its full name, deliberately: the abbreviation
+    table this replaced gave both `Cell Area` and `Local Nematic Order` the
+    label `S`, so a loading table could not be read without knowing which
+    family had been selected."""
+    match = _EFD_COEFFICIENT.match(str(column))
+    if match:
+        return f"Harmonic {int(match.group(1)) + 1} {match.group(2)}"
+    return str(column)
+
+
+def cell_index_order(index) -> list:
+    """`index` sorted by (frame, label) NUMERICALLY, not as strings -- `Cell10_2`
+    belongs after `Cell9_2`, which a lexicographic sort gets backwards. Keys
+    that are not `Cell{frame}_{label}` keep their relative order, after the
+    ones that are."""
+    def key(position_and_value):
+        position, value = position_and_value
+        match = _CELL_INDEX.match(str(value))
+        if match:
+            return (0, int(match.group(1)), int(match.group(2)), position)
+        return (1, 0, 0, position)
+
+    return [value for _, value in sorted(enumerate(index), key=key)]
+
+
+def write_pca_components(
+    output_path: str,
+    components: np.ndarray,
+    explained_variance_ratio: np.ndarray,
+    feature_names: list,
+    scores: pd.DataFrame,
+    raw_features: pd.DataFrame,
+    descriptor_correlation: Optional[pd.DataFrame] = None,
+) -> str:
+    """One workbook describing the fit, replacing the per-component
+    `PCA_Component_{i}.xlsx` files and `Explained_Variance_Ratio_All_PC.xlsx`.
+
+    Sheets:
+
+    - `Loadings` -- features x PCs, for reading the whole basis at once.
+    - `Explained variance` -- every component, not only the retained ones.
+    - `Feature correlation` -- PCs x features, Pearson r between each PC score
+      and each feature's RAW value. This is not the loading: a loading is the
+      weight on a standardized feature within an orthogonal basis, while r is
+      what Supp. Fig. 1A plots. Same definition as
+      `figures/revision_2026-10/fig6_dyn_collective/scripts/static_pca.py:14`.
+    - `PC{i}` -- one per retained component, sorted by contribution squared.
+    - `Descriptor correlation` -- only when the caller has one (EFD; see
+      `efd_descriptors`), because 40 Fourier coefficients have no readable
+      loading table.
+
+    `raw_features` must be the matrix PCA was fit on BEFORE standardizing, and
+    aligned to `scores` by index; correlation is scale-free so standardizing
+    would not change r, but the sentinel-masking and pruning done upstream
+    would."""
+    labels = [pca_feature_label(name) for name in feature_names]
+    retained = [f"PC{i + 1}" for i in range(components.shape[0])]
+    aligned = raw_features.loc[scores.index]
+
+    loadings = pd.DataFrame(components.T, index=labels, columns=retained)
+    loadings.index.name = "Feature"
+
+    variance = pd.DataFrame({
+        "Principal Component": [f"PC{i + 1}" for i in range(len(explained_variance_ratio))],
+        "Explained Variance Ratio": explained_variance_ratio,
+        "Cumulative": np.cumsum(explained_variance_ratio),
+        "Retained": [i < components.shape[0] for i in range(len(explained_variance_ratio))],
+    })
+
+    correlation = pd.DataFrame(
+        [[float(np.corrcoef(aligned[column].to_numpy(float), scores[pc].to_numpy(float))[0, 1])
+          for column in feature_names] for pc in retained],
+        index=retained, columns=labels,
+    )
+    correlation.index.name = "Principal Component"
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with pd.ExcelWriter(output_path) as writer:
+        loadings.to_excel(writer, sheet_name="Loadings")
+        variance.to_excel(writer, sheet_name="Explained variance", index=False)
+        correlation.to_excel(writer, sheet_name="Feature correlation")
+        if descriptor_correlation is not None:
+            descriptor_correlation.to_excel(writer, sheet_name="Descriptor correlation")
+        for i, pc in enumerate(retained):
+            contribution = components[i]
+            pd.DataFrame({
+                "Feature": labels,
+                "Contribution": contribution,
+                "Contribution Squared": contribution ** 2,
+            }).sort_values("Contribution Squared", ascending=False).to_excel(
+                writer, sheet_name=pc, index=False)
+    return output_path
+
+
+def efd_descriptor_correlation(
+    features: pd.DataFrame, scores: pd.DataFrame, group_by: str = "frame"
+) -> pd.DataFrame:
+    """How well readable shape descriptors explain each EFD principal
+    component -- the `Descriptor correlation` sheet.
+
+    An EFD loading table is 40 Fourier coefficients, which nobody can read. The
+    same component expressed as "r = 0.93 with skewness along the axis" can be.
+    The descriptor panel is the one `make_efd_analyses.descriptor_table` uses:
+    `efd_descriptors.DESCRIPTOR_NAMES` (moments + geometry) plus elongation,
+    EFD irregularity and the per-harmonic amplitudes, all computed from the
+    order-10 RECONSTRUCTION rather than from the mask -- see the file header of
+    `efd_descriptors.py` for why that is the only comparison that isolates the
+    descriptor panel from the coefficient truncation.
+
+    Reported per PC: Pearson r, Spearman rho, and the cross-validated R-squared
+    of a linear (Ridge) fit from the whole panel. `group_by` names the CV
+    grouping, which goes into the column header -- inside one project that is
+    the frame, so a fold cannot learn a PC from cells that share a frame with
+    its training set. The boosted-tree and quadratic fits
+    `make_efd_analyses.fig_descriptor_panel` also runs are deliberately left
+    out: minutes of compute for a number the workbook does not need.
+
+    **Depends on the front/back convention.** `mu30_x` (skewness along the
+    axis) and the bending moments change sign with it, so this sheet reads
+    differently under a per-outline fit than under a per-track one."""
+    import efd
+    import efd_descriptors as ed
+    from scipy.stats import pearsonr, spearmanr
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import r2_score
+    from sklearn.model_selection import GroupKFold
+    from sklearn.pipeline import make_pipeline
+
+    matrix = features.loc[scores.index].to_numpy(float)
+    order = matrix.shape[1] // 4
+    canonical = matrix.reshape(-1, order, 4)
+
+    panel = ed.descriptors(canonical)
+    # Elongation is the harmonic-1 axis ratio, which `canonicalize`/`drop_size`
+    # leave alone (they rotate and rescale uniformly), so it can be read off
+    # the canonical coefficients instead of the raw ones.
+    panel["elongation"] = efd.ellipse_from_harmonic1(efd.phase_normalize(canonical))[0]
+    panel["irregularity"] = efd.irregularity(matrix)
+    amplitude = np.sqrt((canonical ** 2).sum(axis=2))
+    for harmonic in range(2, order + 1):
+        panel[f"amp_h{harmonic}"] = amplitude[:, harmonic - 1]
+
+    pretty = {
+        "mu30_x": "Skewness along axis", "mu30_y": "Skewness across axis",
+        "mu21": "Bending (x2y)", "mu12": "Bending (xy2)",
+        "mu40": "Kurtosis along axis", "mu04": "Kurtosis across axis",
+        "mu22": "Cross moment (x2y2)", "circularity": "Circularity",
+        "shape_index": "Shape index", "solidity": "Solidity", "convexity": "Convexity",
+        "max_concavity_depth": "Max concavity depth", "lobe_count": "Lobe count",
+        "bending_energy": "Bending energy", "curv_sign_changes": "Curvature sign changes",
+        "elongation": "Elongation", "irregularity": "EFD irregularity",
+        **{f"amp_h{n}": f"Amplitude h{n}" for n in range(2, order + 1)},
+    }
+    names = list(ed.DESCRIPTOR_NAMES) + ["elongation", "irregularity"] + \
+        [f"amp_h{n}" for n in range(2, order + 1)]
+    panel_matrix = np.column_stack([panel[name] for name in names])
+    usable = np.isfinite(panel_matrix).all(axis=1)
+    panel_matrix = panel_matrix[usable]
+
+    groups = pd.Index(scores.index[usable]).str.extract(r"Cell(\d+)_", expand=False).to_numpy()
+    folds = min(5, len(np.unique(groups)))
+
+    rows = {}
+    for pc in scores.columns:
+        y = scores[pc].to_numpy(float)[usable]
+        row = {}
+        if folds >= 2:
+            prediction = np.empty(len(y))
+            for train, test in GroupKFold(n_splits=folds).split(panel_matrix, y, groups):
+                model = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+                prediction[test] = model.fit(panel_matrix[train], y[train]).predict(panel_matrix[test])
+            row[f"Linear CV R2 ({folds}-fold GroupKFold by {group_by})"] = r2_score(y, prediction)
+        else:
+            row[f"Linear CV R2 (not computed: only {folds} {group_by} group)"] = np.nan
+        for position, name in enumerate(names):
+            row[f"{pretty[name]} r"] = pearsonr(panel_matrix[:, position], y).statistic
+            row[f"{pretty[name]} rho"] = spearmanr(panel_matrix[:, position], y).statistic
+        rows[pc] = row
+
+    table = pd.DataFrame(rows).T
+    table.index.name = f"Principal Component ({int(usable.sum())} of {len(usable)} cells scored)"
+    return table
+
+
+def fit_pca(
+    features, n_components: float = 0.85, sign_convention: bool = True
+) -> tuple[PCA, np.ndarray]:
+    """Fit PCA on an already-prepared matrix and return `(model, scores)`.
+
+    A PCA component's sign is arbitrary -- `-c` explains exactly as much
+    variance as `c` -- so two runs on the same data can report opposite
+    loadings and mirrored scores. `sign_convention` fixes it by flipping each
+    component so its largest-magnitude loading is positive. Same rule, same
+    order of operations as `fit_pca` in
+    `figures/efd_figures/make_efd_figures.py:118`, which is what the
+    manuscript figures are drawn with; `_self_test` pins the two together
+    element by element."""
+    pca = PCA(n_components=n_components)
+    scores = pca.fit_transform(features)
+    if sign_convention:
+        flip = np.sign(pca.components_[
+            np.arange(len(pca.components_)), np.abs(pca.components_).argmax(axis=1)
+        ])
+        pca.components_ *= flip[:, None]
+        scores = scores * flip[None, :]
+    return pca, scores
+
+
 def compute_pca(
     cells_info: pd.DataFrame,
     output_dir: Optional[str] = None,
@@ -372,24 +544,35 @@ def compute_pca(
     standardize_mode: str = "global",
     prune_correlation: Optional[float] = None,
     sign_convention: bool = False,
+    with_efd_descriptors: bool = False,
 ) -> pd.DataFrame:
     """Standardize `cells_info` (already filtered to the desired feature
-    columns, e.g. `data_input.ML_FEATURE_COLUMNS`) and run PCA, keeping enough
-    components to explain `variance_threshold` cumulative variance (v1
-    hardcoded 0.85). Returns a DataFrame indexed like `cells_info`, columns
-    `PC1..PCk, PC_score` (PC_score = variance-weighted sum of scores), sorted
-    descending by `PC_score` — exactly as `bio_compute_cell_pca` did.
+    columns, e.g. `data_input.ML_FEATURE_COLUMNS`) and run PCA. Returns a
+    DataFrame indexed like `cells_info`, columns `PC1..PCk`, in `Cell Index`
+    order -- frame then label, numerically.
 
-    If `output_dir` is given, writes the same diagnostic artifacts v1 did:
-    `Explained_Variance_Ratio_All_PC.xlsx/.png`, per-component
-    `PCA_Component_{i}.xlsx/.png`, and `Cells_info_PCA.xlsx`.
+    `variance_threshold` is passed straight to sklearn: a fraction keeps enough
+    components to explain that much cumulative variance (v1 hardcoded 0.85), an
+    integer keeps exactly that many. The distinction matters because 0.85 keeps
+    only PC1-PC2 on `AS_LE_lateral` (cum2 = 87.6%) while the manuscript's
+    Supp. Fig. 1 panels are drawn on PC1-PC3.
+
+    **No `PC_score` column** (Round 34, 1-4): it was a variance-weighted sum of
+    scores whose signs are arbitrary, used only to sort these rows. Removing it
+    changes the row order to `Cell Index` order; `cluster_cells_kmeans` used to
+    pick its PC columns as "everything but the last one", which would have
+    silently dropped a real PC, and now matches `PC\d+` by name.
+
+    If `output_dir` is given, writes `Cells_info_PCA.xlsx` (unchanged format:
+    first column `Cell Index`) and one `PCA_Components.xlsx` workbook. No PNGs:
+    every chart this used to export is better drawn by the plotting step, and
+    four of them were written on every run whether or not anyone looked.
+    `with_efd_descriptors` adds the `Descriptor correlation` sheet, and is only
+    meaningful when `cells_info` holds EFD features (see
+    `efd_descriptor_correlation`).
 
     `standardize_mode`, `prune_correlation` and `sign_convention` all default to
-    reproducing v1 exactly; see `standardize`, `prune_correlated`, and below.
-    `sign_convention` flips each component so its largest loading is positive,
-    a port of `fit_pca` in
-    `figures/Epiquant_ShapeAnalysis_allMutants.ipynb` -- PCA signs are otherwise
-    arbitrary, so loading tables and mode plots need not reproduce across runs.
+    reproducing v1 exactly; see `standardize`, `prune_correlated` and `fit_pca`.
     """
     if prune_correlation is not None:
         cells_info, pruned = prune_correlated(cells_info, threshold=prune_correlation)
@@ -402,93 +585,29 @@ def compute_pca(
 
     cell_info_scaled = standardize(cells_info, mode=standardize_mode)
 
-    pca_all = PCA()
-    pca_all.fit(cell_info_scaled)
-    explained_variance_ratio = pca_all.explained_variance_ratio_
-
-    if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
-        explained_variance_df = pd.DataFrame({
-            "Principal Component": ["PC" + str(i + 1) for i in range(len(explained_variance_ratio))],
-            "Explained Variance Ratio": explained_variance_ratio,
-        })
-        explained_variance_df.to_excel(
-            os.path.join(output_dir, "Explained_Variance_Ratio_All_PC.xlsx"), index=False
-        )
-
-        plt.figure(figsize=(10, 6), dpi=300)
-        bars = plt.bar(
-            explained_variance_df["Principal Component"],
-            explained_variance_df["Explained Variance Ratio"] * 100,
-            width=0.4, color="lightgreen",
-        )
-        plt.xlabel("Principal Component", fontsize=18, fontweight="bold")
-        plt.ylabel("Explained Variance Ratio (%)", fontsize=18, fontweight="bold")
-        plt.title("Explained Variance Ratio for All PC", fontsize=20, fontweight="bold")
-        plt.xticks(rotation=0, fontsize=16, fontweight="bold")
-        plt.tight_layout()
-        for bar, variance in zip(bars, explained_variance_df["Explained Variance Ratio"] * 100):
-            plt.text(
-                bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                f"{variance:.2f}%", ha="center", color="black", fontsize=14, fontweight="bold",
-            )
-        plt.grid(True, which="both", axis="y", linestyle="--", linewidth=0.5)
-        plt.savefig(os.path.join(output_dir, "Explained_Variance_Ratio_All_PC.png"), dpi=300)
-        plt.close()
-
-    pca = PCA(n_components=variance_threshold)
-    cell_info_pca = pca.fit_transform(cell_info_scaled)
-    if sign_convention:
-        flip = np.sign(pca.components_[
-            np.arange(len(pca.components_)), np.abs(pca.components_).argmax(axis=1)
-        ])
-        pca.components_ *= flip[:, None]
-        cell_info_pca = cell_info_pca * flip[None, :]
-    components = pca.components_
-
-    if output_dir is not None:
-        for i in range(components.shape[0]):
-            contributions = components[i]
-            contributions_squared = contributions ** 2
-            feature_abbreviations = [PCA_FEATURE_ABBREVIATIONS.get(col, col) for col in cells_info.columns]
-            component_contributions = pd.DataFrame({
-                "Feature": feature_abbreviations,
-                "Contribution": contributions,
-                "Contribution Squared": contributions_squared,
-            })
-            component_contributions.to_excel(
-                os.path.join(output_dir, f"PCA_Component_{i + 1}.xlsx"), index=False
-            )
-
-            plt.figure(figsize=(10, 6), dpi=300)
-            bars = plt.bar(
-                component_contributions["Feature"],
-                component_contributions["Contribution Squared"] * 100,
-                width=0.4, color="skyblue",
-            )
-            plt.xlabel("Feature", fontsize=18, fontweight="bold")
-            plt.ylabel("Contribution Squared (%)", fontsize=18, fontweight="bold")
-            plt.title(f"Contribution Squared for PC {i + 1}", fontsize=20, fontweight="bold")
-            plt.xticks(rotation=0, ha="right", fontsize=16, fontweight="bold")
-            plt.tight_layout()
-            for bar, contribution in zip(bars, component_contributions["Contribution Squared"] * 100):
-                plt.text(
-                    bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                    f"{contribution:.2f}%", ha="center", color="black", fontsize=14, fontweight="bold",
-                )
-            plt.grid(True, which="both", axis="y", linestyle="--", linewidth=0.5)
-            plt.savefig(os.path.join(output_dir, f"PCA_Component_{i + 1}_Contribution_Squared.png"), dpi=300)
-            plt.close()
+    explained_variance_ratio = PCA().fit(cell_info_scaled).explained_variance_ratio_
+    pca, cell_info_pca = fit_pca(cell_info_scaled, variance_threshold, sign_convention)
 
     pca_columns = ["PC" + str(i + 1) for i in range(cell_info_pca.shape[1])]
     cell_scores = pd.DataFrame(cell_info_pca, index=cells_info.index, columns=pca_columns)
-    cell_scores["PC_score"] = np.sum(cell_scores * pca.explained_variance_ratio_, axis=1)
+    cell_scores = cell_scores.loc[cell_index_order(cell_scores.index)]
 
     if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
         cell_scores.to_excel(os.path.join(output_dir, "Cells_info_PCA.xlsx"), sheet_name="Cell1")
+        write_pca_components(
+            os.path.join(output_dir, "PCA_Components.xlsx"),
+            components=pca.components_,
+            explained_variance_ratio=explained_variance_ratio,
+            feature_names=list(cells_info.columns),
+            scores=cell_scores,
+            raw_features=cells_info,
+            descriptor_correlation=(
+                efd_descriptor_correlation(cells_info, cell_scores)
+                if with_efd_descriptors else None),
+        )
 
-    cells_info_pca = cell_scores.sort_values(axis=0, by="PC_score", ascending=False)
-    return cells_info_pca
+    return cell_scores
 
 
 def plot_shape_modes(
@@ -626,8 +745,14 @@ def cluster_cells_kmeans(
     k_range: tuple[int, int] = (2, 9),
     random_state: Optional[int] = DEFAULT_RANDOM_STATE,
 ) -> pd.DataFrame:
-    """K-means cluster cells on their PC scores (all `PC*` columns of
-    `cells_info_pca` except the trailing `PC_score`).
+    """K-means cluster cells on their PC scores -- every `PC{n}` column of
+    `cells_info_pca`, matched by NAME.
+
+    It used to be `columns[:-1]`, i.e. "everything but the last column",
+    because the last column was the `PC_score` sort key. With `PC_score` gone
+    (Round 34, 1-4) that rule would have dropped the last real component
+    without a word, so the selection is by name and the result is asserted to
+    be exactly `PC1..PCk` with nothing else in the frame.
 
     `n_clusters`: an integer cluster count (any N >= 2, not just 2), or the
     literal string `"auto"` to pick k via `_select_k_by_silhouette` over
@@ -647,18 +772,22 @@ def cluster_cells_kmeans(
     caller never used them (src/gui_main.py:1112), so that dead output is
     dropped here rather than ported.
 
-    If `output_dir` is given, writes `cells_PCA_2D.png` and
-    `cells_clustering_results.xlsx`. The plot draws a PC1-vs-PC2 scatter
-    plus a logistic-regression decision-boundary contour ONLY when the
-    final cluster count is exactly 2 (a boundary line is inherently a
-    binary-classifier concept and doesn't generalize past 2 classes); for
-    N>2 it's a plain multi-color scatter with no boundary.
+    If `output_dir` is given, writes `cells_clustering_results.xlsx`. The
+    `cells_PCA_2D.png` scatter it also used to write is gone with the other
+    default PNG exports (Round 34, 1-1); the Morphospace view draws the same
+    thing, with the decision boundary, on demand.
 
     `random_state` is newly exposed (v1 had none, i.e. `None`/non-deterministic)
     so callers can pass a fixed seed for reproducible runs/tests.
     """
     fac_index = cells_info_pca.index
-    components = [col for col in cells_info_pca.columns[:-1] if col.startswith("PC")]
+    components = [col for col in cells_info_pca.columns if re.fullmatch(r"PC\d+", str(col))]
+    expected = [f"PC{i + 1}" for i in range(len(components))]
+    if components != expected or len(components) != len(cells_info_pca.columns):
+        raise ValueError(
+            f"expected the PCA score table to hold exactly {expected} and nothing else, "
+            f"got {list(cells_info_pca.columns)}"
+        )
     data = cells_info_pca[components].values
 
     if n_clusters == "auto":
@@ -666,43 +795,6 @@ def cluster_cells_kmeans(
 
     kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=random_state)
     label = kmeans.fit_predict(data)
-
-    if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
-        plt.figure(figsize=(10, 8), dpi=300)
-
-        if len(np.unique(label)) == 2:
-            plt.scatter(data[:, 0], data[:, 1], c=label, cmap="viridis", s=5)
-            ax = plt.gca()
-            ax.spines["right"].set_visible(True)
-            ax.spines["top"].set_visible(True)
-            ax.set_xlim(data[:, 0].min() - 1, data[:, 0].max() + 1)
-            ax.set_ylim(data[:, 1].min() - 1, data[:, 1].max() + 1)
-
-            log_reg = LogisticRegression(random_state=random_state)
-            log_reg.fit(data[:, :2], label)
-
-            x_values = np.linspace(data[:, 0].min(), data[:, 0].max(), 100)
-            y_values = np.linspace(data[:, 1].min(), data[:, 1].max(), 100)
-            xx, yy = np.meshgrid(x_values, y_values)
-            grid = np.c_[xx.ravel(), yy.ravel()]
-            probabilities = log_reg.predict_proba(grid)[:, 1].reshape(xx.shape)
-            plt.contour(xx, yy, probabilities, levels=[0.5], linestyles=["--"], colors="r")
-        else:
-            plt.scatter(data[:, 0], data[:, 1], c=label, cmap="tab10", s=5)
-            ax = plt.gca()
-            ax.spines["right"].set_visible(True)
-            ax.spines["top"].set_visible(True)
-            ax.set_xlim(data[:, 0].min() - 1, data[:, 0].max() + 1)
-            ax.set_ylim(data[:, 1].min() - 1, data[:, 1].max() + 1)
-
-        plt.xlabel("PC1", fontsize=18, fontweight="bold")
-        plt.ylabel("PC2", fontsize=18, fontweight="bold")
-        plt.xticks(fontsize=16, fontweight="bold")
-        plt.yticks(fontsize=16, fontweight="bold")
-        plt.tight_layout(pad=1)
-        plt.savefig(os.path.join(output_dir, "cells_PCA_2D.png"), dpi=300)
-        plt.close()
 
     n_clusters_actual = label.max() + 1
     counts = np.bincount(label, minlength=n_clusters_actual)
@@ -785,6 +877,145 @@ def _self_test() -> None:
     pd.testing.assert_frame_equal(first, again)
     print("  sign convention: repeated runs give identical components")
 
+    # 3b. (Round 34, 0-4) The GUI and `/figures` must be the SAME PCA, not two
+    #     implementations that agree in spirit. `make_efd_figures.py` cannot be
+    #     imported -- it loads pickles at module level -- so its `fit_pca`
+    #     (`figures/efd_figures/make_efd_figures.py:118-122`) is copied here
+    #     verbatim as the reference, and the copy is what this pins against.
+    def reference_fit_pca(F, n=10):
+        p = PCA(n_components=n).fit(F)
+        flip = np.sign(p.components_[np.arange(n), np.abs(p.components_).argmax(axis=1)])
+        p.components_ *= flip[:, None]
+        return p, p.transform(F)
+
+    reference_model, reference_scores = reference_fit_pca(features.to_numpy(float), n=6)
+    ours, our_scores = fit_pca(features.to_numpy(float), n_components=6, sign_convention=True)
+    assert np.allclose(ours.components_, reference_model.components_, rtol=0, atol=1e-12), (
+        f"components differ by up to {np.abs(ours.components_ - reference_model.components_).max():.2e}"
+    )
+    assert np.allclose(our_scores, reference_scores, rtol=0, atol=1e-9), (
+        f"scores differ by up to {np.abs(our_scores - reference_scores).max():.2e}"
+    )
+    print(f"  figures parity: components identical to make_efd_figures.fit_pca "
+          f"(max |diff| {np.abs(ours.components_ - reference_model.components_).max():.1e})")
+
+    # 3c. (Round 34, 0-2) The same for the EFD feature matrix: with `track_ids`
+    #     it must be exactly `make_efd_figures.py:129-131`'s `X`. Without them
+    #     the front/back decision is per outline, which is a DIFFERENT matrix --
+    #     assert that too, so the distinction cannot quietly stop mattering.
+    import efd as _efd
+
+    rng_e = np.random.default_rng(3)
+    theta = np.linspace(0, 2 * np.pi, 200, endpoint=False)
+    contours, tracks, frames_e = [], [], []
+    for cell in range(6):
+        for t in range(4):
+            radius = 1 + 0.3 * np.cos(theta) + 0.12 * np.cos(2 * theta + 0.4 * t + cell)
+            outline = np.c_[radius * np.cos(theta), radius * np.sin(theta)]
+            contours.append(_efd.elliptic_fourier_descriptors(outline, order=10))
+            tracks.append(f"cell{cell}")
+            frames_e.append(t)
+    C = np.asarray(contours)
+    reference_X = _efd.drop_size(
+        _efd.canonicalize(C, flip=_efd.front_back_by_track(C, tracks, frames_e))
+    ).reshape(len(C), -1)
+    ours_X = _efd.efd_features(C, track_ids=tracks, frames=frames_e)
+    assert np.allclose(ours_X, reference_X, rtol=0, atol=0), "efd_features must BE the figures' chain"
+    per_outline_X = _efd.efd_features(C)
+    assert not np.allclose(per_outline_X, reference_X), (
+        "fixture has no front/back ambiguity -- it cannot tell the two conventions apart"
+    )
+    flipped = (np.abs(per_outline_X - reference_X).max(axis=1) > 1e-9).sum()
+    print(f"  figures parity: EFD features identical with track_ids; "
+          f"{flipped}/{len(C)} outlines differ under the per-outline rule")
+
+    # 3d. (Round 34, Part 1) What a classification run leaves on disk: one
+    #     workbook, no PNGs, no `PC_score`, rows in Cell Index order.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        written = compute_pca(features, output_dir=tmp, sign_convention=True)
+        assert "PC_score" not in written.columns, written.columns
+        assert list(written.columns) == [f"PC{i + 1}" for i in range(written.shape[1])], written.columns
+        files = sorted(os.listdir(tmp))
+        assert not [f for f in files if f.endswith(".png")], f"PNG exports are back: {files}"
+        assert files == ["Cells_info_PCA.xlsx", "PCA_Components.xlsx"], files
+        book = pd.ExcelFile(os.path.join(tmp, "PCA_Components.xlsx"))
+        expected_sheets = ["Loadings", "Explained variance", "Feature correlation"] + \
+            [f"PC{i + 1}" for i in range(written.shape[1])]
+        assert book.sheet_names == expected_sheets, book.sheet_names
+        loadings = book.parse("Loadings", index_col=0)
+        assert list(loadings.index) == list(features.columns), list(loadings.index)
+        per_pc = book.parse("PC1")
+        assert list(per_pc.columns) == ["Feature", "Contribution", "Contribution Squared"]
+        assert per_pc["Contribution Squared"].is_monotonic_decreasing, "PC sheets sort by contribution"
+        assert set(per_pc["Feature"]) == set(loadings.index), "the two sheets must name the same features"
+        correlation = book.parse("Feature correlation", index_col=0)
+        assert list(correlation.index) == list(written.columns), list(correlation.index)
+        # r is between the PC score and the RAW feature, i.e. what Supp. Fig. 1A plots.
+        manual = np.corrcoef(features.loc[written.index, "Cell Area"], written["PC1"])[0, 1]
+        assert abs(correlation.loc["PC1", "Cell Area"] - manual) < 1e-12, correlation.loc["PC1", "Cell Area"]
+        variance = book.parse("Explained variance")
+        assert len(variance) == features.shape[1], "every component, not only the retained ones"
+        assert int(variance["Retained"].sum()) == written.shape[1], variance
+
+    # Rows come out in Cell Index order, numerically -- Cell10 after Cell9.
+    shuffled = features.sample(frac=1.0, random_state=1)
+    shuffled.index = pd.Index(
+        [f"Cell{1 + i % 11}_{1 + i // 11}" for i in range(len(shuffled))], name="Cell Index")
+    ordered = compute_pca(shuffled, sign_convention=True)
+    keys = [(int(i[4:].split("_")[0]), int(i.split("_")[1])) for i in ordered.index]
+    assert keys == sorted(keys), f"not in (frame, label) order: {keys[:6]}"
+    assert list(ordered.index) != sorted(ordered.index), (
+        "fixture has no Cell10-vs-Cell9 case, so it cannot tell a numeric sort from a string one"
+    )
+
+    # And k-means now picks its PC columns by name. The old `columns[:-1]`
+    # rule, applied to a PC_score-free table, drops a real component.
+    clusters = cluster_cells_kmeans(ordered, n_clusters=2, random_state=0)
+    assert list(clusters.columns) == ["Cell_Index", "Cluster_Label", "Cell_Type"], clusters.columns
+    assert list(clusters["Cell_Index"]) == list(ordered.index), "k-means must keep the row order"
+    try:
+        cluster_cells_kmeans(ordered.assign(PC_score=1.0), n_clusters=2)
+        raise AssertionError("a stray column must be refused, not silently used or dropped")
+    except ValueError as error:
+        assert "PC_score" in str(error), error
+    print(f"  Part 1: one PCA_Components.xlsx ({len(expected_sheets)} sheets), no PNGs, no PC_score; "
+          f"rows in Cell Index order; k-means used {ordered.shape[1]} PC(s) by name")
+
+    # 3e. (Round 34, 1-3) The EFD descriptor sheet. Re-uses 3c's contours.
+    efd_frame = pd.DataFrame(
+        ours_X, index=pd.Index([f"Cell{f + 1}_{t[4:]}" for t, f in zip(tracks, frames_e)],
+                               name="Cell Index"),
+        columns=_efd.efd_feature_names(10))
+    with tempfile.TemporaryDirectory() as tmp:
+        efd_scores = compute_pca(efd_frame, output_dir=tmp, standardize_mode="none",
+                                 variance_threshold=3, sign_convention=True,
+                                 with_efd_descriptors=True)
+        sheets = pd.ExcelFile(os.path.join(tmp, "PCA_Components.xlsx")).sheet_names
+        assert "Descriptor correlation" in sheets, sheets
+        sheet = pd.read_excel(os.path.join(tmp, "PCA_Components.xlsx"),
+                              sheet_name="Descriptor correlation", index_col=0)
+        assert list(sheet.index) == list(efd_scores.columns), list(sheet.index)
+        assert sheet.columns[0].startswith("Linear CV R2"), sheet.columns[0]
+        assert "Skewness along axis r" in sheet.columns and "Amplitude h10 rho" in sheet.columns
+        # 40 coefficients -> 15 descriptors + elongation + irregularity + 9 amplitudes,
+        # each with an r and a rho, plus the one R2 column.
+        assert sheet.shape[1] == 1 + 2 * 26, sheet.shape
+        assert "Loadings" in sheets and "Harmonic 1 a" in \
+            list(pd.read_excel(os.path.join(tmp, "PCA_Components.xlsx"),
+                               sheet_name="Loadings", index_col=0).index)
+    # Elongation is read off the canonical coefficients; it must match the
+    # value the figures take from the raw ones.
+    canonical = ours_X.reshape(-1, 10, 4)
+    from_canonical = _efd.ellipse_from_harmonic1(_efd.phase_normalize(canonical))[0]
+    from_raw = _efd.ellipse_from_harmonic1(_efd.phase_normalize(C))[0]
+    assert np.allclose(from_canonical, from_raw, atol=1e-9), (
+        f"elongation shortcut drifts by {np.abs(from_canonical - from_raw).max():.2e}"
+    )
+    print("  1-3: Descriptor correlation sheet written (26 descriptors x r/rho + CV R2); "
+          "elongation matches the raw-coefficient route")
+
     # 4. Families are additive, well-formed, and exclude the retired columns.
     RETIRED = {
         "P-Value", "Frame Neighbor Entropy",
@@ -812,7 +1043,6 @@ def _self_test() -> None:
         assert restored not in base_only, f"{restored} must default off"
         assert restored in family_columns([], include_default_off=True), f"{restored} must be offered"
         assert restored in data_input.CELLS_INFO_COLUMNS, f"{restored} must be in the schema"
-        assert restored in PCA_FEATURE_ABBREVIATIONS, f"{restored} needs an abbreviation for the loading plots"
     # The note is the only place the user can read WHY a box is unticked.
     basic_note = FEATURE_FAMILIES["basic"]["note"]
     assert "Ellipse Angle" in basic_note and "Circularity" in basic_note, basic_note
@@ -830,7 +1060,6 @@ def _self_test() -> None:
     for retired in ("P-Value",):
         assert retired not in data_input.CELLS_INFO_COLUMNS, f"{retired} is back in the schema"
         assert retired not in data_input.ML_FEATURE_COLUMNS, f"{retired} is back in ML_FEATURE_COLUMNS"
-        assert retired not in PCA_FEATURE_ABBREVIATIONS, f"{retired} still has an abbreviation"
     assert set(FEATURE_FAMILIES["basic"]["columns"]) == set(data_input.ML_FEATURE_COLUMNS), (
         "the basic family and ML_FEATURE_COLUMNS must stay the same set"
     )
@@ -884,14 +1113,13 @@ if __name__ == "__main__":
 
     pca_df = compute_pca(filtered, args.output_dir)
     print("Explained variance (retained components):")
-    print(pca_df.drop(columns="PC_score").columns.tolist())
+    print(pca_df.columns.tolist())
 
     n_clusters_arg = "auto" if args.n_clusters.strip().lower() == "auto" else int(args.n_clusters)
     k_range_arg = tuple(args.k_range)
 
     if n_clusters_arg == "auto":
-        components = [col for col in pca_df.columns[:-1] if col.startswith("PC")]
-        best_k, scores = _select_k_by_silhouette(pca_df[components].values, k_range_arg, args.random_state)
+        best_k, scores = _select_k_by_silhouette(pca_df.values, k_range_arg, args.random_state)
         print(f"\nSilhouette scores over k_range={k_range_arg}:")
         for k, score in scores.items():
             marker = "  <-- selected" if k == best_k else ""

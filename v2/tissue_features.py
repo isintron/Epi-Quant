@@ -139,26 +139,60 @@ def build_interface_graph(
     fill_labels: np.ndarray,
     min_interface_px: int = MIN_INTERFACE_PX,
     max_gap_px: int = segmentation_qc.MAX_GAP_PX,
-) -> Dict[int, Set[int]]:
+    return_weights: bool = False,
+):
     """`{cell_id: {neighbor_id, ...}}` where two cells are neighbours only if
     they share at least `min_interface_px` of border.
+
+    With `return_weights`, the value is `{neighbor_id: shared_border_px}`
+    instead -- the interface LENGTH, which is the quantity the Schmitt band
+    and the minimum-interface rule are both really about, and the one
+    `adjacency.build_neighbor_graph`'s dilation overlap only stands in for.
+    Matches that function's own `return_weights` flag so the two graphs are
+    interchangeable at the call site (Round 31 §D).
 
     Gaps are closed first with `segmentation_qc._bridge_gaps`, because Cellpose
     output frequently leaves no two cells touching at all. See the module
     docstring for why this is used instead of `adjacency.build_neighbor_graph`.
+
+    **`min_interface_px` is the four-way-vertex rule**: an interface this short
+    is where cells meet at a corner, not along a wall. Two independent grounds
+    for the default of 2:
+
+    1. Measured here. Against Etournay's truth adjacency (`directed_bonds`),
+       over `demo`'s 71 frames and 20 frames of `WT_1`, this function returns
+       a median 0.00% / 0.04% false positives and 0.27% / 0.10% missed edges,
+       against `adjacency.build_neighbor_graph`'s 0.00% / 0.08% and 0.07% /
+       0.04% at `dilation_px=2`. Both are essentially exact; this one costs
+       1.5x (demo) to 3.2x (WT_1) more per frame (Round 30 §D4).
+    2. Etournay's real `bond_length` distribution says what the cutoff takes
+       away, and it is not nothing: ~1% of all edges are <= 2 px, against
+       18-36% of the edges involved in a T1 event (Round 30 §F). **So this is
+       a change to the criterion, not a cleanup**, and it is reported as one.
+
+    Tissue Analyzer's *Finish all* dialog is reported by the maintainer to
+    carry a same-named parameter defaulting to 2 px. That is a side note only:
+    the Java version is closed source and neither `TA_java.md` nor `pyTA.md`
+    mentions it, so it is not evidence and nothing here rests on it.
     """
     bridged = segmentation_qc._bridge_gaps(fill_labels, max_gap_px)
-    graph: Dict[int, Set[int]] = {}
+    graph = {}
     for (first, second), pixels in segmentation_qc._interface_pixels(bridged).items():
         if pixels.size < min_interface_px:
             continue
-        graph.setdefault(int(first), set()).add(int(second))
-        graph.setdefault(int(second), set()).add(int(first))
+        first, second, length = int(first), int(second), int(pixels.size)
+        if return_weights:
+            graph.setdefault(first, {})[second] = length
+            graph.setdefault(second, {})[first] = length
+        else:
+            graph.setdefault(first, set()).add(second)
+            graph.setdefault(second, set()).add(first)
     # Cells with no qualifying interface still belong in the graph, or they
     # would silently vanish from the output table.
+    empty = dict if return_weights else set
     for label in np.unique(fill_labels):
         if label != 0:
-            graph.setdefault(int(label), set())
+            graph.setdefault(int(label), empty())
     return graph
 
 

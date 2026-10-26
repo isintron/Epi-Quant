@@ -128,7 +128,7 @@ def compute_displacement_vectors(
 
 
 def interpolate_vector_field(
-    displacement_df: pd.DataFrame, grid_size: int = 100,
+    displacement_df: pd.DataFrame, grid_size: int = 100, fill_value: float = np.nan,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Interpolate the sparse per-cell displacement vectors in
     `displacement_df` (as returned by `compute_displacement_vectors`) onto a
@@ -137,6 +137,14 @@ def interpolate_vector_field(
 
     Extracted from `CellDirection.plot_displacement_arrows`,
     src/gui_cell_direction.py:187-201, decoupled from `ax.streamplot`.
+
+    **`fill_value` was `0` until Round 34.** Cubic `griddata` returns nothing
+    outside the convex hull of the input points, and filling that with zero
+    says "measured, and stationary" for every grid node outside the tissue --
+    so `streamplot` drew flow slowing to a halt at the tissue edge, which looks
+    like biology and is an artefact of the interpolation. `np.nan` is what
+    `streamplot` reads as "no data here". Pass `0.0` to restore the old
+    behaviour; nothing in the product does.
     """
     x_arr = displacement_df["Current X"].to_numpy(dtype=float)
     y_arr = displacement_df["Current Y"].to_numpy(dtype=float)
@@ -146,8 +154,8 @@ def interpolate_vector_field(
     xi = np.linspace(x_arr.min(), x_arr.max(), grid_size)
     yi = np.linspace(y_arr.min(), y_arr.max(), grid_size)
     X, Y = np.meshgrid(xi, yi)
-    U = griddata((x_arr, y_arr), u_arr, (X, Y), method="cubic", fill_value=0)
-    V = griddata((x_arr, y_arr), v_arr, (X, Y), method="cubic", fill_value=0)
+    U = griddata((x_arr, y_arr), u_arr, (X, Y), method="cubic", fill_value=fill_value)
+    V = griddata((x_arr, y_arr), v_arr, (X, Y), method="cubic", fill_value=fill_value)
     return X, Y, U, V
 
 

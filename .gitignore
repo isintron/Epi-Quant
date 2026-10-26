@@ -13,14 +13,12 @@ docs/
 .claude/
 CLAUDE.md
 CLAUDE.local.md
-人机协同点击测试指南.md
-Claude outputs/
 
 # Python
 __pycache__/
 *.pyc
 
 # Output of test data generation (ignored at any directory depth)
-test_data/
 tmp/
+test_data/
 v2/baseline_data/

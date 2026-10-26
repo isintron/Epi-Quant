@@ -1421,6 +1421,1449 @@ with zero residual difference from the original table.
 > frame 24: 1, frame 29: 1`). Three applications, one rule; it is not re-argued
 > in each round section.
 
+### Round 36 follow-up: one retired column emptied every value picker (2026-10-22)
+
+**Symptom.** `AS_LE_lateral view_E-cad` could no longer be read by Clone
+(multiple) cell data or Morphospace.
+
+**Cause.** That project's `cell_classification_output/` predates Round 34 --
+it still holds `Explained_Variance_Ratio_All_PC.xlsx`, `PCA_Component_1/2.xlsx`
+and, critically, a `Cells_info_PCA.xlsx` whose columns are
+`PC1, PC2, PC_score`. Round 34 §1-4 retired `PC_score`, so
+`cell_table.dimension_of` does not know it, and `dimension_of` **raises** on an
+unknown column by design -- that strictness is what stops a value being
+labelled µm while it holds pixels.
+
+But it raised inside `value_catalog()`, which walks every numeric column of
+every loaded table. One unrecognised column therefore took out the **whole**
+catalog: `get_value_catalog` returned `{"values": [], "error": ...}`, every
+value picker came up empty, and from the UI that is indistinguishable from
+"this project cannot be loaded". Round 36's `get_distributions_plot` called
+`value_catalog()` without a guard and raised outright.
+
+Measured on the real project: **0 values offered before, 20 after.**
+
+**Fix, in two places:**
+
+- `value_catalog()` **skips** a column with no dimension instead of raising,
+  and records it; `CellTable.unknown_columns()` reports what was skipped and
+  `get_value_catalog` returns it as `skipped`. The strictness stays where it
+  bites -- `dimension_of` still raises for anyone converting or labelling such
+  a column, and the self-test still requires every column this version ships to
+  have an entry.
+- `_load_pca_scores` drops `PC_score` on read, naming it in the log. It was
+  retired on purpose (a variance-weighted sum of arbitrarily-signed scores that
+  only ever ordered the rows) and must not reappear as something a user can
+  plot.
+
+Pinned at both levels: `cell_table._self_test` builds a PCA table carrying
+`PC_score` and requires the catalog to keep the rest and name the skipped one;
+the API self-test writes a pre-Round-34 `Cells_info_PCA.xlsx` and requires it
+to load with the column gone. A project written by this version is unchanged
+(19D: 32 values, nothing skipped).
+
+**And the 145-vs-108 that surfaced with it.** That stored table has 145 rows of
+which **37 hold no cell in any frame** -- on disk, not made by
+`dedupe_tracking_data`. Every plot counts rows that hold cells (108); the Track
+step counted rows (145); the two looked like a contradiction.
+
+`cell_tracking.count_tracks` is now the single definition -- `{rows,
+with_cells, empty}`, a row counting as a track when at least one `Frame{n}`
+column holds a value -- and `load_existing_tracking`, `onTrackDone` and the
+re-track report all read it, so they cannot drift apart (`CLAUDE.md` rule 6).
+The Track step now says:
+
+> Done: **108 tracks** (37 of the 145 rows hold no cell and are not shown).
+
+A table with no empty rows says just "423 tracks", with no parenthetical to
+explain away. `get_track_numbers()` also stops offering the empty rows: picking
+one could only ever produce "No frame data for this track", and a picker 37
+entries longer than anything displayable is the same confusion in another
+place. `with_cells_only=False` still returns every row for anything reasoning
+about the file itself.
+
+That changes one measurement, so it is on the record rather than implied: the
+visual-inspection pass now covers tracks that can be **displayed**, and
+`start_track_inspection` writes `track_counts` into the provenance beside
+`tracks_total`.
+
+> ⚠️ **`embryos_GBE_GAP43` has one too**: 501 rows, **500 with cells**. The
+> dataset inventory in `CLAUDE.local.md` records "501 GT tracks", and anything
+> that counted rows there counted 501. Flagged, not changed -- the GT files are
+> the maintainer's.
+
+### Round 36: four click-test bugs, "individual", and letting static data into step 8 (2026-10-22)
+
+The maintainer's record is `v2/rounds/revision_2.md`. Four bugs, a wording
+pass, and the gap §6 and §8 exposed: **Round 34 computed a joint PCA that
+nothing could draw, and data without tracking could not enter step 8 at all**,
+so both static datasets stopped after Extract.
+
+#### 1. Streamlines subtracted the drift along the wrong axis
+
+`drift_by_frame` is `{frame: (dx, dy)}` (`_estimate_drift`,
+`cell_tracking.py:363`). Audited every consumer -- `cell_tracking.py:1112/1138`,
+`tracking_benchmark.py:248/333/610/617/785/803/1259`, `candidate_probe.py:73`,
+and five magnifier paths in `api.py` -- **all of them read `shift[0]` as x.**
+One line in `get_streamlines_plot` had them crossed, so with Registration on
+(or a tracking run that registered) the compensation went the wrong way, and on
+a diagonally drifting movie the result still looks like a plausible flow field.
+
+Pinned by two synthetic movies, a pure x translation and a pure y translation
+of a rigid lattice. Residual displacement after compensation:
+
+| | Registration off | on | **with the two lines crossed** |
+|---|---:|---:|---:|
+| x-only drift | 21.0 px | **0.00 px** | 29.7 px |
+| y-only drift | 21.0 px | **0.00 px** | 29.7 px |
+
+The crossed case is asserted to stay large, so swapping the lines back fails
+the test.
+
+#### 2. Right-click -> Figure settings did nothing on Clone cell data
+
+The popover is `position: fixed` and was placed with `pageX/pageY`, which are
+**document** coordinates. On the Trajectory step, where Clone cell data sits
+well down a scrolled page, that put it below the bottom of the screen -- it
+opened every time, just off-screen. The Playground page is short, which is why
+it looked fine there. Now `clientX/clientY`, clamped to the viewport. The
+right-click menu keeps page coordinates, which are correct for it: it is
+`position: absolute`.
+
+#### 3. The Lines control changed nothing
+
+`base_rc` set `lines.linewidth`, and then every artist in `plots.py` and
+`morphospace.py` passed an explicit `lw=` -- which beats the rcParam. New
+`plotkit.lw(scale)` returns `scale x rcParams["lines.linewidth"]`, and each
+former constant became `lw(constant)`, chosen so Normal (1 pt) reproduces the
+old number exactly. `lw=0` (a fill with no edge) stays 0: it is not a width.
+Self-test: six chart kinds rendered at Thin and at Normal, **every `Line2D` and
+`LineCollection` width ratio asserted to be 0.5**.
+
+#### 4. Missing glyphs, and the "serif" that was not a fallback
+
+`available_fonts()` listed all 385 families `font_manager` knows, including
+scripts that cannot draw a Latin label. Measured from the font files
+themselves:
+
+- **Muna** (Arabic): 272 glyphs, **no Latin letters at all** -> `Glyph 101 (e)
+  missing`;
+- **Kai**: 7,593 glyphs, Latin present, but **no `µ ² ³ − –`** -> `Glyph 178
+  (SUPERSCRIPT TWO) missing`.
+
+**The serif report has the same single cause.** Kai is a Chinese *regular
+script* (楷体) face -- a calligraphic brush typeface whose Latin letters are
+serif-like. Nothing fell back to a serif family: the labels were being drawn in
+Kai the whole time, and changing the type size merely forced the re-render that
+made it visible. Verified headlessly: `font.family` resolves to `Kai.ttf`
+before and after a size change, with the same four warnings either way. No
+code change was needed for "the serif" beyond not offering Kai.
+
+Two fixes:
+
+- the menu lists only fonts whose charmap covers all **76** characters an
+  Epi-Quant label can contain -- **121 of 385 offered, 264 filtered out**;
+- `base_rc` sets `font.family` to a **list**, not `sans-serif` plus
+  `font.sans-serif`. Matplotlib does per-character fallback at the
+  `font.family` level only; through `font.sans-serif` it picks one font for the
+  whole string. Measured on the same label: **4 warnings the old way, 0 this
+  way.** `installed_stack()` also drops `Liberation Sans`, which is not on this
+  machine and was logging a warning on nearly every draw.
+
+Self-test: every offered font renders a label containing all 76 characters with
+zero `Glyph ... missing`.
+
+#### 5. embryo -> individual
+
+Changed in user-facing text only -- `index.html` and the `app.js` strings.
+`api.py`'s "embryo" occurrences are all docstrings, comments and dataset names
+(`embryos_GBE_GAP43`), which stay. Specifically: the group chip now reads
+`(8 individuals)`, the folder picker says "Select an individual's project
+folder", and the comparator's note and tooltip became:
+
+| mode | panel text | tooltip |
+|---|---|---|
+| Clusters comparison | Clusters of the current project. | Descriptive only: the clusters were defined on these values, and cells in one sample are not independent. |
+| Multi-groups comparison | Each group is one or more project folders. | Each folder counts as one individual: group means are means of individual means, and intervals resample individuals. |
+
+Both are set from JS, in step with the mode. They were a static HTML attribute,
+so the tooltip still described Clusters while Multi-groups was selected, and it
+carried the markup's indentation into the popup.
+
+#### 6-8. The joint PCA becomes reachable, and step 8 opens after Extract
+
+- **Feature families** (`joint-features-btn`) had no listener at all and
+  `build_joint_pca` hardcoded the basic 13. It now takes
+  `feature_families`/`selected_features`, resolved the way Classify resolves
+  them (EFD exclusive and unstandardized, `-1` masked to NaN), records them in
+  the manifest, and refuses a folder **by name and by missing table**.
+- **`PCA source`** at the top of step 8: `This project`, plus a `Joint: <name>`
+  for every manifest found in this project or any group folder. Selecting one
+  runs `check_joint_pca` first and refuses, naming the folder, if any
+  `Cells_info` has changed since the fit. On a joint source the Morphospace
+  draws every cell of every folder, coloured by **group**, one 95% hull per
+  group, and **no k-means boundary** -- a joint PCA is a shared basis, not a
+  clustering. Exemplar glyphs come from each cell's own folder.
+- **Step 8 unlocks after Extract.** `CellTable.key_table` without tracking
+  builds keys from `Cells_info` with `Track_ID = NaN`, and
+  `get_playground_capabilities` tells each panel what it can do **with the
+  reason attached** -- a disabled control answers "why not" on hover.
+- **Distributions** (new panel) puts Round 34's Columns template on screen at
+  last, as the manuscript's Fig. 3D SuperPlot: cells as small points, one large
+  point per individual, a bar at the mean of individual means +/- their SD.
+  Statistics follow the mode -- Clusters is descriptive only, Multi-groups gets
+  a 5,000-resample bootstrap CI **over individuals**, and a group with one
+  individual gets none and says so.
+- **"Extract missing"** (agreed with the maintainer, beyond the plan): one
+  individual is one folder, so `Demo_pyd_central_AS` is 24 projects and the
+  comparison was unreachable without 24 manual Extracts. The button extracts
+  only folders with no `Cells_info.xlsx`, with this session's settings, and
+  reports them.
+
+#### 7. `test_data/Demo_pyd_central_AS`
+
+24 individuals copied (never moved) from
+`~/cellpose/Epi-Quant_analysis/data/Static WT pyd images/central_AS`: WT_GBR 8,
+WT_DC 8, pyd_GBR 4, pyd_DC 4. One individual per project folder, because the
+Group comparator counts a folder as an individual. `<crop>.npy` is the original
+image again, not a mask, and is not copied; the mask is TA's
+`<crop>/handCorrection.tif`.
+
+Files are renamed `<crop>_0001.tif`: `resolve_frame_numbers` takes the **last**
+digit run, so `WT1_037.tif` would be frame **37**. Verified that all 24
+projects resolve to exactly one frame, numbered 1, image and mask paired by
+stem. `_mapping.tsv` records every file against its source. READMEs added to
+both this directory and `Demo_19D_AS`.
+
+#### Acceptance, end to end on both datasets
+
+**19D** (Extract only, no tracking, no Classify):
+
+| | measured | 19D_demo README | difference |
+|---|---:|---:|---:|
+| Ctrl | 842 | 842 | 0 |
+| 19D KD | 847 | 847 | 0 |
+| total | **1,689** | **1,689** | **0** |
+
+Step 8 opened on Extract alone; Clone multiple cells and Streamlines were
+disabled saying "Needs tracking (step 5)."; the joint PCA over Basic + Hull +
+Lobe built over 1,689 cells and 4 components, appeared in `PCA source`, drew,
+and exported.
+
+**pyd central AS** (24 individuals, 4 groups, Basic-13 joint PCA). Cell counts
+against `static_cells_pca.csv`, **exact once edge cells are excluded**, which
+is the setting `fig5_static/README.md` states:
+
+| group | ours | reference |
+|---|---:|---:|
+| WT_GBR | 244 | 244 |
+| WT_DC | 232 | 232 |
+| pyd_GBR | 117 | 117 |
+| pyd_DC | 110 | 110 |
+
+**⚠️ Ellipse AR does not agree, and it is not the sample.** With the same 703
+cells, the aspect ratio is **+3 to +6% high in every group, on every statistic**
+(cell mean, cell median and mean of individual means alike):
+
+| group | cell mean, ours / ref | mean of individual means, ours / ref |
+|---|---|---|
+| WT_GBR | 1.919 / 1.826 | 1.923 / 1.831 |
+| WT_DC | 1.553 / 1.502 | 1.549 / 1.501 |
+| pyd_GBR | 2.224 / 2.094 | 2.199 / 2.071 |
+| pyd_DC | 1.933 / 1.863 | 1.925 / 1.856 |
+
+Edge exclusion does not move it (1.919 -> 1.923 with edge cells dropped), so
+the cells being measured are the same and the **ellipse measurement itself has
+changed** since the figures were made. The likely area is the always-on mask
+reading introduced in Round 24 -- the vertex-pocket removal and the
+stale-outline rebuild, and geometry being measured on `dat['masks']` -- all of
+which post-date that run and none of which is switchable. **Not tuned to
+match** (the plan forbids it, and so does `CLAUDE.md` rule 5); reported as an
+open question for whoever next quotes Fig. 5's AR numbers. Reference: the
+figures pipeline's own source data. This is agreement, not accuracy.
+
+#### Still not verified
+
+As in Round 35, everything above ran against the real backend through the dev
+HTTP bridge -- no `mock` marker anywhere -- but **not in the native pywebview
+window**, which this session cannot drive. The screenshots the plan asks for
+there are the maintainer's to take; each behaviour they would show is pinned by
+a test or measured above.
+
+### Round 35: what the click-test found -- a bridge contract, three stale-data bugs, and one layout engine (2026-10-22)
+
+The maintainer clicked through Round 34 in the real window. Nothing new was
+added this round; T1 and every Round 34 data rule (units, time window, joint
+PCA, counting) are untouched.
+
+#### 0-A. The mock hid a bug the real bridge could not miss
+
+Every Style / Font / Size / Error change did nothing, and the terminal said
+`set_plot_settings() takes 1 positional argument but 2 were given`. pywebview
+marshals a JS call into **positional** Python arguments, so
+`def set_plot_settings(self, **settings)` cannot be called from the frontend at
+all -- while the dev mock, whose own signature took one object, worked
+perfectly. The mock also listed **4 styles and 3 fonts** against the real 30
+and 382, which is most of "the menus look empty".
+
+Fixed, and then made un-repeatable:
+
+- the signature takes the dict positionally;
+- **`EpiQuantAPI.check_js_api_signatures`** scans every
+  `window.EpiQuantAPI.<name>(...)` in `app.js` and compares it with
+  `inspect.signature`: no `**kwargs` or keyword-only parameters, no call
+  passing more arguments than the method takes, no call to a method that does
+  not exist. Run against Round 34's signature it fails; against the fixed one
+  it is clean. Its own negative controls (an over-long call, a missing method)
+  are in the self-test, and its first run found three false positives of its
+  own -- `app.js` writes trailing commas, which the argument counter was
+  counting as an extra argument. That is fixed too, and said here because an
+  un-calibrated checker is worse than none.
+- the mock's option lists are now a **snapshot of the real backend's reply**.
+  A mock may stand in for layout; it may not invent what the options are.
+
+Verification this round ran against a **dev HTTP bridge to the real
+`EpiQuantAPI`** (in the maintainer's scratch directory, stdlib only, nothing in
+the repository knows it exists), which marshals arguments positionally exactly
+as pywebview does. So the pages below carry no `mock` marker and really did hit
+the real backend -- but they are still not the native window, which only the
+maintainer can drive.
+
+#### 2-2, 2-3. Three ways a figure was drawn from the wrong data
+
+1. **`Cells_shape` / `Cells_tissue` were never loaded.**
+   `load_existing_shape_features` wrote them to `self.cells_shape` and
+   `self.cells_tissue` -- **without the leading underscore** -- while every
+   reader uses `self._cells_shape`. And the frontend never called it at all,
+   although `get_existing_results` had always reported whether the files were
+   there. Measured on `embryos_GBE_GAP43`: the value catalog goes from **21 to
+   40 values** once the two tables actually arrive. `setattr` is what let the
+   typo through, so the names are now asserted against the attributes
+   `__init__` declares.
+2. **The `CellTable` cache was keyed on the tracking hash alone**, so
+   re-extracting shape or tissue left every chart serving the old tables --
+   tracking had not changed. The key is now that hash **and** a generation
+   counter bumped by `__setattr__` on any source table, which no future
+   assignment site can forget to call.
+3. **The PCA-score cache was keyed on the path**, and re-running Classify
+   writes the same path -- so every PC plot went on using the previous run's
+   scores. It now keys on path + mtime + size.
+
+And the one that drew a wrong figure in silence: **`set_project` reset
+nothing.** `Cell1_5` exists in every project, so project A's tables join
+cleanly onto project B's keys and the plot comes out wrong with no error. It
+now restores every attribute from a snapshot taken at the end of `__init__`,
+minus a short keep-list (the window handle and the display preferences), so a
+new attribute is reset the day it is added rather than the round after someone
+notices.
+
+All four are pinned by a test on real projects
+(`embryos_GBE_GAP43` -> `AS_LE_lateral view_E-cad`).
+
+#### 0-C. One layout engine, and nothing explanatory inside a figure
+
+The preview went through `dpi=150` + `bbox_inches="tight"` while the export did
+not, so **the picture on screen was not the picture that got saved**. The
+small-multiple height was `figure_height * n / 2`, so one value at double-column
+width was a strip a third as tall as it was wide with its y label cut off.
+`tight_layout()` was everywhere, and it ignores figure legends and anything
+drawn outside the axes.
+
+Now, all in `plotkit` and shared by every chart:
+
+- **`panel_figure`** is the only way a chart gets a figure: constrained layout,
+  `MaxNLocator(5)` on both axes, and a height set by the **panel** rather than
+  the figure -- `clamp(0.62 x panel width, 45 mm, 80 mm)` for one panel, a flat
+  38 mm per row for small multiples, so adding a value makes the figure taller
+  instead of squeezing the rows. An outside legend's width is subtracted from
+  the preset, never added to it.
+- **Preview and export are the same `savefig` call**, at the same 600 dpi; the
+  frontend shows the image at its physical width (mm -> CSS px at 96/in), which
+  is also what makes it sharp on a Retina screen.
+- **The time axis picks its unit from the span** -- s to 10 min, min to 2 h,
+  then h. The exported `Time (s)` column stays in seconds.
+- **No prose inside a figure.** Kept-vs-total counts, the error-band name,
+  filter settings and the "not yet judgeable" explanation are returned as a
+  `note` for the panel's status line and written into the export's Provenance.
+  The censored *shading* stays: it is data.
+- **`plots.layout_problems`** measures a rendered figure -- all text inside the
+  figure, the y label clear of its ticks, the legend clear of the data. Run
+  over **8 chart kinds x 3 widths x 3 type sizes = 72 figures**, all clean,
+  with a contact sheet for the maintainer. (The plan says 63 for 7 kinds; the
+  one-value and multi-value small multiples are tested separately, because the
+  one-value case is the strip in screenshot 1.) Its first run reported a defect
+  in 31 of 72 -- `MaxNLocator` keeps label artists for ticks outside the view
+  limits, positioned off-figure and never drawn. The checker now ignores those;
+  it is still able to fail, which the self-test proves with an over-long label.
+
+#### 1. Figure settings, and giving the style sheets back their own look
+
+The settings bar is gone from both panels; **right-click any chart ->
+Figure settings...** opens a draggable popover that serves every chart in every
+step. The **Time window stays on the panel** -- it is a property of the data
+being shown, not of how it is drawn.
+
+`MANUSCRIPT_STYLE` is deleted; the default is `default` and the list is all 29
+Matplotlib style sheets plus it, underscore-prefixed ones included.
+**Matplotlib here is 3.10.3, which has every style on the reference page,
+`petroff10` included** -- the plan expected that one to be missing. `base_rc`
+no longer forces `axes.spines.*`, `legend.frameon`, `figure.facecolor` or
+`savefig.facecolor`, and `save` takes the background from the figure: those
+overrides are most of what a style sheet *is*, and they made `dark_background`
+export as a white page. Pinned by a test that reads the corner pixel of an
+exported PNG under `default`, `ggplot` and `dark_background`.
+
+**Fonts: 382 on this machine**, from `font_manager.get_font_names()`.
+
+Preview cost at double-column width, 600 dpi (R35 1-4 asked for this to be
+reported rather than quietly worked around):
+
+| chart | ms | kB |
+|---|---:|---:|
+| clone cell data (3 values) | 275 | 350 |
+| two y-axes | 202 | 359 |
+| all tracks (102 of 423) | 332 | 2,794 |
+| morphospace | 701 | 469 |
+| streamlines | 442 | 667 |
+| cell map / Track ID | 88 / 82 | 68 / 67 |
+| **cumulative events** | **13,832** | 156 |
+
+Two notes rather than two changes. **Cumulative events takes 13.8 s, of which
+13.1 s is the T1 computation**, not the render -- 30 frame pairs, each with a
+hysteresis chain walked from frame 1 and a persistence lookahead. T1 is out of
+scope this round, so it is reported, not touched. **All tracks is 2.79 MB**,
+under the 3 MB bound but the closest to it; a 4251x2385 px preview is what
+180 mm at 600 dpi means.
+
+#### 2-1, 3, 4. The rest
+
+- **The value list is drawn by us**, not a native `<datalist>`: an option
+  carrying both a `value` and a `label` is rendered on two lines by WebKit and
+  cannot be styled. One line each -- name in body colour, `(µm²) · Cells_info`
+  in grey, no parentheses for a dimensionless value -- and the search matches
+  the source table as well as the name. One component serves all three pickers.
+- **The cell map stops burning text into the image.** PIL's default bitmap font
+  has no `µ`, so `µm²` rendered as boxes; the range is now a status line
+  (`Range (whole movie): 3.34 - 13.1 Cell Area (µm²)`), where it can also say
+  whose range it is.
+- **The cell map goes through `_chart`**, so Save PNG and Save data work; it
+  declares `kinds: ["png", "xlsx"]` and the menu hides Save SVG, because there
+  is no vector form of a label image. Its PNG is written at the mask's own
+  resolution.
+- **Track ID is a value**, coloured by the identity palette (a ramp gives
+  consecutive track ids indistinguishable colours). The separate
+  `Export TA Track-ID map` button is gone: picking Track ID in Movie maker
+  produces exactly the old TA output -- same encoding, same directory layout,
+  frame range from the dialog. The round trip is now a self-test that decodes
+  with `tracker_comparison.py`'s own expression and checks ids 1, 2, 300 and
+  70000 come back exactly. Two bugs surfaced while writing it: the export went
+  through `_load_frame`, which decodes the microscopy image for every frame and
+  **fails outright on a project with no images**, and its output directory hit
+  the same one-second name collision the figure exports had.
+- **Streamlines get a Registration control**: `As tracked` (the old behaviour,
+  following `tracking_drift_mode`, never the mutable UI setting), `On`, `Off`.
+  Whichever applies goes in the note and the Provenance.
+- **One export callback for every panel.** Morphospace and Streamlines reported
+  nothing after an export because the old one knew two panels by name; the new
+  one finds the status line from the image's own panel and so knows none of
+  them.
+- **The theme dropdown spanned the window at 1250x845.** The global
+  `input, select { flex: 1; min-width: 120px }` applies to the nav bar, which
+  is a flex row -- once it wrapped, the select was the only flexible item on
+  its line. It sizes to its content now; checked at 1250x845 and 1024x768.
+- **Wording**: `Save PNG`, `Save data`, `Default`, `Single column` / `1.5
+  column` / `Double column`, `Small` / `Medium` / `Large`, `Thin` / `Normal`,
+  `Min. coverage`, `Two y-axes`, `Fixed scale`, `Clusters comparison` /
+  `Multi-groups comparison`, `Add folder`, and a time-window suffix that is
+  just `s` or `frame` with the range moved onto the inputs' `min`/`max`. The
+  numbers went into `title` tooltips. Beyond the plan's table: the cumulative-
+  events hint, the group-comparator note, the coverage control's explanation
+  and the fixed-scale explanation all moved from body text to tooltips.
+  **The Movie maker dialog is untouched, as asked.**
+
+#### Still not verified
+
+Every page above was driven through the HTTP bridge against the real backend,
+so none carries a `mock` marker -- but **the native pywebview window was not
+clicked**: this session has no way to drive it. The acceptance screenshots the
+plan asks for in the real window are the maintainer's to take; the behaviours
+they would show are each pinned by a test or measured above.
+
+### Round 34: the GUI's PCA becomes the figures' PCA, and the outputs step grows a plotting layer (2026-10-21)
+
+**Part 0 first, because every chart below is drawn on these numbers.** Three
+measured disagreements between what the GUI computed and what
+`figures/revision_2026-10` draws:
+
+1. *The sign convention was off.* `api.py` called `pca_kmeans.compute_pca`
+   without `sign_convention`, so component signs were arbitrary and a loading
+   table need not reproduce between runs, let alone match a figure. The GUI now
+   always passes `sign_convention=True`, in both the `time_series` and the
+   `independent_samples` branch.
+2. *EFD front/back was decided per outline.* `efd.front_back_by_track` decides
+   it once per track, which is what `make_efd_figures.py:129` does; per outline
+   it is one contour's skewness, i.e. noise for a cell with little asymmetry,
+   and every even-harmonic mode (PC2 bending) flickers. The conflict is that
+   Classify (step 3) runs before Track (step 5). Resolved as agreed: with
+   tracking, pass `track_ids` + `frames`; without it, fall back and **record
+   `front_back: "per_outline"` in the classification provenance**, so the
+   time-series plots can say so instead of quietly disagreeing. Nothing is
+   re-fitted automatically -- a refit moves every label in the movie.
+3. *`independent_samples` has no comparable PC axes at all.* It fits a separate
+   PCA per frame, so PC2 in frame 5 and PC2 in frame 6 are different
+   directions. `dataset_mode` goes into the provenance and
+   `get_pc_availability()` refuses every PC-valued plot under it, by value, not
+   by step -- area, shape and tissue values are unaffected.
+
+**What this changes for an existing project.** Re-running Classify at the
+default `variance_threshold` keeps the same components and the same k-means
+clusters -- a sign flip is a reflection of the PC space, so the partition is
+untouched -- but `Cells_info_PCA.xlsx` itself is **not** byte-comparable with
+one written before this round: the PC signs are now fixed rather than
+arbitrary, and the rows are in `Cell Index` order instead of `PC_score` order.
+A stored table from before and one from after can therefore disagree in sign
+for the same cells; that is the defect being fixed, not a regression. The
+manuscript's Fig. 2 numbers are unaffected at the default, and at
+`variance_threshold = 3` the GUI now reproduces fig2's split exactly.
+
+A new `classification_provenance.json` beside `Cells_info_PCA.xlsx` carries
+both, plus the feature set, the standardize mode, the seed and the retained
+component count: none of it is visible in the score table, and all of it
+changes what a PC score means.
+
+**Pinned, not asserted.** `pca_kmeans._self_test` now copies
+`make_efd_figures.fit_pca`'s four lines in as the reference (that module loads
+pickles at import, so it cannot be imported) and requires element-for-element
+equality; same for the EFD feature matrix against `make_efd_figures.py:129-131`,
+with the per-outline matrix asserted to DIFFER so the distinction cannot stop
+mattering unnoticed.
+
+**Measured against the figures**, on the pinned
+`v2/baseline_data/AS_LE_lateral_view_E-cad/Cells_info.xlsx` (6,110 rows, the
+same count fig2 reports) vs `fig2/source_data/loadings_signed.csv`:
+
+| | max |diff| | signs agreeing |
+|---|---:|---|
+| PC1 | 6.1e-06 | 13/13 |
+| PC2 | 1.3e-05 | 13/13 |
+| PC3 | 5.0e-05 | 13/13 |
+| `Feature correlation` vs `ASLE_pc_feature_correlation.csv` | 5.1e-05 | -- |
+
+Reference: `/figures`' own stored source data, produced from a v2 extraction on
+another machine at an earlier commit -- so the residual 5e-05 is the two
+extractions, not the PCA, which is identical to machine precision in the
+self-test. The sign rule's degenerate case is a component whose two largest
+|loadings| are equal; on PC2 the gap is **0.0023** (Circularity 0.4430 vs
+AR 0.4407), the narrowest of the three, and worth knowing before trusting PC2's
+sign on a different extraction.
+
+**A fourth disagreement, not in the plan, found while measuring it.**
+`variance_threshold` existed in `compute_pca` but was not threaded through
+`run_classification`, so the product could only ever keep 85% cumulative
+variance -- which on `AS_LE_lateral` is **PC1-PC2 only** (cum2 = 87.63%), while
+Supp. Fig. 1's morphospaces are PC1-PC3. By `CLAUDE.md` rule 6 that parameter
+was not implemented. It is now a "Components to keep" control in Classify
+(default 0.85, unchanged), and at 3 the GUI reproduces fig2's classification
+exactly: **5,724 / 386**, against fig2's `n_LE = 5724`, `n_AS = 386`.
+
+#### Part 1: one workbook, no PNGs, no `PC_score`
+
+`cell_classification_output/` after a run is now exactly:
+
+```
+Cells_info_PCA.xlsx  PCA_Components.xlsx  cells_clustering_results.xlsx  classification_provenance.json
+```
+
+Gone: `Explained_Variance_Ratio_All_PC.png`, one
+`PCA_Component_{i}_Contribution_Squared.png` per component, `cells_PCA_2D.png`,
+and the per-component `PCA_Component_{i}.xlsx`/`Explained_Variance_Ratio_All_PC.xlsx`
+pair. `PCA_Components.xlsx` holds `Loadings` (features x PCs), `Explained
+variance` (every component, with which were retained), `Feature correlation`
+(PCs x features, Pearson r against the RAW feature -- Supp. Fig. 1A's number,
+same definition as `static_pca.py:14`), one sheet per PC sorted by contribution
+squared, and, for the EFD family, `Descriptor correlation`: 26 readable
+descriptors x (Pearson r, Spearman rho) plus a 5-fold GroupKFold Ridge CV R2
+per PC, with the grouping named in the column header. 40 Fourier coefficients
+have no readable loading table; this is what replaces it.
+
+`PCA_FEATURE_ABBREVIATIONS` is deleted. Its only use was the `Feature` column
+of those per-PC files, and it gave both `Cell Area` and `Local Nematic Order`
+the label `S`. Full names now; EFD coefficients read `Harmonic 3 b`.
+
+`PC_score` is gone with it. It was a variance-weighted sum of
+arbitrarily-signed scores, used only to sort the rows. **The hidden dependency
+was the dangerous part**: `cluster_cells_kmeans` picked its PC columns as
+`columns[:-1]`, so deleting `PC_score` without touching it would have left
+k-means silently using one component fewer. It now matches `PC\d+` by name and
+refuses a frame holding anything else. Rows are written in `Cell Index` order
+(frame, then label, numerically). Checked for row-order dependence and found
+none: `rendering`, `manual_correction_classification`, the frontend and the
+census all key on `Cell_Index`; `common.save_modified_rows` maps by position
+but reads its positions from the same frame it writes.
+
+#### Part 2: the pure functions come out of `figures/`, once
+
+`figkit.py` exists in four copies under `figures/revision_2026-10/`, `morph.py`
+in two, and `v2/plotting_style.py` is a fifth style whose genotype colours
+contradict the manuscript (it has WT blue / tmc orange / pyd green; the
+manuscript is WT `#2F6A46` / pyd `#BD7338` / tmc `#E0989E`). None can be
+imported by the GUI: `figkit` needs `cmocean` and `lxml`, which this project
+does not depend on, and `make_oscillation_figures` runs `make_efd_analyses`'s
+pickle load at import. Nothing under `figures/` was changed.
+
+New, each with an equivalence self-test against a copied reference:
+
+- **`v2/plotkit.py`** -- the manuscript palette, `unclip`, `flatten_svg`
+  (re-written on the standard library's ElementTree, since lxml is absent;
+  pinned by being idempotent on an SVG the lxml version produced), `save`
+  (never overwrites), physical size/type/line presets, the style context, and
+  `write_tables` for Excel's limits.
+- **`v2/morphospace.py`** -- `hull95` (identical to `morph.py`),
+  `boundary_xy`, `pairwise_boundaries`, `contour`, `exemplar_grid`.
+- **`v2/dynamics_compare.py`** -- `dtw` (identical to `fig_dynamic_demo.py`),
+  `heading`/`angle_between`/`group_distance_and_angle`, `detrended_stats`,
+  `acf_first_minimum`, `dtw_pairs`, and the resampling for movies at different
+  frame intervals.
+- **`v2/efd_descriptors.py`** -- copied byte-for-byte.
+- **`v2/plots.py`**, **`v2/cell_table.py`** -- new, below.
+
+Two deliberate divergences from the originals, both measured:
+
+- `boundary_xy` solved `y = f(x)` and so returned **nothing** for a boundary
+  that is vertical in the slice. That is not a corner case here: on
+  `AS_LE_lateral` the clusters separate almost entirely along PC1, so the
+  PC1-PC2 boundary is near-vertical. It now solves for whichever axis has the
+  larger weight -- the same line -- and the self-test still requires
+  byte-equality with `morph.py` wherever the original's own orientation holds.
+- `acf_first_minimum` takes the first LOCAL minimum.
+  `make_oscillation_figures._acf_extrema` takes the global argmin, which agrees
+  on a damped curve and picks an arbitrary trough on a weakly damped one.
+  Measured on a synthetic 10% sinusoid: noise at 80% of the signal's amplitude
+  moves the first minimum by at most one lag (6 -> 5/6) while the ACF's 0.5
+  crossing drops 3 -> 1. That asymmetry is the whole reason this is the readout
+  and the crossing time is not.
+
+`timestamped()` had to learn a `-2`, `-3` suffix: the stamp has one-second
+resolution and exporting a PNG then an SVG of the same chart takes well under a
+second, so "never overwrite" was refusing the second export. Found by running
+the exports, not by reading them.
+
+**Units are applied on the way out only** (`cell_table.DIMENSIONS`): stored
+tables stay px and frames, and a column with no dimension recorded fails the
+self-test rather than being labelled um while holding pixels. 40 columns
+covered. Time is `(frame - first_frame) * dt` with `first_frame` read from the
+movie -- GBE numbers from 0, so `frame - 1` is wrong for it.
+
+#### Part 3: the data layer, measured at Etournay scale
+
+`v2/cell_table.py` builds a three-column key table from the **in-memory**
+tracking data and fetches values one column at a time. No wide join is ever
+materialised. `Cell{frame}_{label}` is not a track id; everything goes through
+the tracking table (an earlier notebook pivots on the label, which is only
+correct on masks TA had already tracked).
+
+Measured on this Mac, on a scratch sandbox decoded from Etournay WT_1's TA
+colour TIFFs (`test_data` read-only), 296,779 cell-frames / 201 frames /
+5,706 TA tracks:
+
+| step | time | peak RSS |
+|---|---:|---:|
+| read the tracking table | 0.04 s | 179 MB |
+| `extract_cell_info` (201 frames) | 38.0 s | 504 MB |
+| `key_table()` | 0.18 s | 504 MB (23.7 MB table) |
+| `pivot('Cell Area')` -- 201 x 5,706 | 0.07 s | 504 MB (9.2 MB) |
+| all-tracks figure, every track | 0.10 s | 504 MB |
+| PNG 600 dpi + SVG | 0.55 s | 504 MB |
+| `write_tables` xlsx | 7.95 s | 526 MB |
+
+**Peak 526 MB, well under the 1.5 GB the plan set as the stop line.** Against
+the plan's synthetic table: the key table is 23.7 MB rather than 3.6 MB,
+because it carries the `Cell Index` strings as well as the three int32 columns;
+the pivot is 9.2 MB against 11.4 MB predicted. Extraction dominates and is not
+part of the data layer. Reference: none -- this is a resource measurement.
+Note for later: only **514 of 5,706** tracks cover 90% of that movie, which is
+exactly why the coverage filter's kept/total count is drawn on the figure.
+
+#### Parts 4-7: what shipped
+
+- **4-1 Clone cell data** -- a drag-reorderable chip picker over
+  `value_catalog()`, small multiples or a two-value dual axis (three on two
+  axes is refused), the value set surviving a change of cell.
+- **4-2 Cumulative dynamics events** -- `C(t) = sum n(f)/N(f)`, counting the
+  **loss** side of a T1 as Nat Commun 2023 (s41467-023-41178-w) does, from the
+  axes actually on screen, so every filter applies to the count exactly as it
+  applies to the picture. `N(f)` is the tracked, non-margin cells present in
+  both frames of the pair. Losses whose paired gain the quartet check rejected
+  are hidden and so uncounted, and reported on their own line. The last `hold`
+  frame pairs cannot be judged settled, so the tail is shaded
+  "not yet judgeable" rather than trimmed.
+- **5-1/5-2/5-3/5-4** -- all-tracks curves with a named error band, the
+  morphospace (robust hulls, k-means boundary, exemplar glyphs), the cell map
+  with a fixed p1-p99 scale and a diverging map centred on zero for PCs, the
+  TA-style Track-ID export, and streamlines.
+- **6** -- the clipboard button is a dropdown; Movie maker renders one PNG per
+  frame through each step's own `get_*_overlay` plus a `settings.json`.
+- **7** -- the cluster mode shows no test, no p value and no interval, and says
+  so in the caption; the folder mode's joint PCA pools every cell unweighted,
+  refuses a mix of folders with and without a pixel size, and **checks every
+  target before writing anything** (a name that already exists stops the whole
+  write and lists the conflicts).
+
+**`interpolate_vector_field`'s `fill_value` was `0`.** Cubic `griddata` returns
+nothing outside the convex hull of the cells, and zero there means "measured,
+and stationary", so `streamplot` drew flow slowing to a halt at the tissue
+edge -- biology-shaped, and an artefact. Measured on `embryos_GBE_GAP43`
+frames 0-5 (234 cells through both): of 402 grid nodes outside the tissue,
+**364 were exactly zero before and are NaN after**. The displacement is
+measured in the coordinate system `tracking_drift_mode` records, never
+`self.drift_mode` (Round 18 D1), and the caption says which.
+
+#### Acceptance
+
+- The same chart in `Epi-Quant (manuscript)`, `ggplot` and `dark_background`,
+  each exported PNG + SVG + xlsx: **0 `<clipPath>` and 0 `<g>` in every SVG**,
+  text left as text. 53-54 kB per SVG, 127-220 kB per PNG at 600 dpi.
+- Cumulative events on the GBE movies, all against **GT tracking**, filters
+  `event_filter=persistent`, quartet off, hold = 150 s:
+
+  | movie | dt | pairs | median N | T1 | cumulative per tracked cell |
+  |---|---:|---:|---:|---:|---:|
+  | `embryos_GBE_GAP43` | 30 s | 30 | 244 | 189 | 0.784 |
+  | `embryos_GBE_OE_GAP43` | 15 s | 80 | 213 | 293 | 1.407 |
+  | `embryos_GBE_UTRN` | 30 s | 123 | 178 | 448 | 2.454 |
+
+  Read these as "events the current filters draw", not as a rate to compare
+  between movies: the three differ in frame interval, length and cell count,
+  and the hold window is 150 s, i.e. 5 frames on two of them and 10 on OE.
+  Division and delamination are 0 in all three: only **confirmed** events count, and
+  nobody has confirmed any in a scripted run. That is the intended behaviour,
+  not a detector failure.
+- Movie export: 20 `frame_0000.png`-style frames plus `settings.json` carrying
+  the step, the frame list, `tracking_drift_mode` and the T1 parameters.
+- The 3-frame lattice self-test: one exchange and its reversal give
+  `C(t) = [0.000, 0.250]` per tracked cell with N = 4, and 0 under
+  "settled only" -- the display filter reaches the count.
+
+#### Deliberately not implemented, recorded rather than omitted
+
+Each of these is reachable from no UI path, so by `CLAUDE.md` rule 6 it is not
+implemented, and saying so is the point:
+
+- **Morphospace exemplars for the EFD family** are real cells, not PCA
+  reconstructions. `make_efd_figures.morphospace`'s `contour_of(pca.mean_ +
+  a*c_x + b*c_y)` is not wired; the geometric families cannot be inverted at
+  all, so the real-cell path is the one that serves every family.
+- **The Columns template's PC-tertile box plots** (Supp. Fig. 1 B-D) exist in
+  `plots.columns_plot` but have no control; only the oscillation panel reaches
+  it.
+- **Cross-folder comparison of non-PC values** (7-2) and the cross-interval
+  resampling (7-4) exist in `cell_table`/`dynamics_compare` and are exercised by
+  their self-tests, but the only folder-level UI path is the joint PCA.
+  `check_joint_pca` is likewise API-only.
+- **`statistics-conventions`**, cited by the plan's 2-6, 7-2 and 7-4, does not
+  exist anywhere in this repository. The conventions were taken from the plan's
+  own wording and from `make_efd_figures._boot`/`_group_raw`.
+- **Native-window verification is still behind.** Everything above was verified
+  through backend scripts on real data plus a dev-mock click-through; the last
+  full click-through in the real pywebview window remains 2026-08-17.
+
+### Round 33: the interface-length minimum is read off each movie, and lengths were 2x (2026-10-21)
+
+**The unit bug first.** `segmentation_qc._interface_pixels` collects the 2-px
+band straddling a border -- one pixel on each side -- so a straight 30 px wall
+returns 60 (measured on a synthetic two-cell frame). Round 32 multiplied that
+count by `pixel_size_um`, so every interface was displayed at twice its
+length, and its thresholds were thresholds on the count. All lengths now go
+through `_true_length_px` (count / 2), the minimum is stored as true pixels,
+and the self-test builds the 30 px wall and asserts `interface_px == 30` and
+`interface_um == 30 x 0.1083`, which the Round 32 formula fails (60, 6.498).
+`MIN_INTERFACE_PX` and the hysteresis band still compare against the raw count;
+they are unitless thresholds on it, not lengths, and are documented as such.
+
+**Why 2 um had to go.** UTRN's project records `pixel_size_um: 0.1083`, so
+2 um is ~18.5 px of wall. The movie's own sweep below shows what that does: it
+removes 99.6% of reversing and 99.2% of settled gains -- the whole T1 result.
+(The figures the plan quoted for GAP43's interfaces, p25 18 / median 23 px,
+were in the double-sided count; in true length over all 31 frames, n = 21,126,
+they are p25 8.0 / median 11.5 px. GAP43 records no pixel size, but at the
+same 0.1083 um/px the old default would sit well above three quarters of its
+interfaces, not at the 29th percentile.)
+
+**The default now comes from the movie** -- `get_t1_length_sweep`, which the
+app runs on the loaded movie the first time the filter is switched on with no
+value typed. For each integer threshold from 1 px to the p25 of all the
+movie's interfaces, it reports the share of events removed, split into those
+that REVERSE at the single sample f+2 and those that HOLD there (both cells
+present), gains and losses separately, with n. The default is the threshold
+with the largest gain-side separation (removed % of reversing gains minus
+removed % of settled ones: Youden's J with "reverses" as positive), smallest
+threshold on ties. Measured with GT tracking (no drift_mode applies),
+interface adjacency, on sandbox copies:
+
+| movie (interval) | default | gains removed at default: rev / held | J | losses removed at default: rev / held |
+|---|---:|---:|---:|---:|
+| GAP43 (30 s) | **2 px** | 46.8% / 27.8% (n 126 / 252) | 19.0 | 29.7% / 35.4% (n 111 / 268) |
+| OE_GAP43 (15 s) | **3 px** | 66.1% / 44.3% (n 487 / 720) | 21.8 | 41.3% / 54.2% (n 482 / 744) |
+| UTRN (15 s) | **4 px** = 0.433 um | 74.2% / 54.1% (n 453 / 732) | 20.1 | 50.0% / 63.8% (n 450 / 771) |
+
+GAP43 ties at 2 and 3 px (J 19.0 both) and takes the smaller. Its 2 px row is
+exactly Round 32's "4 px" row -- the same cut, now in the right unit.
+
+**Two things the default does not do.** It maximises separation, not
+precision: at its own default every movie still removes a quarter to a half of
+the gains that held. And on the **loss side the separation is zero or negative
+at every threshold on all three movies** (GAP43 -0.2 to -5.7, OE -0.5 to
+-12.9, UTRN -0.1 to -14.9 points, positive only by 0.1-0.6 where nearly
+everything is already gone): the cut always removes a larger share of
+exchanges that held than of flicker. As decided, the rule stays two-sided --
+this is the record of what that costs, not a reason to change it this round.
+The full curves, every threshold with both sides and their n, are in
+`docs/t1-length-sweep-round33.json`; it is exactly what `get_t1_length_sweep`
+returns for each movie.
+
+**UI.** One input in true pixels; empty means "derived from this movie" and
+shows `auto N px`; microns appear beside it (`= 0.433 um`) only when Extract
+has a pixel size. With no pixel size the filter still runs -- nothing about a
+pixel threshold needs microns -- and the micron display is simply absent.
+Enabling it with nothing typed and no tracked movie to derive from is refused
+with the reason.
+
+**One cache defect found on the way.** `_pair_event_index` (Round 31) is built
+in track space but was only invalidated on mask changes, so a tracking
+correction left it stale. It and the new sweep cache now carry a fingerprint
+of the tracking table. `_hysteresis_cache` has the same exposure and predates
+this round; it is noted, not changed.
+
+### Round 32: seven fixes the maintainer ran into, and nothing else (2026-10-21)
+
+> ⚠️ **Corrected Round 33: every pixel figure in this T1-1 section is in the
+> DOUBLE-SIDED count**, which is twice the wall length -- the interface graph
+> counts the pixel on each side of a border, so a 30 px wall reads 60. "< 4 px"
+> below means 2 px of wall, and the micron display multiplied the count, not
+> the length, so it showed every interface at twice its size. The 2 um default
+> is also gone: at UTRN's recorded 0.1083 um/px it removed essentially every
+> T1. See Round 33.
+
+**T1-1 -- the two-sided interface minimum, in microns.** Both the shrinking
+interface (a loss, measured at f) and the newly formed one (a gain, at f+1)
+must be at least `t1_min_interface_um` long (default 2 um, Benoit et al.
+2020), measured as the interface graph's shared-border pixels times
+`pixel_size_um`. Off by default, reported beside the raw counts like the
+quartet check, and **refused -- with the reason -- when no pixel size is set**,
+never run in pixels. The UI field is labelled um and shows its current pixel
+equivalent (`= 10 px` at 0.2 um/px). A frame that fell back to dilation is
+left unjudged rather than judged on overlap pixels.
+
+The plan predicted a gain-only effect and asked to be told first if the loss
+side dropped a lot. **It did, and in the wrong direction.** Three GBE movies,
+GT tracking, interface adjacency, reversal judged at the single sample f+2
+(dt = 30 s on GAP43, 15 s on OE and UTRN), both cells present:
+
+| | GAP43 | OE_GAP43 | UTRN |
+|---|---:|---:|---:|
+| gains removed at < 4 px: reversing / settled | 46.8% / 27.8% | 30.4% / 19.2% | 27.8% / 16.4% |
+| losses removed at < 4 px: reversing / settled | 29.7% / 35.4% | 18.0% / 22.4% | 15.3% / 21.4% |
+| loss interface median: reversing / settled | 5.0 / 4.0 px | 6.0 / 5.0 px | 7.5 / 6.0 px |
+
+On the gain side the filter discriminates, as on Etournay. On the loss side
+the reversing interfaces are the *longer* ones, so the cut removes more
+exchanges that held than flicker. The maintainer chose to keep the published
+two-sided rule; the numbers are in `_annotate_interface_lengths`' docstring
+and the popover says, without numbers, that the shrinking side tends to remove
+real exchanges. (No pixel threshold below 3 px removes anything: interfaces
+under `min_interface_px = 2` are not in the graph to begin with.) Measured on
+sandbox copies, with the masks' tree hash -- names, sizes, mtimes -- checked
+unchanged afterwards.
+
+**T1-2 -- the loss axis a rejected gain left behind.** The quartet check judges
+gains only, so filtering hid a gain's blue axis and left its orange partner on
+screen alone. `validate_quartet_permutation` now marks each loss
+`quartet_orphan` when it is paired with at least one gain (the T1 geometry:
+four distinct cells, the lost pair both neighbours at t of each gained cell)
+and none of those gains was accepted; with the filter on those losses are
+hidden too, and the count of hidden partners is reported. A loss with no
+paired gain is not the filter's doing and stays. Display only -- the filter's
+logic is unchanged. The name stays **Quartet check**.
+
+**T1-3** -- not a bug: the two axes of one T1 are parallel by construction
+(`detect_t1_transitions` negates the gain nematic so they reinforce instead of
+cancelling). Now said in the popover.
+
+**T1-4 -- `get_trajectory_overlay(None, ...)` crashed** on `int(None)` in the
+highlight branch. Fixed at both ends: the backend returns `None` (the same exit
+as a track absent from the frame) and the frontend no longer calls it with no
+track selected. The self-test and the harness now call it with
+`track_number=None` in both colour modes; nothing had before, which is how it
+reached the user.
+
+**UI-1** gate scale explained in the matching popover; **UI-2** the swap-mode
+status line now follows the checkbox in both directions (it was only written
+when the mode came on); **UI-3** `.nav-action-btn` was the top bar's one
+literal (`background: white`), which also out-ranked the themed `select` rule
+-- now `var(--panel)`. The amber `mock` badge keeps its literal colours on
+purpose: it is a warning that only exists in the dev mock. **UI-4** the Cell
+dynamics popover rewritten with no numbers at all, the parallel-axes sentence,
+and the three newer controls.
+
+### Round 31: on corrected data the flicker is still 30-46%, and two thirds of it comes from a few interfaces (2026-10-20)
+
+Every count in this section was produced with the maintainer's
+`GT_cell_track_output` tables as the tracking, so **no `drift_mode` applies** --
+that is the convention stamp these numbers carry. Two things this needs and
+Round 30 did not have: corrected segmentation *and* corrected tracking on the
+same movie, which makes "it is the tracking" and "it is the segmentation"
+testable rather than arguable.
+
+Alignment is by frame NUMBER, and an empty frame column is dropped by looking
+at its values: all three GT tables carry one column more than the masks
+(`Frame31`/`Frame81`/`Frame124`), all three are empty, and counting columns
+shifts every frame by one.
+
+**§1 -- the counts, reproduced.** GT coverage is asserted, not assumed (median
+and worst both 100% on all three: every GT label still exists in the masks).
+
+| movie | interval | frames | GT cells/frame | gains | losses | gains per frame pair |
+|---|---|---:|---:|---:|---:|---:|
+| `embryos_GBE_GAP43` | 30 s | 31 | 254 | 431 | 436 | 14.4 |
+| `embryos_GBE_OE_GAP43` | 15 s | 81 | 215 | 1,218 | 1,231 | 15.2 |
+| `embryos_GBE_UTRN` | 15 s | 124 | 179 | 1,212 | 1,251 | 9.9 |
+
+GAP43's 867 raw events sit 8% below Round 30's 944 at `drift_mode='mask'` and
+3.5x below the 3,000 at `none`. **So Round 30's registration result holds, but
+its 27% estimate of the tracking contribution was too high** -- that figure
+carried Etournay's per-error coefficients onto GBE, and §A below measures the
+thing directly at 8.5%.
+
+**§2 -- reversal is high and FLAT on clean data**, gains and losses apart,
+single-sample check at f+1+k, both cells required present:
+
+| movie | shortest dt | gains | losses | at dt = 300 s | gains | losses |
+|---|---|---:|---:|---|---:|---:|
+| GAP43 | 30 s | 31.2% (n=382) | 31.4% (n=382) | 300 s | 29.4% (n=102) | 28.0% (n=107) |
+| OE_GAP43 | 15 s | 39.9% (n=1,175) | 37.4% (n=1,192) | 300 s | 46.5% (n=660) | 36.0% (n=680) |
+| UTRN | 15 s | 39.2% (n=1,188) | 35.3% (n=1,228) | 300 s | 46.2% (n=797) | 31.5% (n=829) |
+
+Across every k the curves stay inside 29-34% (GAP43), 36-47% (OE) and 31-46%
+(UTRN). **Flat from the first sample is not a survival curve.** Etournay's
+gain curve rises over the same span (19.2% to 29.7%), which is what real
+turnover looks like -- a constant hazard per unit time. A curve that starts
+flat describes a fixed fraction of events that are in a reversing state at
+every timescale. It is not sample exhaustion either: UTRN still has 797 of
+1,188 gains at k=20.
+
+And this is on corrected segmentation and corrected tracking. **So the 30-46%
+is neither of those; it is in the adjacency measurement or the criterion.**
+
+**§3 -- the events are not spread over the tissue, they pile onto a few
+interfaces.** Per cell pair, over the whole movie:
+
+| movie | events | distinct pairs | median | max | pairs firing once | share of events from pairs firing 4+ |
+|---|---:|---:|---:|---:|---:|---:|
+| GAP43 (30 s) | 867 | 472 | 1 | 9 | 60.4% | 23.5% |
+| OE_GAP43 (15 s) | 2,449 | 663 | 3 | **21** | 31.5% | **68.7%** |
+| UTRN (15 s) | 2,463 | 691 | 3 | **25** | 32.6% | **64.5%** |
+
+A pair of cells that genuinely swap neighbours does it once. On OE the median
+offending pair does it three times and one pair does it 21 times. The two
+15 s/frame movies are far worse than the 30 s one, in the direction the
+mechanism predicts: double the sampling rate and you catch twice as many
+crossings of the same wobbling interface.
+
+**§4 -- the repeat offenders are the weak interfaces**, by median dilation
+contact strength over the frames where the pair really is in contact:
+
+| pair fires | GAP43 pairs / median | OE pairs / median | UTRN pairs / median |
+|---|---:|---:|---:|
+| never | 1,190 / 26.0 | 799 / **45.0** | 692 / **109.0** |
+| once | 285 / 11.5 | 209 / 21.0 | 225 / 37.0 |
+| 2-3 times | 148 / 9.0 | 211 / 15.0 | 242 / 24.0 |
+| 4+ times | 39 / 6.0 | 243 / 11.0 | 224 / 14.2 |
+| 8+ times | 3 / 5.5 | 63 / **9.5** | 68 / **11.0** |
+
+Monotone on all three, with a 4-5x gap between a stable pair and a repeat
+offender. On OE the stable pairs' p25 is 35 and the 4+ group's p75 is 18, so
+the divide falls between 18 and 35 -- and the factory Schmitt band is 25/15,
+chosen in `docs/schmitt-trigger.md` §5 from a disappearance-rate curve, by a
+completely different route.
+
+**§A -- the tracking contribution, subtracted instead of extrapolated.** Same
+masks, same adjacency, same criterion; one arm uses our tracker, the other the
+GT table. Events are compared by the CELLS they involve, since track ids are
+not comparable between two tables:
+
+| movie | drift_mode | tracker events | GT events | shared | only tracker | only GT | wrong links vs GT |
+|---|---|---:|---:|---:|---:|---:|---:|
+| GAP43 | `mask` | 933 | 859 | 854 | **79 (8.5%)** | 5 | 19 / 7,223 |
+| OE_GAP43 | `none` | 2,519 | 2,512 | 2,502 | 17 (0.7%) | 10 | **0** / 16,534 |
+| UTRN | `none` | 2,463 | 2,449 | 2,449 | 14 (0.6%) | 0 | 1 / 19,737 |
+
+**8.5% on GAP43, and under 1% on the two movies where our tracking already
+agrees with the GT link for link.** The independent check the plan asked for:
+48 of GAP43's 79 tracker-only events (60.8%) touch a cell on a wrong link --
+so most of the excess is the tracking, but **not all of it**, and on OE there
+are 17 tracker-only events with *zero* wrong links. Those come from the other
+difference between the two tables: where the GT breaks a track that we
+continue, the "present in both frames" test answers differently, and an event
+appears or vanishes without any link being wrong. Worth remembering before
+anyone reads "only in the tracker arm" as "tracker error".
+
+**§B -- the repeat count is the signal, and it ships as an annotation.** Every
+event now carries `pair_event_count` (how many times this pair fires in the
+whole movie) and `pair_event_rank` (which crossing this is), and
+`get_pair_event_distribution()` returns the histogram with each group's
+contact strength. **No threshold is hardcoded and none is proposed here**: the
+three movies disagree about where it would fall (4+ accounts for 23.5% of
+events at 30 s/frame and 68.7% at 15 s/frame), so it has to be read off the
+data each time.
+
+> **Why this is not a length threshold in disguise.** A real T1 *must* pass
+> through a weak interface -- an edge has to shrink to nothing before it
+> breaks -- so the pairs that fire exactly once are weak too (median 21 px on
+> OE against the repeat offenders' 11). What separates them is not how weak
+> the interface is at any instant, it is how many times it crosses. This is in
+> `_pair_event_index`'s docstring because the next reader will be tempted to
+> simplify it into a cutoff.
+
+**§C -- frame interval and pixel size moved to Extract**, both persisted in
+`extract_settings.json`, both allowed to stay empty, and empty behaves exactly
+as before. `pixel_size_um` is new and nothing falls back to pixels without it:
+a feature needing microns must refuse rather than quietly mean something else
+(`docs/schmitt-trigger.md` §7 found zero hits for `pixel_size`/`um_per_px`
+anywhere in the repo, which is why every px threshold in it is a statement
+about one objective). Step 7 keeps a read-only readout of both.
+
+**§D -- one adjacency, not a menu.** T1 now reads
+`tissue_features.build_interface_graph`, with the dilation graph kept as an
+internal fallback for segmentation where bridging still leaves nothing
+touching (`pupae_E-cad`: 826 cells, zero shared interfaces), and the choice
+recorded per frame in `t1_parameters()["adjacency_used"]` rather than assumed.
+Round 30 shipped the menu; it is withdrawn because the choice was never worth
+offering: the two graphs barely differ, and only one of them yields a length.
+
+> **The plan's own figure for this did not reproduce, and the correction
+> makes the case stronger rather than weaker.** It quoted GBE's first six
+> frames as dilation ~733 edges against interface ~793, with 23 dilation-only
+> and 388 interface-only, i.e. interface as "basically a superset". Measured
+> here at the shipped defaults (`dilation_px=2`, `min_interface_px=2`,
+> `max_gap_px=3`): **dilation 732 edges per frame, interface 729, 4
+> dilation-only (0.5%), 0 interface-only.** The interface graph is a near
+> subset, not a superset. (The plan's two percentages, 0.5% and 8.2%, do not
+> match its own counts either -- 23/733 is 3.1% and 388/793 is 49% -- so the
+> counts and the percentages came from different runs.) Either way the menu
+> offered a choice between two definitions that disagree about 4 edges in
+> 732, while hiding that only one of them can measure an interface.
+
+The two gap knobs (`dilation_px=2`, `max_gap_px=3`) are now one, `t1_gap_px`.
+
+`build_interface_graph` gained `return_weights`, so the graph carries shared
+border pixels. **That is what brings the Schmitt band back to life**: in Round
+30 selecting `interface` silently made the band inert, which was a dead knob
+of exactly the kind §A of that round was about. Cost, measured here: 0.013 s
+per frame on GAP43 (300x434), 0.034 s on OE (469x805), 0.135 s on UTRN
+(785x1985) -- all cached per frame and dropped through
+`_invalidate_frame_caches`.
+
+**§E -- the quartet check, on clean data for the first time.** Benoit et al.
+2020's permutation check as an optional filter (`set_t1_quartet_filter`),
+annotating always and reporting both counts, with the criterion untouched:
+
+| movie | gains on the GT arm | accepted | rejected |
+|---|---:|---:|---:|
+| GAP43 | 426 | 311 | 115 (**27.0%**) |
+| OE_GAP43 | 1,244 | 916 | 328 (**26.4%**) |
+| UTRN | 1,206 | 951 | 255 (**21.1%**) |
+
+21-27%, strikingly consistent across three movies, and these are all gains on
+corrected segmentation and corrected tracking -- so the rejected ones are
+genuinely quartets that are not complete rings at both ends, not broken
+tracks. That is why it stays a named alternative and ships off.
+
+**§F** -- the 3-frame sliding mean is deliberately not done: it treats noise
+in every interface, and §3 says the problem is a few interfaces crossing
+repeatedly, which §B addresses directly. The 2 µm two-sided minimum waits for
+a project that has a pixel size.
+
+### Round 30: the Schmitt band was never connected, and a registration setting moves T1 counts 3.2x (2026-10-20)
+
+**§A -- the band could not reach detection, and three independent checks say
+so.** `webview/api.py:283` carried *"At 25/15 that becomes 1,229 / 978 with the
+one-frame reversal rate falling 21.0% -> 14.8%"*, README §D2 carried the same
+table, and `docs/schmitt-trigger.md` §7 carried a five-layer audit --
+core / state / setter / UI / handler -- concluding *"nothing needs building
+here"*. **The audit lists every layer that offers the parameter and none that
+consumes it.** Verified here rather than taken on trust:
+
+1. `detect_t1_transitions`' signature was
+   `(graph_t, graph_t1, label_to_track_t, label_to_track_t1, centroids_t)` --
+   no band -- and `get_t1_events` was its only production caller.
+2. `_get_neighbor_graph` returns `{cell: set()}`, with no strengths, so a band
+   reaching it would have been a no-op anyway: `contacts_in_track_space` sees
+   `strength is None` and admits the pair unconditionally. Run against the
+   pre-Round-30 function, one synthetic frame pair gives `gained=2` with the
+   band off, at 25/15 and at 6/4 alike.
+3. Nothing in the repo set a band and asserted a count moved.
+
+The band now reaches `detect_t1_transitions`, carrying `previous_contacts_t`
+so the chain keeps its state, and `_t1_graph` is the single accessor deciding
+which adjacency **both** the detector and its persistence lookahead read --
+the split between those two was the actual defect, since it judged events
+detected on raw adjacency against a hysteretic lookahead. The new self-test is
+the one that would have failed: same synthetic lattice, band off vs 6/4,
+**gains 2 -> 0**. Default still off, because §B has not established what
+reversal rate is worth filtering. The four places quoting the old numbers now
+say what they measured.
+
+**§B -- a reversal rate is a function of dt, and the one claim built on the
+Etournay curve does not survive the presence rule.** Every rate below is at a
+single sample point f+1+k, gains and losses apart, dt in seconds, our three
+movies extracted and tracked by the measurement script itself:
+
+| movie | dt | gains reversed | losses reversed |
+|---|---:|---:|---:|
+| `embryos_GBE_GAP43` (30 s/frame) | 30 s | 24.9% (n=1,354) | 18.6% (n=1,432) |
+| `embryos_GBE_OE_GAP43` (15 s) | 15 s | 39.8% (n=1,182) | 37.5% (n=1,193) |
+| `embryos_GBE_UTRN` (15 s) | 15 s | 39.0% (n=1,194) | 35.2% (n=1,232) |
+| Etournay `WT_1`, truth adjacency + truth tracking | 284 s | 19.2% (n=3,798) | 26.0% (n=3,117) |
+
+WT GBE's gain curve climbs 24.9% -> 59.7% between 30 s and 300 s while its
+loss curve stays flat (18.6% -> 19.8%, peak 23.8%); the two 15 s/frame movies
+are nearly flat on both sides from the first sample (OE gains 39.8 -> 46.8,
+losses 37.5 -> 36.0 over 15-300 s). Sample counts fall with k and are reported
+with every point; `GBE_GAP43` at k=10 rests on 486 gains and 577 losses.
+
+> **The plan's §B2 reading -- Etournay's losses flat at ~24%, therefore a
+> fixed-size population, therefore the four-way-vertex representation -- is an
+> artefact of the sampling rule, and it reproduces exactly when the rule is
+> dropped.** A cell that has disappeared by the check frame has no contacts
+> there, which scores as *not reversed* for a loss and *reversed* for a gain.
+> Requiring both cells present at the check frame (the only way the question
+> has an answer):
+>
+> | `WT_1` losses | k=1 | k=2 | k=3 | k=4 | k=5 | k=6 |
+> |---|---:|---:|---:|---:|---:|---:|
+> | cell may be gone | 23.8 | 24.2 | 24.2 | 24.5 | 25.1 | 24.3 |
+> | both present | 26.0 | 28.3 | 30.2 | 32.3 | 34.9 | 35.6 |
+>
+> and the gain side moves the other way (26.7 -> 55.2 becomes 19.2 -> 29.7).
+> **The flat line was cell death, not topology.**
+
+**Which of §B4's three conclusions.** The second, with one side of it
+inverted. At the one dt where both pipelines are measured (284-300 s) our WT
+GBE gains reverse **59.7%** against Etournay's **19.2%** -- 3.1x, so not
+"consistent with the reference pipeline". At our short end, 30 s, our gains
+already reverse **24.9%**, above Etournay's rate at a dt ten times longer,
+while reversal grows with dt in both. That excess is the unexplained part, and
+it is on the **gain** side only: our loss plateau (~20%) sits *below*
+Etournay's 26.0%, so conclusion 3's "our plateau above their 24%" is not what
+the data show. No false-positive rate is quoted from this: Etournay is pupal
+wing at 284 s and we are germband at 30 s, so the comparison bounds the
+question, it does not answer it.
+
+**§C/§D4 -- adjacency is not the problem, now at 91 frames instead of one.**
+Against `directed_bonds` truth adjacency on the same cells, decoding the
+colour-coded TIFF to `cell_id` (`demo`: all 531 truth cells matched, 81.6% of
+colours, the rest background; `WT_1`: 99.9%, after fitting the -3.54 degree
+rotation between the TIFF and the sqlite frame, which a nearest-centroid match
+cannot absorb -- it matched 106 of 947 before the fit):
+
+| definition | demo FP med / worst | demo missed | `WT_1` FP | `WT_1` missed | s/frame |
+|---|---:|---:|---:|---:|---:|
+| `dilation_px=1` | 0.00% / 0.00% | **100%** | 0.00% | **100%** | 0.01 / 0.04 |
+| **`dilation_px=2` (factory)** | **0.00% / 0.40%** | 0.07% / 0.26% | 0.08% | 0.04% | 0.02 / 0.05 |
+| `dilation_px=3` | 0.40% / 1.21% | 0.00% | 0.29% | 0.00% | 0.02 / 0.05 |
+| `build_interface_graph` | 0.00% / 0.20% | 0.27% / 0.54% | 0.04% | 0.10% | 0.03 / **0.16** |
+
+One decoding defect had to be fixed first and is worth recording: in some
+frames the tissue exterior is painted as a single colour, and the
+nearest-centroid match hands that whole region to one cell, which then
+"touches" hundreds of others -- one label of ~24,000 px against a median of
+326 on `demo` frames 10-12, by itself ~550 false adjacencies. Dropped by area,
+as `tracker_comparison._drop_oversized_components` already does.
+
+**§D2 -- we reproduce TissueMiner exactly.** `WT_1`, 40 frame pairs, truth
+adjacency and truth tracking, against `t1DataFilt.RData`:
+
+| | ours | TissueMiner | ours-not-theirs | theirs-not-ours | of which a cell is absent in one frame |
+|---|---:|---:|---:|---:|---:|
+| losses | 2,028 | 2,129 | **0** | 101 | **101** |
+| gains | 2,489 | 2,620 | **0** | 131 | **131** |
+
+The difference is exactly our appearance/disappearance filter, to the event.
+(`detect_t1_transitions`' docstring attributed that filter to TissueMiner;
+`t1DataFilt` does not apply it -- we are stricter. Corrected in place.)
+
+**§D3 -- what one tracking error costs in T1 events.** Etournay gives a
+perfect adjacency and a perfect tracking, so the track-id mapping can be
+perturbed alone, with the cell set and the adjacency provably unchanged
+(asserted per injection) and a zero-injection control that must produce zero
+differing events -- the control Round 29's withdrawn ROI experiment lacked.
+`demo`, 120 injections per type, five frame pairs scored around each:
+
+| error injected | new gains | new losses | events removed | net | injections with no effect |
+|---|---:|---:|---:|---:|---:|
+| **swap** (two neighbours exchange ids in one frame) | 11.12 ± 2.21 | 11.10 ± 2.22 | 0.22 | **+22.0** | 0 / 120 |
+| **merge** (a cell takes a neighbour's id onward) | 2.88 ± 0.94 | 0.17 ± 0.57 | 0.62 | +2.43 | 1 / 120 |
+| **break** (fresh id from frame f onward) | 0.19 ± 0.41 | 0.18 ± 0.41 | 0.57 | **-0.20** | 71 / 120 |
+| **drop** (untracked from frame f onward) | 0.00 | 0.00 | 0.54 | **-0.54** | 76 / 120 |
+
+**A swap manufactures ~22 T1 events -- about 11 per displaced cell, which is
+one per neighbour.** A break or a drop manufactures none: the "present in both
+frames" filter absorbs them, and they only *remove* events. That is worth
+knowing on its own, because the tracking failure this project has measured
+most (Round 26's 136 edge flips on `AS_LE_lateral`, each making an orphan and
+a new track) is of the harmless kind.
+
+**Spending the coefficients -- and a registration result that dwarfs them.**
+On `embryos_GBE_GAP43` against the maintainer's link-by-link ground truth
+(2026-10-18), agreement depends overwhelmingly on the registration convention:
+
+| `drift_mode` | tracks | agreement with GT | links we get wrong | raw T1 events |
+|---|---:|---:|---:|---:|
+| `none` (the default when nothing sets it) | 423 | 85.5% | 1,049 | **3,000** |
+| `centroid` | 481 | 98.2% | 130 | -- |
+| **`mask`** | 492 | **99.7%** | 25 | **944** |
+
+So the GT was collected under mask registration, and comparing an unregistered
+run against it measures the convention, not the tracking (`CLAUDE.md` rule 5
+case 5 -- caught here only because the disagreement grew monotonically with
+frame number, which is what accumulated drift looks like). **And the same
+switch moves the raw T1 count by 3.2x on identical masks** -- more than any
+persistence setting does.
+
+Taking the registered run: 25 wrong links, which form 11 open chains over 23
+displaced cells (none closed, so `classify` counts 0 strict swaps; a chain
+displaces each cell exactly as a swap does). At 11.11 events per displaced
+cell that predicts **~256 of the 944 raw events, about 27%**, with a bound of
+60 (if each behaves like a merge) to 424 (like a swap). **Tracking error of
+the kind our GT can see accounts for roughly a quarter of the raw T1 events on
+this movie, not all of it** -- and the remaining three quarters are not
+attributed by this round.
+
+**§E -- the persistence horizon is stored in seconds.** `frame_interval_sec`
+is a project setting (persisted in `extract_settings.json`), `min_duration_sec`
+defaults to **150 s** -- Finegan et al. 2019's 2.5 min, which Benoit et al.
+2020 reach independently on a different pipeline -- and `t1_persist_frames` is
+derived: 5 frames on `embryos_GBE_GAP43` (30 s), 10 on the two 15 s movies,
+1 on Etournay. The UI input's maximum comes from the interval (600 s worth)
+instead of the literal 10 it used to be, which was exactly the requirement of
+a 15 s/frame movie with no headroom. All four rows measured in one run each:
+
+| persist_frames | seconds | unregistered gains / losses | mask-registered |
+|---:|---:|---:|---:|
+| 0 | 0 | 1,468 / 1,532 | 477 / 467 |
+| 1 | 30 | 1,017 / 1,227 | 294 / 317 |
+| 2 | 60 | 780 / 1,084 | 201 / 259 |
+| **5 (Finegan)** | **150** | **318 / 784** | **111 / 193** |
+
+`annotate_persistence` now also records `detected_frame` and `settled_frame`
+(Finegan dates a T1 where the swap settles; the difference between the two is
+the flicker delay, so both are kept), and `flatten_transient` applies her
+smoothing as an explicit step that returns a new structure -- default off, raw
+table still there.
+
+**§F -- the interface graph is available to T1, and does not fix the
+flicker.** `get_t1_events` takes an adjacency source (`dilation` | `interface`)
+and `min_interface_px` is exposed as the four-way-vertex cutoff, default 2.
+Side by side:
+
+| | gains | losses | gain reversal | loss reversal | s/frame |
+|---|---:|---:|---:|---:|---:|
+| demo, dilation (dt 288 s) | 861 | 856 | 20.2% | 22.0% | 0.016 |
+| demo, interface | 933 | 930 | 19.4% | 27.0% | 0.028 |
+| GBE mask-registered, dilation (dt 30 s) | 477 | 467 | 26.2% | 26.6% | 0.008 |
+| GBE mask-registered, interface | 470 | 463 | 27.9% | 24.8% | 0.013 |
+
+Within a couple of points either way, at 1.6-1.8x the cost. **The four-way
+cutoff is not the fix.** And it is not a cleanup either -- measured on
+Etournay's real `bond_length`, 2 px is in the middle of the T1 distribution:
+
+| edges | n | p25 | median | p75 | <= 2 px |
+|---|---:|---:|---:|---:|---:|
+| lost, reversed at f+2 | 810 | 2.00 | 3.00 | 5.24 | 27.2% |
+| lost, settled | 2,307 | 1.41 | 2.83 | 5.83 | 32.2% |
+| gained, reversed at f+2 | 731 | 1.41 | 2.00 | 3.41 | **50.1%** |
+| gained, settled | 3,067 | 2.83 | 4.41 | 10.90 | 18.1% |
+| **all edges, frames 0-9** | 28,264 | 11.90 | 17.90 | 23.14 | **1.2%** |
+
+On losses, length does not separate reversed from settled at all (the settled
+ones are slightly *shorter*). On gains there is a 2.8:1 enrichment. Either way
+a 2 px cutoff redefines 18-50% of T1 events while touching 1.2% of edges, so
+it ships off-path and is documented as a criterion change.
+
+**§G1** -- `topology.validate_quartet_permutation`, Benoit et al. 2020's
+four-cell permutation pruning, added beside the napariCellFlow rosette check as
+a second named alternative; `detect_t1_transitions`' criterion is untouched.
+It requires both the start and the end state to be complete rings, which is
+what rejects the "intermediate chain-like topologies" Benoit reports Tissue
+Analyzer counting (45 false T1s against their 6). Their DTW templates, the
+3-frame smoothing and the 2 micron minimum are deliberately not ported -- the
+first needs labelled events we do not have, the last needs a pixel size the
+repo still does not record anywhere.
+
+### Round 29: six attributes on the bridge, a local re-track that is not worth wiring up, and a theme (2026-10-18)
+
+**The freeze was six public DataFrames.** `webview/app.py` hands the whole
+`EpiQuantAPI` instance to pywebview as `js_api`, and pywebview enumerates the
+instance's public attributes to build the JS-side proxy. Six of them were
+DataFrames (`cells_info`, `cells_shape`, `cells_tissue`, `clustering_data`,
+`tracking_data`, `original_tracking_data`), and a DataFrame's `.T` returns
+another DataFrame, which has its own `.T` — the walk has no bottom. Every
+column is visited at every level, and most of the dtype accessors (`.list`,
+`.struct`, `.dt`) raise on object dtype, which is what the maintainer's log was
+full of. Inspection plays frames on a timer, so the walk ran on every tick.
+
+Measured with a counting proxy that records each attribute pywebview would
+touch, on tables this pipeline actually produces:
+
+| project | tracking table | attributes before | after |
+|---|---|---:|---:|
+| WT GBE | 423 tracks x 33 cols | 30,685 | 149 |
+| OE GBE | 411 tracks x 83 cols | 70,885 | 149 |
+
+The fix is the convention that was already there and these six missed: a
+leading underscore (every cache in the same `__init__` already had one).
+**The guard is `bridge_hazards(instance)`** — it walks the public attributes
+*and* the properties, and names anything that is a DataFrame, Series or
+ndarray, or any property that raises. The self-test asserts it is empty on a
+fresh instance, empty after a full pipeline run, **and that it can fail**: it
+re-adds a public `tracking_data`, asserts the guard names it, then deletes it.
+A guard never seen to fire is not known to work.
+
+§10e: the `_neighbor_graph_cache` comment still claimed the geometry *"never
+changes once a project is loaded"* — the sentence Round 28 disproved. It now
+points at `_invalidate_frame_caches` and `docs/cache-invalidation.md`.
+
+**§4 — does `window.pywebview` exist in the native window? Yes.** The error in
+the maintainer's log was printed *by* pywebview, which settles it: it is
+present and working, and was failing only at serialisation. The yellow banner
+keys off `typeof window.pywebview !== "undefined" && window.pywebview.api`, so
+it appears only in a browser running the dev mock — which is where that
+screenshot was taken. It is kept (it is the one thing standing between a
+fixture number and a believed result) and shrunk to a badge in the top-right.
+
+**§6 — swap mode is `X`, not `Cmd/Ctrl+W`.** `Cmd+W` closes the window on
+macOS; rebinding it would one day close unsaved work. `X` was grepped clear of
+every other owner first. The mode is visible (the toggle highlights, the
+status line says so), `Esc` leaves it, and it is registered in `KEY_OWNERS`
+behind the census and inspection owners so it only fires on Correct Tracking.
+
+**§8 — one `saveKeyDown`, plus a backend refusal.** The dispatcher reads
+`currentStep()` and routes to the classification save on step 4, the tracking
+save on step 6, and returns false everywhere else; `preventDefault` keeps the
+browser's "save page" dialog away in dev mode. Behind it, `_refuse_wrong_table`
+checks the table it was handed: a `Frame\d+` column set means tracking, a
+`Cluster_Label`/`Cell_Type` column means classification, and the wrong one is
+refused with `{"error": ...}` rather than written. Four sandbox tests, on a
+copy of the project in a temp directory:
+
+| test | result |
+|---|---|
+| `Cmd+S` on step 4 | classification file rewritten, tracking file hash unchanged |
+| `Cmd+S` on step 6 | tracking file rewritten, classification file hash unchanged |
+| `Cmd+S` on steps 1/2/3/5/7 | both hashes unchanged, no exception |
+| `currentStep()` forced to lie | backend refused, both hashes unchanged |
+
+The fourth is the one worth having: it tests what happens when the frontend is
+wrong, which is the case a frontend test cannot cover. (Two things the browser
+run taught: `goToStep` gates on the `enabledSteps` set, so enabling the DOM
+buttons is not enough to enter a step; and the mock's state is closure-private,
+so the test wraps `window.EpiQuantAPI` in a recording Proxy rather than adding
+a hook to the mock that production would not have.)
+
+**§7 — dark theme, with the data colours nailed down.** Interface colours are
+CSS variables redefined under `html[data-theme="dark"]`; the data encodings sit
+in their own block headed `DATA COLOURS — NOT THEMED, EVER` and were checked by
+value in both themes (`#ffd633` matched, `#3388ff` unmatched, `#ff00ff`
+un-extracted, `#ffcc00` the census candidate outline, and the viridis LUT, all
+identical). The selected step was the
+maintainer's specific complaint: `#2563eb` on the dark panel measures **3.12:1**,
+below AA; the dark theme uses `#60a5fa`, **6.35:1**. (Those two numbers were
+guessed in a comment before they were measured, and the comment was wrong in
+both directions — they are measured now.) The choice is session-only, not
+written to disk, same reasoning as `Enable inset view`.
+
+**§9 — a local re-track, measured, and then not wired up.** The implementation
+follows §9b: the frame pair is solved **whole**, with the same cost
+`track_cells` uses, and `roi_labels_by_frame` filters only what is **written
+back**. Restricting the cost matrix instead would delete every out-of-ROI cell
+from the options and force a cell whose true successor is outside onto a
+second-best one inside — inventing errors exactly where the user has just been
+working. `previous_matches` keeps the *unfiltered* solution so motion
+compensation still sees every accepted match.
+
+> ⚠️ **The first run of §9c was void, and the way it was void is CLAUDE.md rule
+> 5 in its purest form.** The script injected a bad segmentation, called
+> `_reextract_frames`, and treated the result as "the stale table" — but
+> `_reextract_frames` does not re-track, so that table was **byte-identical to
+> the clean one in 100/100 trials**, and the masks were repaired before the
+> re-track ran. The reference and the starting state were the same object, so
+> **doing nothing scored zero errors** and the arm that writes back less won by
+> construction. It reported "ROI never worse, better in 49/100". That number is
+> withdrawn. (The same script also duplicated the `f-1` and `f+1` rows of
+> `Cells_info`, which would have corrupted the full arm independently.)
+
+Re-run with the starting table made genuinely stale (clean masks → clean table
+as the reference; inject; **full re-track on the broken masks** to get the
+table the user would be holding; repair the masks; then re-track from *that*,
+full vs ROI). `AS_LE_lateral view_E-cad`, .npy so edits survive, 6,478 cells /
+147 tracks / 6,303 links, `drift_mode='none'` (the resolved default — the
+reference run and both arms share it), ROI = 3 x the 33 px median cell radius,
+merge/split/delete in equal thirds, 93 of 100 trials valid (7 injections
+changed no link at all):
+
+| | median links wrong vs the clean run | mean |
+|---|---:|---:|
+| leave the stale table alone | 2 (max 12) | 3.66 |
+| full write-back | **0** | **0.00** |
+| ROI write-back | 0 | 0.12 |
+
+The full re-track recovers the clean link set **exactly, 93/93**. The ROI
+matched it in 89, was strictly worse in 4 (1–4 stale links left standing, both
+endpoints outside the ROI), and was better in **none**. Blast radius: median 2
+links changed either way, max 12 vs 11 — the ROI (median 65 labels across the
+three frames) is wide enough that the damage was already inside it. Time:
+0.045 s vs 0.041 s per ROI. **So the ROI bought no measurable locality and no
+time, and cost a little correctness.** It stays unreachable from the UI — which
+is also the honest reason, since the app keeps no pre-correction mask to diff
+and so cannot compute an ROI by itself. The exclusion and these numbers are in
+`retrack_frame_range`'s docstring, as rule 6 case 2 requires.
+
+**§9d — the prediction, written before the measurement:** the environment
+score's documented degenerate case is that *a coherent identity permutation
+scores 1.0*; a re-track re-solves a span, which is a standard way to make one;
+so the share of exact 1.0 should be **higher after** a local re-track than
+before, with the median moving less than the share.
+
+First attempt, one merge per frame on frames 20–24: before 66.5% perfect (337
+scored), after 66.7% (336). **That measured nothing** — the re-track changed
+**6 of the 544 links** touching the span, so there was no treatment to detect.
+Re-run with 20 merges per frame, so the re-track rewrote **326 of 544 links**,
+both arms still sharing the identical damaged masks:
+
+| | scored | perfect 1.0 | share | median | unscoreable |
+|---|---:|---:|---:|---:|---:|
+| before the re-track (stale table) | 316 | 11 | 3.5% | 0.364 | 32 |
+| after the re-track (same masks) | 241 | 32 | **13.3%** | 0.727 | 9 |
+| untouched frames, background | 5,696 | 4,123 | 72.4% | 1.0 | 74 |
+
+The predicted direction holds — the perfect share rises 3.8x while the median
+rises 2.0x — **but the prediction cannot be credited for it**, because the
+scored population fell from 316 to 241. 75 cells left the comparison, and they
+are disproportionately the ones a stale table scores badly. The three
+candidate explanations (the re-track genuinely repaired the links; the re-track
+produced a self-consistent permutation; the worst cells dropped out of the
+denominator) **all predict this table**, and the environment score cannot
+separate them. That is the finding: it is not a judge of a re-track, and
+reporting its median alone would have shown 0.364 → 0.727 and called it a
+repair. Report the scored count and the perfect share beside it, always.
+
+Reference for every number above: the link set the pipeline itself produces on
+the corrected masks, under `drift_mode='none'`, both arms preprocessed
+identically; the degenerate case of the comparison is that a method which
+writes nothing back scores zero when the stale table already agrees with the
+reference, which is exactly how the first run went wrong. No ground truth is
+involved, so none of this is an accuracy.
+
 ### Round 28: a cache that outlived the masks it was built from (2026-10-15)
 
 **The bug was a sentence in a comment.** `_neighbor_graph_cache` carried
@@ -3682,6 +5125,20 @@ The two thresholds are doing the work, not the threshold. Default off.
 "27%" was gains only, `(1505-1102)/1505 = 26.8%`. Both correct, different
 denominators -- stated because this project has lost a number to exactly that
 before.
+
+> ⚠️ **Corrected Round 30 §A: this table does not describe the program.** Every
+> row below the first came out of a measurement script that called
+> `topology.contacts_in_track_space` directly and did its own set difference.
+> **`detect_t1_transitions` took no band until Round 30**, and the only caller
+> that passed one was `_contacts_at`, feeding the persistence lookahead -- so
+> turning the band on in the app changed which events were judged *settled* and
+> could not change a single *detected* count. The rows remain valid
+> measurements **of the criterion**; they were never measurements of the
+> shipped behaviour. Two further things this table should have carried and did
+> not: the reversal rates have no dt (at 30 s/frame "1-frame" is 30 s, and a
+> reversal rate is a function of the sampling interval), and gains and losses
+> are pooled, which hides that on this movie they behave differently -- the
+> gain side climbs with dt and the loss side is flat. See Round 30 below.
 
 **D3** -- `topology.validate_rosette_quartet`, napariCellFlow's four-cell check
 (`edge_analysis.py:183`), added as a **named alternative** beside the ported

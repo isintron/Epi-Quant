@@ -45,7 +45,8 @@ import numpy as np
 # frames to say anything about its neighbourhood changing.
 __all__ = [
     "contacts_in_track_space", "detect_t1_transitions", "t1_counts_per_cell",
-    "annotate_persistence", "validate_rosette_quartet",
+    "annotate_persistence", "validate_rosette_quartet", "flatten_transient",
+    "validate_quartet_permutation",
 ]
 
 
@@ -119,6 +120,10 @@ def detect_t1_transitions(
     label_to_track_t: Mapping[int, Optional[int]],
     label_to_track_t1: Mapping[int, Optional[int]],
     centroids_t: Mapping[int, tuple] = None,
+    enter_px: Optional[float] = None,
+    exit_px: Optional[float] = None,
+    previous_contacts_t: Optional[Set[tuple]] = None,
+    previous_contacts_t1: Optional[Set[tuple]] = None,
 ) -> dict:
     """Neighbour exchanges between two consecutive frames.
 
@@ -128,10 +133,18 @@ def detect_t1_transitions(
     when `centroids_t` (a `{track_id: (x, y)}` map for frame t) is given.
 
     A contact present at `t` but not `t+1` is a LOSS; present at `t+1` but not
-    `t` is a GAIN. Both cells must appear in both frames, which is
-    TissueMiner's filter for appearance/disappearance artefacts -- without it
-    a cell entering the field of view registers a gain against every
-    neighbour it lands beside.
+    `t` is a GAIN. Both cells must appear in both frames, without which a cell
+    entering the field of view registers a gain against every neighbour it
+    lands beside.
+
+    **That filter is ours, not TissueMiner's** -- this docstring used to
+    attribute it to them, wrongly. Measured on `WT_1`, 40 frame pairs of their
+    own truth adjacency and tracking: we find 2,028 losses and 2,489 gains
+    against `t1DataFilt`'s 2,129 and 2,620, we find **nothing they do not**,
+    and the 101 / 131 they have and we do not are **exactly** the events in
+    which a cell is absent from one of the two frames. So we are their
+    criterion plus this filter; the reasoning for it stands, the attribution
+    did not (Round 30 §D2).
 
     **The orientation is a nematic (a headless axis), and the sign flip for
     gains is the load-bearing part.** From the two cells' centroid separation
@@ -145,13 +158,39 @@ def detect_t1_transitions(
 
     Caveat: a cell division whose daughters both persist can still register as
     a T1, since Epi-Quant has no lineage table to collapse it with.
+
+    **`enter_px`/`exit_px` reach the detection here (Round 30 §A).** They did
+    not until this round: this function built its two contact sets with a bare
+    `contacts_in_track_space`, and the only caller that passed a band was
+    `EpiQuantAPI._contacts_at`, whose sole consumer is `annotate_persistence`'s
+    lookahead. Turning the band on therefore detected events on raw adjacency
+    and judged them persistent on hysteretic adjacency -- two different
+    definitions of "contact" on the two sides of one verdict, with the filter
+    under test present on only one of them (`CLAUDE.md` rule 5). The band is
+    still off by default and nothing changes when it is.
+
+    Both contact sets carry state: `previous_contacts_t` is the band's verdict
+    at `t-1`, and `previous_contacts_t1` defaults to the `t` set computed here,
+    which is the chain the Schmitt trigger needs. Pass `previous_contacts_t1`
+    explicitly only to break that chain deliberately.
+
+    A band on an UNWEIGHTED graph is a no-op -- `contacts_in_track_space` sees
+    `strength is None` and admits the pair unconditionally -- so a caller that
+    sets it must pass `adjacency.build_neighbor_graph(..., return_weights=True)`.
     """
     present_t = {t for t in label_to_track_t.values() if t is not None}
     present_t1 = {t for t in label_to_track_t1.values() if t is not None}
     present_both = present_t & present_t1
 
-    contacts_t = contacts_in_track_space(graph_t, label_to_track_t)
-    contacts_t1 = contacts_in_track_space(graph_t1, label_to_track_t1)
+    contacts_t = contacts_in_track_space(
+        graph_t, label_to_track_t, previous_contacts=previous_contacts_t,
+        enter_px=enter_px, exit_px=exit_px,
+    )
+    contacts_t1 = contacts_in_track_space(
+        graph_t1, label_to_track_t1,
+        previous_contacts=previous_contacts_t1 if previous_contacts_t1 is not None else contacts_t,
+        enter_px=enter_px, exit_px=exit_px,
+    )
 
     def _judgeable(pair):
         return pair[0] in present_both and pair[1] in present_both
@@ -183,7 +222,8 @@ def detect_t1_transitions(
     return events
 
 
-def annotate_persistence(events: dict, contacts_after: list, persist_frames: int = 1) -> dict:
+def annotate_persistence(events: dict, contacts_after: list, persist_frames: int = 1,
+                         detected_frame: Optional[int] = None) -> dict:
     """Mark each event in `detect_t1_transitions`' result with whether the
     change it describes actually held. Sets three fields on every entry, in
     place, and returns `events`:
@@ -229,6 +269,39 @@ def annotate_persistence(events: dict, contacts_after: list, persist_frames: int
 
     `persist_frames=0` marks everything persistent with nothing unjudgeable --
     the unfiltered TissueMiner behaviour.
+
+    Measured on `embryos_GBE_GAP43` (30 s/frame), counting only settled
+    events, all rows from one run each, Round 30. The last row is Finegan et
+    al. 2019's requirement: that movie is 30 s/frame germband, the same rate
+    and tissue she set it on, so 5 frames IS her 150 s, unconverted.
+
+        persist_frames   seconds   unregistered        mask-registered
+                                   gains   losses      gains   losses
+                     0        0    1,468    1,532        477      467
+                     1       30    1,017    1,227        294      317
+                     2       60      780    1,084        201      259
+                     5      150      318      784        111      193
+
+    **Two things this table says that one column could not.** First, the
+    registration convention changes the raw count by 3.2x -- more than any
+    persistence requirement does -- so a count quoted without it says little
+    (`drift_mode='mask'` is what `embryos_GBE_GAP43`'s ground truth was
+    collected under; measured agreement 99.7% against 85.5% unregistered).
+    Second, the earlier record of 1,047/1,225 and 806/1,074 for rows 1 and 2
+    was measured in an earlier round under settings it did not state; these
+    rows replace them and differ by 2-3%.
+
+    With `detected_frame`, two more fields are set on every entry:
+
+        "detected_frame"  the frame the exchange was first seen at
+        "settled_frame"   where it FIRST holds for the full horizon, which is
+                          `detected_frame` for a persistent event and a later
+                          frame for one that flickers and then settles; `None`
+                          if it never settles inside `contacts_after`
+
+    Finegan records a T1 at the frame the swap settles, not where it first
+    appeared. Both are kept rather than one replaced by the other: their
+    difference is the flicker delay, which is itself a diagnostic.
     """
     horizon = int(persist_frames)
     judgeable = len(contacts_after) >= horizon
@@ -252,7 +325,58 @@ def annotate_persistence(events: dict, contacts_after: list, persist_frames: int
         else:
             entry["state"] = "unjudgeable"
         entry["persistent"] = entry["state"] == "persistent"
+        if detected_frame is not None:
+            entry["detected_frame"] = int(detected_frame)
+            entry["settled_frame"] = _settles_at(
+                pair, wanted, contacts_after, horizon, int(detected_frame))
     return events
+
+
+def _settles_at(pair, wanted: bool, contacts_after: list, horizon: int, detected_frame: int):
+    """The first frame from which `pair` holds `wanted` for `horizon`
+    consecutive frames, or `None`."""
+    if horizon <= 0:
+        return detected_frame
+    for start in range(0, len(contacts_after) - horizon + 1):
+        window = contacts_after[start:start + horizon]
+        if all((pair in contacts) == wanted for contacts in window):
+            # contacts_after[0] describes frame detected_frame + 2.
+            return detected_frame if start == 0 else detected_frame + 2 + start
+    return None
+
+
+def flatten_transient(events: dict) -> dict:
+    """Finegan's smoothing, as an EXPLICIT step rather than a hidden filter.
+
+    Returns `{"gained": [...], "lost": [...], "removed": {...}, "moved": int}`:
+    an exchange that never settles is dropped -- the interface stays with the
+    pair that held it before and after the interlude -- and one that settles
+    later is kept, at its `settled_frame`.
+
+    Not called by anything in the pipeline by default. `annotate_persistence`
+    deliberately drops nothing, and this returns a NEW structure rather than
+    editing one, so the unfiltered event table is still there afterwards: a
+    filter whose removals cannot be seen cannot be judged too aggressive
+    (`docs/schmitt-trigger.md` section 6).
+
+    Requires `annotate_persistence(..., detected_frame=...)` to have run;
+    without `settled_frame` there is nothing to flatten and it raises rather
+    than quietly returning the input.
+    """
+    kept = {"gained": [], "lost": []}
+    removed = {"gained": 0, "lost": 0}
+    moved = 0
+    for key in ("gained", "lost"):
+        for entry in events[key]:
+            if "settled_frame" not in entry:
+                raise ValueError("flatten_transient needs annotate_persistence(detected_frame=...)")
+            if entry["settled_frame"] is None:
+                removed[key] += 1
+                continue
+            if entry["settled_frame"] != entry.get("detected_frame"):
+                moved += 1
+            kept[key].append(entry)
+    return {**kept, "removed": removed, "moved": moved}
 
 
 def validate_rosette_quartet(
@@ -313,6 +437,92 @@ def validate_rosette_quartet(
     return {
         "gained": len(events["gained"]), "rosette": accepted,
         "rejected": len(events["gained"]) - accepted,
+    }
+
+
+def validate_quartet_permutation(
+    events: dict,
+    contacts_t: Set[tuple],
+    contacts_t1: Set[tuple],
+) -> dict:
+    """Benoit et al. 2020's four-cell permutation pruning, as a SECOND named
+    alternative (PLoS Comput Biol 10.1371/journal.pcbi.1008049).
+
+    Four cells can be paired three ways -- (ab|cd), (ac|bd), (ad|bc) -- and a
+    T1 is a move from one of those partitions to a DIFFERENT one, with the
+    four ring edges shared by both states. So of the six ordered pairings only
+    two are T1-compatible, and a quartet whose start or end state is not a
+    closed ring is an intermediate, not an event. That intermediate is what
+    Benoit reports Tissue Analyzer mis-labelling: 45 false T1s against their 6
+    on the same embryo data, *"intermediate chain-like topologies between
+    valid start and end states"*.
+
+    Marks each gained event `quartet: True` with its `quartet_partner`;
+    annotates, drops nothing, and `detect_t1_transitions` is untouched.
+
+    **Requires both states to be complete**: all five of the six quartet edges
+    present at `t` (the ring plus the lost pair) and all five at `t+1` (the
+    ring plus the gained pair). That is the difference from
+    `validate_rosette_quartet` above, which requires the ring in both frames
+    but says nothing about the diagonal in the frame where it should be
+    absent. The two therefore agree whenever the event came out of
+    `detect_t1_transitions`, which guarantees those absences -- measured on
+    `embryos_GBE_GAP43` and reported in README Round 30 §G. Kept separate
+    anyway, because they are two papers' criteria and a later change to one
+    must not silently become a change to the other.
+
+    **What this does NOT port**: the DTW template matching, the 3-frame
+    sliding mean on interface length, and the 2 micron minimum. The first
+    needs labelled training events this project does not have; the last needs
+    a pixel size the repo does not record anywhere (`docs/schmitt-trigger.md`
+    section 7).
+    """
+    lost_pairs = [entry["tracks"] for entry in events["lost"]]
+    accepted = 0
+    for entry in events["gained"]:
+        c, d = entry["tracks"]
+        entry["quartet"] = False
+        for a, b in lost_pairs:
+            if len({a, b, c, d}) != 4:
+                continue
+            ring = {(min(p, q), max(p, q)) for p, q in ((a, c), (c, b), (b, d), (d, a))}
+            before = ring | {(min(a, b), max(a, b))}
+            after = ring | {(min(c, d), max(c, d))}
+            if before <= contacts_t and after <= contacts_t1 \
+                    and (min(c, d), max(c, d)) not in contacts_t \
+                    and (min(a, b), max(a, b)) not in contacts_t1:
+                entry["quartet"] = True
+                entry["quartet_partner"] = (a, b)
+                accepted += 1
+                break
+
+    # Round 32 T1-2: the check judges GAINS only, so filtering on it hides a
+    # gain's axis and leaves its paired loss drawn alone -- the maintainer's
+    # "cells lose their T1 axes" was exactly the blue gain axis gone and the
+    # orange loss axis still there. Mark each loss with whether the filter
+    # orphaned it: it is PAIRED with at least one gain (the T1 geometry --
+    # four distinct cells, the lost pair both neighbours at `t` of each cell
+    # of the gained pair, the same `shared` test the rosette check uses) and
+    # none of those gains was accepted. A loss with no paired gain at all is
+    # not the filter's doing and is not marked. Annotation for display only:
+    # the filter's own logic is unchanged.
+    neighbours_t: Dict[int, Set[int]] = {}
+    for p, q in contacts_t:
+        neighbours_t.setdefault(p, set()).add(q)
+        neighbours_t.setdefault(q, set()).add(p)
+    accepted_partners = {entry["quartet_partner"] for entry in events["gained"]
+                         if entry.get("quartet")}
+    for loss in events["lost"]:
+        a, b = loss["tracks"]
+        paired = [gain for gain in events["gained"]
+                  if len({a, b, *gain["tracks"]}) == 4
+                  and {a, b} <= (neighbours_t.get(gain["tracks"][0], set())
+                                 & neighbours_t.get(gain["tracks"][1], set()))]
+        loss["quartet_orphan"] = bool(paired) and (a, b) not in accepted_partners
+    return {
+        "gained": len(events["gained"]), "quartet": accepted,
+        "rejected": len(events["gained"]) - accepted,
+        "orphaned_losses": sum(1 for loss in events["lost"] if loss["quartet_orphan"]),
     }
 
 
@@ -450,5 +660,44 @@ if __name__ == "__main__":
     assert lone_summary["rosette"] == 0, lone_summary
     assert len(lone["gained"]) == 1, "annotate, never drop"
     print("  -> a gain with no matching loss is rejected, and still returned.")
+
+    # --- R30 G1: Benoit's quartet-permutation check, beside the rosette one
+    permutation = detect_t1_transitions(graph_t, graph_t1, identity, identity)
+    perm_summary = validate_quartet_permutation(permutation, ct, ct1)
+    print("\nR30 G1 quartet-permutation check on the canonical T1:", perm_summary)
+    assert perm_summary["quartet"] == 1, perm_summary
+    # The difference from the rosette check is the state completeness
+    # requirement, so a quartet missing one ring edge at t+1 must fail here.
+    broken_t1 = {1: {3}, 2: {3, 4}, 3: {1, 2, 4}, 4: {2, 3}}
+    broken = detect_t1_transitions(graph_t, broken_t1, identity, identity)
+    assert validate_quartet_permutation(broken, ct,
+                                        contacts_in_track_space(broken_t1, identity))["quartet"] == 0
+    print("  -> an incomplete end state is rejected; the event is annotated, not dropped.")
+    # R32 T1-2: the loss paired with that rejected gain is the orphan the
+    # display has to hide too -- and the accepted canonical T1's loss is not.
+    assert broken["lost"] and broken["lost"][0]["quartet_orphan"] is True, broken["lost"]
+    assert permutation["lost"][0]["quartet_orphan"] is False, permutation["lost"]
+    print("  -> R32: the loss left behind by a rejected gain is marked quartet_orphan; "
+          "an accepted T1's loss is not.")
+
+    # --- R30 E2/E3: the settle frame, and flattening as an explicit step
+    flicker = detect_t1_transitions(graph_t, graph_t1, identity, identity)
+    # Reverses at t+2, comes back at t+3 and holds: detected at 7, settles at 10.
+    after = [ct, ct1, ct1]
+    annotate_persistence(flicker, after, persist_frames=1, detected_frame=7)
+    entry = flicker["gained"][0]
+    assert entry["detected_frame"] == 7, entry
+    assert entry["settled_frame"] == 10, entry        # contacts_after[1] is frame 10
+    assert entry["state"] == "transient", entry
+    flat = flatten_transient(flicker)
+    assert flat["moved"] == 2 and flat["removed"] == {"gained": 0, "lost": 0}, flat
+    never = detect_t1_transitions(graph_t, graph_t1, identity, identity)
+    annotate_persistence(never, [ct, ct, ct], persist_frames=1, detected_frame=7)
+    assert never["gained"][0]["settled_frame"] is None
+    assert flatten_transient(never)["removed"] == {"gained": 1, "lost": 1}
+    assert len(never["gained"]) == 1, "flatten returns a new structure; the raw table stays"
+    print("R30 E: an exchange detected at frame 7 that settles at 10 keeps both frames; "
+          "flatten_transient moves it, drops one that never settles, and leaves the "
+          "original event table intact.")
 
     print("\nAll topology self-tests passed.")

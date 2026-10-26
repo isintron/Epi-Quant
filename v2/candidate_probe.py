@@ -99,7 +99,7 @@ def probe_item(api, item, want_label: int, drift=(0.0, 0.0)) -> dict:
         cy, cx = int(round(ys.mean())), int(round(xs.mean()))
         if 0 <= cy < before.shape[0] and 0 <= cx < before.shape[1]:
             inside = bool(before[cy, cx] == anchor)
-    claimed = tracking_benchmark.label_to_track(api.tracking_data, frame + 1)
+    claimed = tracking_benchmark.label_to_track(api._tracking_data, frame + 1)
 
     ranks = (1 if item.get("reference_label") == want_label else None,
              rank(by_iou), rank(by_anchor), rank(by_link))

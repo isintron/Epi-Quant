@@ -33,8 +33,10 @@ isn't, and re-reading avoids ever serving a stale frame after a correction.
 """
 
 import base64
+import copy
 import csv
 import datetime
+import glob
 import json
 import logging
 import os
@@ -42,8 +44,11 @@ import re
 import statistics
 import sys
 import threading
+from collections.abc import Mapping
+from io import BytesIO
 from typing import Optional, Union
 
+import matplotlib as mpl
 import numpy as np
 import pandas as pd
 import webview
@@ -53,14 +58,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import adjacency
 import baselines
 import cell_tracking
+import cell_table
 import census
 import common
 import coverage_log
 import data_input
+import dynamics_compare
 import efd
 import manual_correction_classification
 import manual_correction_tracking
 import pca_kmeans
+import plotkit
+import plots
 import rendering
 import segmentation_qc
 import lineage
@@ -80,8 +89,140 @@ def _finite(value) -> Optional[float]:
     return number if np.isfinite(number) else None
 
 
+def bridge_hazards(instance) -> list:
+    """Public attributes pywebview would try to serialise, and must not find.
+
+    **The whole `EpiQuantAPI` instance is handed to `webview.create_window
+    (js_api=...)`, and pywebview walks its public attributes.** A pandas
+    DataFrame is a trap for anything that walks attributes: `df.T` is another
+    DataFrame with its own `.T`, so the walk never bottoms out, and at every
+    level it touches each column's accessors (`.list`, `.struct`, `.dt`),
+    most of which raise on an object dtype. Round 29 traced the maintainer's
+    frozen UI and screenfuls of
+    `original_tracking_data.T.T.T.T.T.T.Frame3.list` errors to exactly this --
+    worst during the inspection pass, which makes a bridge call per frame, and
+    worse the more columns and tracks a movie has.
+
+    Every cache in this class was already underscore-prefixed, so pywebview
+    skipped them; the six DataFrames were the ones that slipped. The
+    convention existed, it just was not enforced -- which is what this
+    function is for (`CLAUDE.md` rule 6).
+
+    Properties are checked too: pywebview reaches those through `getattr` the
+    same way. A getter that raises is reported rather than swallowed, since
+    pywebview would hit the same error.
+    """
+    hazards = []
+    for name, value in vars(instance).items():
+        if name.startswith("_"):
+            continue
+        if isinstance(value, (pd.DataFrame, pd.Series, np.ndarray)):
+            hazards.append(f"{name} ({type(value).__name__})")
+    for name in dir(type(instance)):
+        if name.startswith("_") or not isinstance(getattr(type(instance), name, None), property):
+            continue
+        try:
+            value = getattr(instance, name)
+        except Exception as error:                       # noqa: BLE001 - reporting, not handling
+            hazards.append(f"{name} (property raised {type(error).__name__})")
+            continue
+        if isinstance(value, (pd.DataFrame, pd.Series, np.ndarray)):
+            hazards.append(f"{name} (property -> {type(value).__name__})")
+    return hazards
+
+
+def _count_js_arguments(source: str, open_paren_end: int):
+    """How many top-level arguments a JS call starting at `open_paren_end`
+    passes, or `None` if the call cannot be read (an unterminated or templated
+    argument list). Counts commas at nesting depth 0, skipping strings,
+    template literals and comments -- an object literal or an arrow function is
+    one argument, however many commas it contains.
+
+    `seen_any` is reset at every top-level comma, so a TRAILING comma before
+    the closing paren does not invent an extra argument. `app.js` writes its
+    long calls with one, and without this the check reported three false
+    positives the first time it ran."""
+    depth, count, index, seen_any = 0, 0, open_paren_end, False
+    quote = None
+    length = len(source)
+    while index < length:
+        char = source[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in "\"'`":
+            quote = char
+            seen_any = True
+            index += 1
+            continue
+        if char == "/" and index + 1 < length and source[index + 1] == "/":
+            index = source.find("\n", index)
+            if index == -1:
+                return None
+            continue
+        if char == "/" and index + 1 < length and source[index + 1] == "*":
+            index = source.find("*/", index)
+            if index == -1:
+                return None
+            index += 2
+            continue
+        if char in "([{":
+            depth += 1
+            seen_any = True
+        elif char in ")]}":
+            if char == ")" and depth == 0:
+                return count + (1 if seen_any else 0)
+            depth -= 1
+        elif char == "," and depth == 0:
+            count += 1
+            seen_any = False
+        elif not char.isspace():
+            seen_any = True
+        index += 1
+    return None
+
+
 class EpiQuantAPI:
+    #: Assigning any of these bumps `_tables_version`, which is the cache key
+    #: for everything derived from them. Done in `__setattr__` rather than by
+    #: hand at each assignment site: there are a dozen of those and the next
+    #: one added would not have remembered (CLAUDE.md rule 6 -- an invariant in
+    #: a comment is not enforced). In-place mutation still has to call
+    #: `_bump_tables()` explicitly.
+    _VERSIONED_TABLES = ("_cells_info", "_cells_shape", "_cells_tissue",
+                         "_clustering_data", "_tracking_data")
+
+    #: What `set_project` must NOT reset: the window handle, and the display
+    #: preferences the user set for this sitting rather than for one project.
+    #: Everything else `__init__` sets goes back to its initial value, so a new
+    #: attribute is reset by default -- the failure mode becomes "reset
+    #: something that did not need it" instead of "project A leaks into
+    #: project B", which is the one that draws a wrong figure without an error.
+    _KEEP_ACROSS_PROJECTS = frozenset({
+        "window", "coverage_session_id", "_initial_state",
+        "matched_color", "unmatched_color", "unextracted_color", "highlight_color",
+        "border_color", "lifecycle_colors", "dynamics_colors", "cluster_color_map",
+        "plot_settings",
+    })
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if name in self._VERSIONED_TABLES:
+            object.__setattr__(self, "_tables_version",
+                               object.__getattribute__(self, "__dict__").get("_tables_version", 0) + 1)
+
+    def _bump_tables(self) -> None:
+        """Say that a source table changed in place. Assignment is caught
+        automatically; a `.at[...] = ...` is not."""
+        self._tables_version = getattr(self, "_tables_version", 0) + 1
+
     def __init__(self):
+        self._tables_version: int = 0
         self.window = None
 
         # One id per app run, so a coverage log accumulated over several
@@ -93,16 +234,16 @@ class EpiQuantAPI:
         self.npy_folder: Optional[str] = None
         self.output_dirs: Optional[dict] = None
 
-        self.cells_info: Optional[pd.DataFrame] = None
+        self._cells_info: Optional[pd.DataFrame] = None
         # Shape/tissue descriptors live in their own tables, joined to
         # `cells_info` on `Cell Index` only when classification needs them.
         # They are NOT extra columns in `Cells_info.xlsx`: `common.save_modified_rows`
         # maps DataFrame column position onto Excel column position, so growing
         # that schema would silently write into the wrong columns of an
         # existing file.
-        self.cells_shape: Optional[pd.DataFrame] = None
-        self.cells_tissue: Optional[pd.DataFrame] = None
-        self.clustering_data: Optional[pd.DataFrame] = None
+        self._cells_shape: Optional[pd.DataFrame] = None
+        self._cells_tissue: Optional[pd.DataFrame] = None
+        self._clustering_data: Optional[pd.DataFrame] = None
         self.cluster_color_map: dict[int, str] = {}
         self.hidden_cluster_labels: set[int] = set()
         self.show_cluster_borders: bool = False
@@ -112,16 +253,28 @@ class EpiQuantAPI:
         # correction can't leave a stale border set behind.
         self._border_cell_cache: dict[int, Optional[set]] = {}
 
-        self.tracking_data: Optional[pd.DataFrame] = None
-        self.original_tracking_data: Optional[pd.DataFrame] = None
+        # What the last Classify run decided for itself; `None` means "not read
+        # from disk yet", `{}` means "read, and there is none".
+        self._classification_provenance: Optional[dict] = None
+
+        self._tracking_data: Optional[pd.DataFrame] = None
+        self._original_tracking_data: Optional[pd.DataFrame] = None
         # frame_number -> `adjacency.build_neighbor_graph` result, for the
-        # environment-score overlay. Unlike `_border_cell_cache` this needs NO
-        # invalidation on tracking edits: the graph is a function of the
-        # frame's `fill_labels` geometry alone, which never changes once a
-        # project is loaded. The tracking-dependent half (translating labels
-        # to track ids and computing the Dice score) is cheap set math and is
-        # recomputed on every render, so the view is always correct right
-        # after a correction. Cleared only when the project changes.
+        # environment-score overlay.
+        #
+        # **This used to say the graph needs NO invalidation, because
+        # `fill_labels` "never changes once a project is loaded".** A
+        # segmentation correction changes exactly that, and Round 28 measured
+        # the consequence: the graph stayed keyed to labels the masks no longer
+        # used, and the environment score built on it disagreed with the same
+        # score after a restart on all three movies. Cleared by
+        # `_invalidate_frame_caches`, which every mask-changing path calls --
+        # see `docs/cache-invalidation.md` for the full audit.
+        #
+        # The tracking-dependent half (translating labels to track ids and
+        # computing the Dice score) is cheap set math recomputed on every
+        # render, so a correction to the TABLE alone still needs no
+        # invalidation here.
         self._neighbor_graph_cache: dict[int, Optional[dict]] = {}
         # frame_number -> unmodified intensity array for segmentation QC;
         # same file-derived, never-invalidated reasoning as above.
@@ -177,6 +330,9 @@ class EpiQuantAPI:
         # byte-identical to the published baseline. Turning it on changes track
         # counts and therefore cell-loss %.
         self.max_frame_gap: int = 0
+        # x both displacement gates (`cell_tracking.DEFAULT_GATE_SCALE`); > 1 for
+        # sparse, fast-moving cells, 1.0 = shipped behaviour.
+        self.gate_scale: float = cell_tracking.DEFAULT_GATE_SCALE
         # Round 26 B2. The same checkbox, a different meaning: it no longer
         # drops rows at Extract, it filters the consumers whose quantities a
         # truncated cell corrupts (morphometrics, PCA/K-means). Tracking never
@@ -212,7 +368,7 @@ class EpiQuantAPI:
         # reference). Default "none" so the published baseline stays
         # byte-reproducible; "mask" is Tissue Analyzer's convention.
         self.drift_mode: str = "none"
-        # The drift_mode that actually produced `self.tracking_data`, recorded
+        # The drift_mode that actually produced `self._tracking_data`, recorded
         # when tracking completes. `self.drift_mode` is a live UI setting the
         # user can change afterwards, so reading it to describe an existing
         # tracking run is a claim, not a fact -- and Round 18 §D1 caught it
@@ -227,13 +383,81 @@ class EpiQuantAPI:
         self.environment_repair_threshold: float = 0.5
         # Schmitt-trigger hysteresis on the adjacency underlying T1 detection.
         # None = off, reproducing 1,505 gains / 1,545 losses on
-        # `embryos_GBE_GAP43`. At 25/15 that becomes 1,229 / 978 with the
-        # one-frame reversal rate falling 21.0% -> 14.8%; a HARD threshold of
-        # similar magnitude raises it to 31.7% instead, which is the control
-        # showing the hysteresis rather than the threshold is doing the work.
+        # `embryos_GBE_GAP43`.
+        #
+        # ⚠️ **Round 30 §A: the 25/15 numbers this comment used to quote
+        # (1,229 / 978, reversal 21.0% -> 14.8%) were never produced by this
+        # program.** They come from a measurement script that called
+        # `topology.contacts_in_track_space` directly and did its own set
+        # difference. The product could not reach that path: until Round 30
+        # `detect_t1_transitions` took no band, so the only caller that passed
+        # one was `_contacts_at`, whose sole consumer is `annotate_persistence`'s
+        # lookahead -- the band judged persistence of events detected without
+        # it. They remain valid measurements OF THE CRITERION, and are kept in
+        # `docs/schmitt-trigger.md` labelled as such. The band now reaches
+        # detection; it is still off by default, because Round 30 §B has not
+        # yet established what reversal rate is worth filtering.
         self.t1_enter_px: Optional[float] = None
         self.t1_exit_px: Optional[float] = None
         self._hysteresis_cache: dict = {}
+        # The tracking fingerprint the chain above was built under. The chain
+        # is in TRACK space, so a correction moves it on with no mask change.
+        self._hysteresis_fingerprint: Optional[int] = None
+        # T1 detection reads ONE adjacency: `tissue_features.
+        # build_interface_graph`, shared border pixels, with
+        # `adjacency.build_neighbor_graph` kept only as an internal fallback
+        # for segmentation where no two cells touch at all even after
+        # bridging (`pupae_E-cad`: 826 cells, zero shared interfaces).
+        #
+        # Round 30 shipped this as a user-facing menu and Round 31 took it
+        # back out, for two measured reasons. First the menu switched two
+        # things at once: on GBE's first six frames the interface graph is
+        # very nearly a superset of the dilation one (23 edges dilation-only,
+        # 388 interface-only of ~733/793 per frame), and most of that 8.2% is
+        # not "wall vs corner" but gap tolerance -- dilation reaches 2 px
+        # while the interface graph bridges 3 first. Second, the interface
+        # graph is the only one that yields a LENGTH, which the four-way rule
+        # and the hysteresis band both need to mean anything.
+        self.t1_min_interface_px: int = tissue_features.MIN_INTERFACE_PX
+        # Draw only gains whose quartet passes Benoit et al. 2020's
+        # permutation check. Off: the check annotates every event either way,
+        # and both counts are reported, because its rejection rate is high
+        # enough that it must not quietly become the criterion.
+        self.t1_quartet_filter: bool = False
+        # Round 32 T1-1: both interfaces of a T1 -- the shrinking one (a
+        # loss, measured at f) and the new one (a gain, measured at f+1) --
+        # must be at least this long, IN MICRONS. Benoit et al. 2020's 2 um.
+        # Off by default and, like the quartet check, reported beside the raw
+        # counts. It REFUSES to run without `pixel_size_um`: a micron
+        # threshold silently applied in pixels would mean a different
+        # physical length on every microscope.
+        self.t1_length_filter: bool = False
+        # Round 33: the minimum, stored as TRUE interface length in pixels --
+        # half the shared-border pixel count, which counts both sides of a
+        # wall (see `_true_length_px`). `None` means "derive it from this
+        # movie": a fixed 2 um was unusable here -- at UTRN's recorded
+        # 0.1083 um/px it is 18.5 px, which sits around the p25 of ALL of
+        # GAP43's interfaces and far above the 4-5 px of a typical T1
+        # interface, so switching the filter on would have removed nearly
+        # every T1. The default now comes from `get_t1_length_sweep`.
+        self.t1_min_length_px: Optional[float] = None
+        # The sweep that chose the default. Pools across frames and depends
+        # on the tracking (reversal is judged in track space), so it carries
+        # a fingerprint of both and is rebuilt when either changes.
+        self._t1_length_sweep_cache: Optional[dict] = None
+        # The one gap knob, replacing the pair that used to disagree
+        # (`dilation_px=2` and `max_gap_px=3`): the widest gap between two
+        # cells that still counts as contact. Drives the interface graph's
+        # bridging, and the fallback's dilation radius.
+        self.t1_gap_px: int = segmentation_qc.MAX_GAP_PX
+        # Which graph the last build actually used, per frame, so provenance
+        # states it rather than assuming the preferred one succeeded.
+        self._t1_adjacency_used: dict[int, str] = {}
+        # Every T1 event in the movie, keyed by cell pair. Pools across
+        # frames, so it is dropped whole on any mask change.
+        self._pair_event_cache: Optional[dict] = None
+        self._weighted_graph_cache: dict[int, Optional[dict]] = {}
+        self._interface_graph_cache: dict[int, Optional[dict]] = {}
         # Which T1 events to DRAW AT ALL: "all" | "persistent" |
         # "persistent_unjudgeable". Gates the cell fill and the nematic axis
         # together -- Round 17 C3 found it gated only the axis, so `settled
@@ -254,9 +478,37 @@ class EpiQuantAPI:
         # filter removes, because a filter whose removals cannot be seen cannot
         # be judged too aggressive (`v2/docs/schmitt-trigger.md` section 6).
         self.t1_event_filter: str = "persistent"
+        # Seconds between frames, a property of the MOVIE, not of this view.
+        # `None` until the project says so (`docs/datasets.md` carries the
+        # measured values: 30 s for `embryos_GBE_GAP43`, 15 s for
+        # `embryos_GBE_OE_GAP43` and `embryos_GBE_UTRN`).
+        self.frame_interval_sec: Optional[float] = None
+        # Microns per pixel, also a property of the ACQUISITION. `None` until
+        # the project says so, and nothing silently falls back to pixels:
+        # `docs/schmitt-trigger.md` section 7 counted zero hits for
+        # `pixel_size`/`um_per_px`/`micron` across the whole repo, which is
+        # why every px threshold in it is a statement about one objective.
+        # Stored here so a feature that needs microns can refuse to run
+        # rather than quietly meaning something else (Round 31 §C).
+        self.pixel_size_um: Optional[float] = None
+        # How long an exchange must hold to count as settled, IN SECONDS.
+        # 150 s is Finegan et al. 2019's "shorter than 5 image frames (less
+        # than 2.5 mins)", and Benoit et al. 2020 (PLoS Comp Biol) arrive at
+        # the same 2.5 min independently, on a different pipeline. Finegan
+        # imaged germband at 30 s/frame, which is exactly
+        # `embryos_GBE_GAP43`'s rate and tissue, so on that movie the rule
+        # transfers without conversion. It is stored in seconds and not in
+        # frames because the same 150 s is 5 frames there and 10 on the two
+        # 15 s/frame movies -- a frame count is not portable between movies,
+        # which is the time-axis version of the missing `um_per_px`
+        # (`docs/schmitt-trigger.md` section 7).
+        self._t1_min_duration_sec: float = 150.0
         # Frames a neighbour exchange must hold before it counts as settled.
-        # 21% of raw events on `embryos_GBE_GAP43` reverse within one frame.
-        self.t1_persist_frames: int = 1
+        # Derived from `_t1_min_duration_sec` whenever the frame interval is
+        # known; the stored value is the fallback for a project that has not
+        # said how long a frame is. 21% of raw events on `embryos_GBE_GAP43`
+        # reverse within one frame.
+        self._t1_persist_frames_fallback: int = 1
         # Whether the tissue-rim ("free edge") junctions are drawn at all.
         # Off by default: a rim edge only means the mask stops there, which may
         # be a real tissue margin or just where segmentation was cropped, and
@@ -285,6 +537,54 @@ class EpiQuantAPI:
         self.border_color = "#ff00ff"
         self.lifecycle_colors = {"lost": "#ff3b30", "new": "#34c759", "both": "#ffffff"}
         self.dynamics_colors = {"division": "#34c759", "delamination": "#ff3b30", "t1": "#ffd633"}
+
+        # Plotting (Round 34, placed before the snapshot below). Session-only: a style is how someone wants to
+        # look at the data today, not a property of the project.
+        self.plot_settings = {
+            "style": plotkit.DEFAULT_STYLE, "font_size": "M", "line_width": "normal",
+            "size_preset": "single", "font_family": None, "error_band": "SD",
+        }
+        # One shared time window per step that plots against time, so changing
+        # the value or the cell does not reset it.
+        self.time_windows: dict[str, Optional[tuple]] = {"trajectory": None, "playground": None}
+        # chart id -> (builder, spec), so the export menu redraws the picture
+        # on screen rather than keeping a Figure alive for it.
+        self._chart_specs: dict[str, tuple] = {}
+        self._cell_table_cache = None
+        self._movie_cancelled = False
+        self._movie_track = None
+        self._group_extract_cancelled = False
+        self._group_mode = "clusters"
+        self._groups: list = []
+        self._pca_source = "project"
+        self._pca_scores_key = None
+        self._pca_scores_cache = None
+
+        # Taken last, so it covers every attribute above -- including ones a
+        # later round adds without remembering this line exists.
+        self._initial_state = {key: copy.deepcopy(value)
+                               for key, value in vars(self).items()
+                               if key != "_initial_state"}
+
+    def _reset_project_state(self) -> list:
+        """Put every project-scoped attribute back to its `__init__` value.
+
+        A `Cell Index` like `Cell1_5` exists in every project, so a table left
+        over from project A joins cleanly onto project B's keys and draws a
+        figure that is simply wrong -- no exception, no empty plot, nothing to
+        notice. Restoring from the `__init__` snapshot rather than from a
+        hand-written list is the point: a new attribute is covered the day it
+        is added."""
+        restored = []
+        for key, value in self._initial_state.items():
+            if key in self._KEEP_ACROSS_PROJECTS:
+                continue
+            if key in vars(self) and vars(self)[key] is value:
+                continue
+            object.__setattr__(self, key, copy.deepcopy(value))
+            restored.append(key)
+        self._tables_version = getattr(self, "_tables_version", 0) + 1
+        return restored
 
     def set_window(self, window) -> None:
         self.window = window
@@ -367,12 +667,16 @@ class EpiQuantAPI:
         return result[0] if isinstance(result, (list, tuple)) else result
 
     def set_project(self, mask_folder: str, image_folder: str, output_base_dir: str) -> dict:
+        # Everything the previous project left behind goes first, before any
+        # of the new project's paths are set (R35 2-3).
+        self._reset_project_state()
         self.mask_folder = mask_folder
         self.image_folder = image_folder
         # Everything cached belongs to the old project's masks.
         self._invalidate_frame_caches(reason="new project")
         self._junction_min_px = None
         self._junction_min_px_auto = None
+        self._classification_provenance = None
         self.output_dirs = common.setup_output_dirs(output_base_dir)
         fmt = data_input.detect_mask_format(mask_folder)
         # Restore the Extract settings this project was last used with. The
@@ -416,6 +720,13 @@ class EpiQuantAPI:
         """
         per_frame = {
             "neighbor_graph": self._neighbor_graph_cache,
+            # Round 30 §A/§F: two more views of the same frame's geometry --
+            # the weighted dilation graph the Schmitt band reads, and the
+            # shared-border interface graph. Both are per-frame, so they are
+            # dropped frame-by-frame like the others rather than wholesale.
+            "weighted_graph": self._weighted_graph_cache,
+            "interface_graph": self._interface_graph_cache,
+            "t1_adjacency_used": self._t1_adjacency_used,
             "raw_image": self._raw_image_cache,
             "margin": self._margin_cache,
             "border_cells": self._border_cell_cache,
@@ -435,6 +746,12 @@ class EpiQuantAPI:
         if self._hysteresis_cache:
             dropped.append("hysteresis (pools across frames)")
         self._hysteresis_cache.clear()
+        if self._pair_event_cache:
+            dropped.append("pair events (pools across frames)")
+        self._pair_event_cache = None
+        if self._t1_length_sweep_cache:
+            dropped.append("T1 length sweep (pools across frames)")
+        self._t1_length_sweep_cache = None
         self._qc_display_cache.clear()
         self._registration_cache = None
         self._geometry_lookup = None
@@ -455,8 +772,11 @@ class EpiQuantAPI:
         path = self._settings_path()
         if not path or not os.path.exists(path):
             data_input.set_min_cell_area(0)
+            self.frame_interval_sec = None
+            self.pixel_size_um = None
             return {"min_cell_area_px": 0, "restored": False,
-                    "exclude_edge_cells": self.exclude_edge_cells}
+                    "exclude_edge_cells": self.exclude_edge_cells,
+                    "frame_interval_sec": None, "pixel_size_um": None}
         try:
             with open(path, encoding="utf-8") as handle:
                 stored = json.load(handle)
@@ -467,8 +787,14 @@ class EpiQuantAPI:
         area = int(stored.get("min_cell_area_px", 0) or 0)
         data_input.set_min_cell_area(area)
         self.exclude_edge_cells = bool(stored.get("exclude_edge_cells", False))
+        interval = stored.get("frame_interval_sec")
+        self.frame_interval_sec = float(interval) if interval else None
+        pixel_size = stored.get("pixel_size_um")
+        self.pixel_size_um = float(pixel_size) if pixel_size else None
         return {"min_cell_area_px": area, "restored": True,
-                "exclude_edge_cells": self.exclude_edge_cells}
+                "exclude_edge_cells": self.exclude_edge_cells,
+                "frame_interval_sec": self.frame_interval_sec,
+                "pixel_size_um": self.pixel_size_um}
 
     def _save_project_settings(self) -> None:
         path = self._settings_path()
@@ -478,7 +804,9 @@ class EpiQuantAPI:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump({"min_cell_area_px": data_input.get_min_cell_area(),
-                           "exclude_edge_cells": bool(self.exclude_edge_cells)},
+                           "exclude_edge_cells": bool(self.exclude_edge_cells),
+                           "frame_interval_sec": self.frame_interval_sec,
+                           "pixel_size_um": self.pixel_size_um},
                           handle, indent=2, sort_keys=True)
                 handle.write("\n")
         except OSError as error:
@@ -507,15 +835,26 @@ class EpiQuantAPI:
 
     def load_existing_shape_features(self) -> dict:
         """Load previously written `Cells_shape.xlsx` / `Cells_tissue.xlsx`
-        instead of recomputing them."""
+        instead of recomputing them.
+
+        **The attribute names here were `cells_shape` / `cells_tissue`, without
+        the leading underscore**, so for a whole round the tables were read off
+        disk into attributes nothing else ever looked at: every other reader
+        uses `self._cells_shape`. Re-extracting those tables and then finding
+        none of their columns in the value list was the visible symptom.
+        `setattr` is what let a typo through silently, so the names are now
+        asserted against the attributes `__init__` declares."""
         classification_dir = self.output_dirs["cell_classification_output"]
         for attribute, filename, sheet in (
-            ("cells_shape", "Cells_shape.xlsx", "Shape"),
-            ("cells_tissue", "Cells_tissue.xlsx", "Tissue"),
+            ("_cells_shape", "Cells_shape.xlsx", "Shape"),
+            ("_cells_tissue", "Cells_tissue.xlsx", "Tissue"),
         ):
+            assert hasattr(self, attribute), f"{attribute} is not an attribute of EpiQuantAPI"
             path = os.path.join(classification_dir, filename)
             if os.path.isfile(path):
-                setattr(self, attribute, pd.read_excel(path, sheet_name=sheet, index_col="Cell Index"))
+                setattr(self, attribute,
+                        pd.read_excel(path, sheet_name=sheet, index_col="Cell Index"))
+                self._bump_tables()
         return self.get_shape_feature_summary()
 
     def load_existing_extraction(self) -> dict:
@@ -526,12 +865,12 @@ class EpiQuantAPI:
         recomputed."""
         self.npy_folder = data_input.prepare_segmentation_folder(self.mask_folder, image_folder=self.image_folder)
         path = os.path.join(self.output_dirs["cell_classification_output"], "Cells_info.xlsx")
-        self.cells_info = pd.read_excel(path, sheet_name="Cell")
+        self._cells_info = pd.read_excel(path, sheet_name="Cell")
         # On a TIFF project this call just reconverted `npy_converted/` from
         # the TIFFs, so the masks may differ from the ones anything was cached
         # from.
         self._invalidate_frame_caches(reason="loaded existing extraction")
-        return {"frame_count": self.get_frame_count(), "cell_count": len(self.cells_info)}
+        return {"frame_count": self.get_frame_count(), "cell_count": len(self._cells_info)}
 
     def load_existing_classification(self) -> dict:
         """Load a previously written `cells_clustering_results.xlsx` instead
@@ -540,11 +879,16 @@ class EpiQuantAPI:
         clustering_df = pd.read_excel(path)
         if "modified" not in clustering_df.columns:
             clustering_df["modified"] = False
-        self.clustering_data = clustering_df
+        self._clustering_data = clustering_df
         self._border_cell_cache.clear()
+        # Re-read from disk: this table was written by a previous session, so
+        # whatever the in-memory copy says about a previous run does not apply.
+        self._classification_provenance = None
         return {
             "cluster_sizes": clustering_df["Cell_Type"].value_counts().to_dict(),
             "k_used": int(clustering_df["Cluster_Label"].nunique()),
+            **{k: v for k, v in self._read_classification_provenance().items()
+               if k in ("dataset_mode", "front_back")},
         }
 
     def load_existing_tracking(self) -> dict:
@@ -560,9 +904,11 @@ class EpiQuantAPI:
         )
         tracking_df = pd.read_excel(path)
         tracking_df, duplicates_cleaned = cell_tracking.dedupe_tracking_data(tracking_df)
-        self.tracking_data = tracking_df
-        self.original_tracking_data = tracking_df.copy()
-        return {"track_count": int(len(tracking_df)), "duplicates_cleaned": duplicates_cleaned}
+        self._tracking_data = tracking_df
+        self._original_tracking_data = tracking_df.copy()
+        counts = cell_tracking.count_tracks(tracking_df)
+        return {"track_count": counts["rows"], "tracks_with_cells": counts["with_cells"],
+                "empty_rows": counts["empty"], "duplicates_cleaned": duplicates_cleaned}
 
     # ---- Extract --------------------------------------------------------
 
@@ -654,11 +1000,11 @@ class EpiQuantAPI:
                 exclude_edge_cells=exclude_edge_cells,
                 progress_cb=self._progress_cb("extract"),
             )
-            self.cells_info = cells_info.reset_index()
+            self._cells_info = cells_info.reset_index()
             # Extraction has just read the masks off disk; anything cached from
             # a previous read of them may predate a correction made since.
             self._invalidate_frame_caches(reason="extraction")
-            self._notify("onExtractDone", {"frame_count": frame_count, "cell_count": len(self.cells_info)})
+            self._notify("onExtractDone", {"frame_count": frame_count, "cell_count": len(self._cells_info)})
         except Exception as e:
             logger.exception("Extraction failed")
             self._notify("onExtractError", {"message": str(e)})
@@ -699,7 +1045,7 @@ class EpiQuantAPI:
                 self.npy_folder = data_input.prepare_segmentation_folder(
                     self.mask_folder, image_folder=self.image_folder
                 )
-            self.cells_shape = shape_features.extract_shape_features(
+            self._cells_shape = shape_features.extract_shape_features(
                 self.npy_folder,
                 output_path=self.output_dirs["cell_classification_output"],
                 efd_order=efd_order,
@@ -709,9 +1055,9 @@ class EpiQuantAPI:
                 progress_cb=self._progress_cb("shape"),
             )
             if include_tissue:
-                self.cells_tissue = tissue_features.extract_tissue_features(
+                self._cells_tissue = tissue_features.extract_tissue_features(
                     self.npy_folder,
-                    shape_info=self.cells_shape,
+                    shape_info=self._cells_shape,
                     output_path=self.output_dirs["cell_classification_output"],
                     progress_cb=self._progress_cb("shape"),
                 )
@@ -740,7 +1086,7 @@ class EpiQuantAPI:
         """
         offered = {c for spec in pca_kmeans.FEATURE_FAMILIES.values() for c in spec["columns"]}
         summary = {}
-        for label, frame in (("shape", self.cells_shape), ("tissue", self.cells_tissue)):
+        for label, frame in (("shape", self._cells_shape), ("tissue", self._cells_tissue)):
             if frame is None or frame.empty:
                 continue
             present = [c for c in frame.columns if c in offered]
@@ -765,8 +1111,8 @@ class EpiQuantAPI:
         return summary
 
     def get_frame_count(self) -> int:
-        if self.cells_info is not None:
-            frames = self.cells_info["Cell Index"].str.extract(r"Cell(\d+)_")[0]
+        if self._cells_info is not None:
+            frames = self._cells_info["Cell Index"].str.extract(r"Cell(\d+)_")[0]
             return int(frames.astype(int).nunique())
         if self.npy_folder:
             return len(data_input.list_segmentation_files(self.npy_folder))
@@ -782,8 +1128,8 @@ class EpiQuantAPI:
         sequential frame counter -- e.g. `[1, 9, 19]`. The frontend must
         step through this list, not assume `frame + 1` is ever a valid next
         frame."""
-        if self.cells_info is not None:
-            frames = self.cells_info["Cell Index"].str.extract(r"Cell(\d+)_")[0].astype(int)
+        if self._cells_info is not None:
+            frames = self._cells_info["Cell Index"].str.extract(r"Cell(\d+)_")[0].astype(int)
             return sorted(frames.unique().tolist())
         if self.npy_folder:
             files = data_input.list_segmentation_files(self.npy_folder)
@@ -851,12 +1197,12 @@ class EpiQuantAPI:
             return segmentation_qc.neighbor_count_deviation(
                 fill_labels, neighbor_graph=self._get_neighbor_graph(frame_number),
             )
-        if self.cells_info is None:
+        if self._cells_info is None:
             return {}
         if metric == "morphology":
-            return segmentation_qc.morphology_outlier(self.cells_info, frame_number)
+            return segmentation_qc.morphology_outlier(self._cells_info, frame_number)
         if metric == "measurement_failures":
-            return segmentation_qc.measurement_failures(self.cells_info, frame_number)
+            return segmentation_qc.measurement_failures(self._cells_info, frame_number)
         return {}
 
     def _free_edge_ids(self, frame_number: int) -> set:
@@ -943,10 +1289,10 @@ class EpiQuantAPI:
     def _cell_geometry(self, cell_index: str) -> Optional[tuple]:
         """`(x, y, area, radius)` for one `Cell{frame}_{label}` string, from
         `cells_info`. The shape `lineage.py`'s detectors expect."""
-        if self.cells_info is None or not cell_index:
+        if self._cells_info is None or not cell_index:
             return None
         if self._geometry_lookup is None:
-            info = self.cells_info.set_index("Cell Index")
+            info = self._cells_info.set_index("Cell Index")
             self._geometry_lookup = {
                 idx: (
                     float(row["Center X Coordinate"]), float(row["Center Y Coordinate"]),
@@ -964,11 +1310,11 @@ class EpiQuantAPI:
         way it always did -- rather than claiming every cell is unextracted.
         Cached alongside the geometry lookup and cleared with it.
         """
-        if self.cells_info is None:
+        if self._cells_info is None:
             return None
         if self._extracted_label_cache is None:
             self._extracted_label_cache = {}
-            for index in self.cells_info["Cell Index"].astype(str):
+            for index in self._cells_info["Cell Index"].astype(str):
                 match = re.match(r"Cell(\d+)_(\d+)$", index)
                 if match:
                     self._extracted_label_cache.setdefault(
@@ -1008,10 +1354,10 @@ class EpiQuantAPI:
         neither detector can be trusted unattended. The frontend presents these
         for confirmation; only confirmed events reach the lineage sheet.
         """
-        if self.tracking_data is None or self.cells_info is None:
+        if self._tracking_data is None or self._cells_info is None:
             return {"error": "Extract and track the movie first."}
 
-        spans = lineage.track_spans(self.tracking_data)
+        spans = lineage.track_spans(self._tracking_data)
         if not spans:
             return {"divisions": [], "delaminations": [], "t1": {}, "frame": frame_number}
         last = max(s["last"] for s in spans.values())
@@ -1019,10 +1365,15 @@ class EpiQuantAPI:
         divisions = lineage.division_candidates(
             spans, self._cell_geometry, self._get_neighbor_graph, last_frame=last,
         )
+        # Epi-Quant's own linker carries the mother into one daughter, which the
+        # two-newborn pattern cannot see (lineage.continuation_division_candidates).
+        divisions += lineage.continuation_division_candidates(
+            spans, self._cell_geometry, self._get_neighbor_graph, last_frame=last,
+        )
         explained = {d["mother"] for d in divisions}
         # The population median is what "shrunk away" is judged against -- a
         # cell that vanishes at full size is a broken track, not a delamination.
-        typical_area = float(self.cells_info["Cell Area"].median())
+        typical_area = float(self._cells_info["Cell Area"].median())
         delaminations = lineage.delamination_candidates(
             spans, self._cell_geometry, self._is_margin_cell, last_frame=last, explained=explained,
             typical_area=typical_area,
@@ -1070,16 +1421,16 @@ class EpiQuantAPI:
     def save_lineage(self) -> dict:
         """Build the lineage sheet from CONFIRMED events and write it to
         `cell_track_output/cell_lineage.xlsx`."""
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "No tracking data loaded."}
-        spans = lineage.track_spans(self.tracking_data)
+        spans = lineage.track_spans(self._tracking_data)
         margin_tracks = {
             track for track, span in spans.items()
             if self._is_margin_cell(span["cells"][span["first"]])
             or self._is_margin_cell(span["cells"][span["last"]])
         }
         table = lineage.build_lineage_table(
-            self.tracking_data, confirmed=self._confirmed_events(), margin_tracks=margin_tracks,
+            self._tracking_data, confirmed=self._confirmed_events(), margin_tracks=margin_tracks,
         )
         path = os.path.join(self.output_dirs["cell_track_output"], "cell_lineage.xlsx")
         table.to_excel(path, sheet_name="Lineage", index=False)
@@ -1089,9 +1440,9 @@ class EpiQuantAPI:
 
     def _t1_centroids(self, frame_number: int, label_to_track: dict) -> dict:
         """`{track_id: (x, y)}` for one frame, for the T1 orientation nematic."""
-        if self.cells_info is None:
+        if self._cells_info is None:
             return {}
-        info = self.cells_info.set_index("Cell Index")
+        info = self._cells_info.set_index("Cell Index")
         out = {}
         for label, track in label_to_track.items():
             if track is None:
@@ -1107,7 +1458,7 @@ class EpiQuantAPI:
     def _contacts_at(self, frame_number: int) -> Optional[set]:
         """`topology.contacts_in_track_space` for one frame, or `None` if that
         frame has no neighbour graph. Reuses the cached graph."""
-        graph = self._get_neighbor_graph(frame_number)
+        graph = self._t1_graph(frame_number)
         if not graph:
             return None
         if self.t1_enter_px is None:
@@ -1121,6 +1472,14 @@ class EpiQuantAPI:
     def _hysteresis_contacts(self, frame_number: int) -> Optional[set]:
         """Contacts at `frame_number` under the Schmitt trigger, resolved by
         walking forward from the first frame. Cached per frame."""
+        # Track space, like `_pair_event_index`: a tracking correction leaves
+        # every mask alone, so `_invalidate_frame_caches` never fires. Each
+        # frame's verdict carries the previous one, so a stale prefix taints
+        # the whole chain -- it is dropped entirely, not frame by frame.
+        fingerprint = self._tracking_fingerprint()
+        if self._hysteresis_fingerprint != fingerprint:
+            self._hysteresis_cache.clear()
+            self._hysteresis_fingerprint = fingerprint
         if frame_number in self._hysteresis_cache:
             return self._hysteresis_cache[frame_number]
         frames = [f for f in self.get_frame_numbers() if f <= frame_number]
@@ -1129,17 +1488,125 @@ class EpiQuantAPI:
             if frame in self._hysteresis_cache:
                 previous = self._hysteresis_cache[frame]
                 continue
-            loaded = self._load_frame(frame)
-            if loaded is None:
+            weighted = self._get_weighted_neighbor_graph(frame)
+            if weighted is None:
                 self._hysteresis_cache[frame] = None
                 continue
-            weighted = adjacency.build_neighbor_graph(loaded[0], return_weights=True)
             previous = topology.contacts_in_track_space(
                 weighted, self._label_to_track(frame), previous_contacts=previous,
                 enter_px=self.t1_enter_px, exit_px=self.t1_exit_px,
             )
             self._hysteresis_cache[frame] = previous
         return self._hysteresis_cache.get(frame_number)
+
+    def _pair_event_index(self) -> dict:
+        """`{(track_a, track_b): [(frame, "gain"|"loss"), ...]}` over the whole
+        movie, in frame order. Cached; pools across frames.
+
+        **Why a per-pair count is a different question from a per-event one**
+        (Round 31 §B). A pair of cells that genuinely exchange neighbours does
+        it once. Measured on the three GBE movies with corrected segmentation
+        AND corrected tracking -- so neither can be blamed -- the events pile
+        onto a few interfaces instead: on `embryos_GBE_OE_GAP43` the median
+        offending pair produces 3 events, one produces 21, and the pairs with
+        four or more account for 68.7% of all events (`embryos_GBE_UTRN`
+        64.5%, `embryos_GBE_GAP43` 23.5% at half the frame rate).
+
+        Those pairs are the weak interfaces: median dilation contact strength
+        45 px for a pair that never fires, 21 for one that fires once, 11 for
+        four or more, 9.5 for eight or more.
+
+        **But strength alone cannot be the filter, and this is the point of
+        counting instead.** A real T1 *must* pass through a weak interface --
+        an edge has to shrink to nothing before it breaks -- so the pairs that
+        fire exactly once are weak too (median 21 px). What separates them is
+        not how weak the interface is at any one moment, it is how many times
+        it crosses. Anyone tempted to replace this with a length threshold
+        should read Round 31 §4 first.
+        """
+        # Built in TRACK space, so a tracking correction moves it on even
+        # though no mask changed -- `_invalidate_frame_caches` alone would
+        # leave it stale. Round 33 found the gap while adding a second cache
+        # of the same kind; both now check the table's fingerprint.
+        fingerprint = self._tracking_fingerprint()
+        if self._pair_event_cache is not None and self._pair_event_cache[0] == fingerprint:
+            return self._pair_event_cache[1]
+        index: dict = {}
+        frames = self.get_frame_numbers()
+        contacts = {}
+        present = {}
+        for frame in frames:
+            here = self._contacts_at(frame)
+            if here is None:
+                continue
+            contacts[frame] = here
+            present[frame] = {t for t in self._label_to_track(frame).values() if t is not None}
+        for frame in frames:
+            if frame not in contacts or frame + 1 not in contacts:
+                continue
+            both = present[frame] & present[frame + 1]
+            for pair in contacts[frame + 1] - contacts[frame]:
+                if pair[0] in both and pair[1] in both:
+                    index.setdefault(pair, []).append((frame, "gain"))
+            for pair in contacts[frame] - contacts[frame + 1]:
+                if pair[0] in both and pair[1] in both:
+                    index.setdefault(pair, []).append((frame, "loss"))
+        for occurrences in index.values():
+            occurrences.sort()
+        self._pair_event_cache = (fingerprint, index)
+        return index
+
+    def get_pair_event_distribution(self) -> dict:
+        """How the movie's T1 events spread over cell pairs, with the contact
+        strength of each group -- the evidence a threshold would have to be
+        chosen from, reported instead of a threshold.
+
+        Deliberately returns the whole histogram rather than a cut: Round 31
+        §B says the value has to come from the data, and three movies already
+        disagree about where it would fall (23.5% of events come from
+        4-or-more pairs on the 30 s/frame movie, 68.7% on a 15 s/frame one).
+        """
+        if self._tracking_data is None:
+            return {"error": "Track the movie before counting repeat offenders."}
+        index = self._pair_event_index()
+        counts = sorted(len(v) for v in index.values())
+        events = sum(counts)
+        strengths: dict = {}
+        for frame in self.get_frame_numbers():
+            graph = self._t1_graph(frame)
+            if not graph:
+                continue
+            l2t = self._label_to_track(frame)
+            for label, neighbours in graph.items():
+                track_a = l2t.get(label)
+                if track_a is None or not isinstance(neighbours, Mapping):
+                    continue
+                for neighbour, strength in neighbours.items():
+                    track_b = l2t.get(neighbour)
+                    if track_b is None or track_b == track_a:
+                        continue
+                    strengths.setdefault((min(track_a, track_b), max(track_a, track_b)),
+                                         []).append(float(strength))
+        groups = {"never": [], "1": [], "2-3": [], "4+": [], "8+": []}
+        for pair, values in strengths.items():
+            n = len(index.get(pair, ()))
+            name = "never" if n == 0 else ("1" if n == 1 else ("2-3" if n <= 3 else "4+"))
+            groups[name].append(float(np.median(values)))
+            if n >= 8:
+                groups["8+"].append(float(np.median(values)))
+        return {
+            "events": events, "distinct_pairs": len(index),
+            "histogram": {str(c): counts.count(c) for c in sorted(set(counts))},
+            "median_per_pair": float(np.median(counts)) if counts else 0.0,
+            "max_per_pair": max(counts) if counts else 0,
+            "share_of_events_from_pairs_with_4_or_more_pct": round(
+                100.0 * sum(c for c in counts if c >= 4) / max(1, events), 1),
+            "contact_strength_by_group": {
+                name: {"pairs": len(values),
+                       "median": round(float(np.median(values)), 1) if values else None}
+                for name, values in groups.items()},
+            "parameters": self.t1_parameters(),
+        }
 
     def get_t1_events(self, frame_number: int, direction: str = "next") -> dict:
         """Neighbour exchanges (T1 transitions) between `frame_number` and the
@@ -1153,10 +1620,10 @@ class EpiQuantAPI:
         caller renders settled events solid and transient ones faded, and both
         totals are reported so the filter's effect stays visible.
         """
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "Track the movie before looking for T1 transitions."}
         other = frame_number + 1 if direction == "next" else frame_number - 1
-        graph_a, graph_b = self._get_neighbor_graph(frame_number), self._get_neighbor_graph(other)
+        graph_a, graph_b = self._t1_graph(frame_number), self._t1_graph(other)
         if not graph_a or not graph_b:
             return {"counts": {}, "counts_persistent": {}, "counts_unjudgeable": {}, "axes": [],
                     "gained": 0, "lost": 0, "gained_persistent": 0, "lost_persistent": 0,
@@ -1164,15 +1631,23 @@ class EpiQuantAPI:
                     "persist_frames": int(self.t1_persist_frames)}
 
         l2t_a, l2t_b = self._label_to_track(frame_number), self._label_to_track(other)
+        # Round 30 §A: the band now reaches DETECTION. `previous_contacts_t` is
+        # the chain's verdict at the frame before the pair; `detect_t1_
+        # transitions` carries it forward into `t+1` itself.
+        band = {}
+        if self.t1_enter_px is not None:
+            earlier_frame = frame_number if direction == "next" else other
+            band = {"enter_px": self.t1_enter_px, "exit_px": self.t1_exit_px,
+                    "previous_contacts_t": self._hysteresis_contacts(earlier_frame - 1)}
         # Always evaluate forward in time so a "gain" means a bond formed.
         if direction == "next":
             events = topology.detect_t1_transitions(
-                graph_a, graph_b, l2t_a, l2t_b, self._t1_centroids(frame_number, l2t_a),
+                graph_a, graph_b, l2t_a, l2t_b, self._t1_centroids(frame_number, l2t_a), **band,
             )
             earlier = frame_number
         else:
             events = topology.detect_t1_transitions(
-                graph_b, graph_a, l2t_b, l2t_a, self._t1_centroids(other, l2t_b),
+                graph_b, graph_a, l2t_b, l2t_a, self._t1_centroids(other, l2t_b), **band,
             )
             earlier = other
 
@@ -1191,6 +1666,16 @@ class EpiQuantAPI:
             contacts_after.append(contacts)
         topology.annotate_persistence(events, contacts_after, self.t1_persist_frames)
 
+        # R31 B: the pair-level view, attached to every event. `rank` is
+        # which crossing this is for that pair, `count` how many it makes in
+        # the whole movie. Annotation only -- nothing is filtered here.
+        pair_index = self._pair_event_index()
+        for entry in events["gained"] + events["lost"]:
+            occurrences = pair_index.get(entry["tracks"], [])
+            entry["pair_event_count"] = len(occurrences)
+            key = (earlier, "gain" if entry["type"] == "gain" else "loss")
+            entry["pair_event_rank"] = (occurrences.index(key) + 1) if key in occurrences else None
+
         track_to_label = {t: l for l, t in l2t_a.items() if t is not None}
 
         def _counts(subset: dict) -> dict:
@@ -1204,10 +1689,33 @@ class EpiQuantAPI:
             return {key: [e for e in events[key] if e["state"] == state] for key in ("gained", "lost")}
 
         settled, unjudgeable = _subset("persistent"), _subset("unjudgeable")
+        # R31 E: Benoit et al. 2020's four-cell permutation check, as an
+        # OPTIONAL filter that never changes the raw counts beside it. It
+        # rejects a gain whose quartet is not a complete ring at both ends --
+        # the "intermediate chain-like topology" case -- and its rejection
+        # rate is high, so it stays a named alternative rather than becoming
+        # the criterion (`detect_t1_transitions` is untouched).
+        contacts_t, contacts_t1 = self._contacts_at(earlier), self._contacts_at(earlier + 1)
+        quartet = {"gained": len(events["gained"]), "quartet": 0, "rejected": 0,
+                   "orphaned_losses": 0}
+        if contacts_t is not None and contacts_t1 is not None:
+            quartet = topology.validate_quartet_permutation(events, contacts_t, contacts_t1)
+        length = self._annotate_interface_lengths(events, earlier)
         axes = [
             {"center": e["center"], "phi": e["phi"], "type": e["type"],
-             "persistent": e["persistent"], "state": e["state"]}
+             "persistent": e["persistent"], "state": e["state"],
+             "quartet": e.get("quartet"),
+             "pair_event_count": e.get("pair_event_count"),
+             "pair_event_rank": e.get("pair_event_rank")}
             for e in events["gained"] + events["lost"] if "phi" in e
+            # The filter hides a rejected gain; it does not unreport it.
+            if not (self.t1_quartet_filter and e["type"] == "gain" and not e.get("quartet"))
+            # R32 T1-2: and the loss it leaves behind. Hiding only the gain
+            # left the paired loss axis drawn alone, which reads as "this
+            # cell lost half its T1". Display only -- counts are untouched.
+            and not (self.t1_quartet_filter and e["type"] == "loss" and e.get("quartet_orphan"))
+            # R32 T1-1: only when it can actually run (a pixel size is set).
+            and not (length["active"] and e.get("length_ok") is False)
         ]
         return {
             "counts": _counts(events), "counts_persistent": _counts(settled),
@@ -1216,6 +1724,10 @@ class EpiQuantAPI:
             "gained_persistent": len(settled["gained"]), "lost_persistent": len(settled["lost"]),
             "gained_unjudgeable": len(unjudgeable["gained"]), "lost_unjudgeable": len(unjudgeable["lost"]),
             "persist_frames": int(self.t1_persist_frames),
+            "quartet_accepted": quartet["quartet"], "quartet_rejected": quartet["rejected"],
+            "quartet_orphaned_losses": quartet["orphaned_losses"],
+            "length_filter": length,
+            "quartet_filter": bool(self.t1_quartet_filter),
             # How much the filter removes from what is drawn -- fill and axis
             # alike. Reported alongside the RAW counts so turning it on cannot
             # hide its own effect (Round 16 D, corrected in Round 17 C3).
@@ -1264,6 +1776,20 @@ class EpiQuantAPI:
             "dilation_px": adjacency.DEFAULT_DILATION_PX,
             "persist_frames": int(self.t1_persist_frames),
             "event_filter": self.t1_event_filter,
+            "adjacency": "interface",
+            "adjacency_used": sorted(set(self._t1_adjacency_used.values())) or ["interface"],
+            "min_interface_px": int(self.t1_min_interface_px),
+            "gap_px": int(self.t1_gap_px),
+            "quartet_filter": bool(self.t1_quartet_filter),
+            "length_filter": self.t1_length_settings(),
+            # Set but not acting is the state Round 30 §A was about, so it is
+            # reported rather than left to be inferred. The interface graph
+            # now carries lengths, so a band DOES act on it -- it did not in
+            # Round 30, which is half of why that menu is gone.
+            "band_active": bool(self.t1_enter_px is not None),
+            "min_duration_sec": self._t1_min_duration_sec,
+            "frame_interval_sec": self.frame_interval_sec,
+            "pixel_size_um": self.pixel_size_um,
         }
 
     # The three named modes the UI offers. `centroid_weight` and
@@ -1294,14 +1820,20 @@ class EpiQuantAPI:
             "motion_compensation": bool(self.motion_compensation),
             "max_frame_gap": int(self.max_frame_gap),
             "drift_mode": str(self.drift_mode),
+            "gate_scale": float(self.gate_scale),
             "default_overlap_weight": float(cell_tracking.DEFAULT_OVERLAP_WEIGHT),
+            "default_gate_scale": float(cell_tracking.DEFAULT_GATE_SCALE),
         }
 
     def set_tracking_cost(
         self, mode: str = None, overlap_weight: float = None, motion_compensation: bool = None,
-        max_frame_gap: int = None, drift_mode: str = None,
+        max_frame_gap: int = None, drift_mode: str = None, gate_scale: float = None,
     ) -> dict:
         """Set the cost function. Any argument left `None` is unchanged.
+
+        `gate_scale` multiplies both displacement gates (see
+        `cell_tracking.DEFAULT_GATE_SCALE`); it widens which pairs may be
+        linked and changes no cost.
 
         **Measured on `embryos_GBE_GAP43`, against agreement with each cell's
         best-IoU successor: nothing here reduces the 4.89% swap rate.**
@@ -1364,7 +1896,85 @@ class EpiQuantAPI:
             if drift_mode not in ("none", "centroid", "mask"):
                 raise ValueError(f"drift_mode must be none/centroid/mask, got {drift_mode!r}")
             self.drift_mode = drift_mode
+        if gate_scale is not None:
+            if not float(gate_scale) > 0:
+                raise ValueError(f"gate_scale must be > 0, got {gate_scale!r}")
+            self.gate_scale = float(gate_scale)
         return self.get_tracking_cost()
+
+    @property
+    def t1_persist_frames(self) -> int:
+        """The persistence horizon IN FRAMES, derived from the duration in
+        seconds whenever the project has said how long a frame is.
+
+        Reading it is how every consumer stays portable: 150 s is 5 frames on
+        a 30 s/frame movie and 10 on a 15 s/frame one, and a stored frame
+        count would silently mean a different duration on each."""
+        interval = self.frame_interval_sec
+        if interval:
+            return max(0, -(-int(round(float(self._t1_min_duration_sec))) // int(round(float(interval)))))
+        return int(self._t1_persist_frames_fallback)
+
+    def t1_persist_bounds(self) -> dict:
+        """What the UI may offer. The maximum used to be the literal 10 in
+        `index.html`, which happened to be exactly the 150 s requirement of a
+        15 s/frame movie -- no headroom at all, and the next faster movie
+        would have had none. It is now 600 s expressed in this movie's
+        frames."""
+        interval = self.frame_interval_sec
+        return {
+            "frame_interval_sec": interval,
+            "min_duration_sec": float(self._t1_min_duration_sec),
+            "frames": int(self.t1_persist_frames),
+            "max_frames": (max(1, -(-600 // int(round(float(interval))))) if interval else 30),
+            "max_duration_sec": 600.0,
+            "derived": bool(interval),
+        }
+
+    def set_frame_interval(self, seconds: float = None) -> dict:
+        """Seconds between frames for this project; `None` clears it.
+
+        Persisted with the project, because it is a fact about the movie that
+        a later session cannot re-derive from the masks."""
+        if seconds in (None, "", 0):
+            self.frame_interval_sec = None
+        else:
+            seconds = float(seconds)
+            if seconds <= 0:
+                raise ValueError(f"frame interval must be positive, got {seconds}")
+            self.frame_interval_sec = seconds
+        self._save_project_settings()
+        return self.get_acquisition()
+
+    def set_pixel_size(self, microns_per_pixel: float = None) -> dict:
+        """Microns per pixel for this project; `None` clears it.
+
+        Persisted with the project. **Nothing falls back to pixels when this
+        is unset** -- a feature that needs microns must refuse, because the
+        alternative is a number that means a different physical size on every
+        microscope while looking identical.
+        """
+        if microns_per_pixel in (None, "", 0):
+            self.pixel_size_um = None
+        else:
+            value = float(microns_per_pixel)
+            if value <= 0:
+                raise ValueError(f"pixel size must be positive, got {value}")
+            self.pixel_size_um = value
+        self._save_project_settings()
+        return self.get_acquisition()
+
+    def get_acquisition(self) -> dict:
+        """The two facts about how the movie was acquired that the masks
+        cannot supply: seconds per frame and microns per pixel."""
+        return {"frame_interval_sec": self.frame_interval_sec,
+                "pixel_size_um": self.pixel_size_um,
+                **self.t1_persist_bounds()}
+
+    def set_t1_min_duration(self, seconds: float = None) -> dict:
+        """How long an exchange must hold, in seconds (the portable form)."""
+        self._t1_min_duration_sec = max(0.0, float(seconds or 0.0))
+        return self.t1_persist_bounds()
 
     def get_t1_persistence(self) -> dict:
         """How many frames a neighbour exchange must hold to count as settled,
@@ -1373,6 +1983,7 @@ class EpiQuantAPI:
             "value": int(self.t1_persist_frames),
             "enter_px": self.t1_enter_px, "exit_px": self.t1_exit_px,
             "event_filter": self.t1_event_filter,
+            **self.t1_persist_bounds(),
         }
 
     def set_t1_hysteresis(self, enter_px: float = None, exit_px: float = None) -> dict:
@@ -1396,6 +2007,299 @@ class EpiQuantAPI:
         self._hysteresis_cache.clear()
         return self.get_t1_persistence()
 
+    @staticmethod
+    def _true_length_px(counted_px) -> float:
+        """A shared border's TRUE length from the interface graph's weight.
+
+        `segmentation_qc._interface_pixels` collects the 2-px band straddling
+        a border -- the pixel on EACH side -- so a straight 30 px wall comes
+        back as 60. Round 32 multiplied that count by `pixel_size_um` and so
+        displayed every interface at twice its length. Everything that turns
+        an interface weight into a length goes through here.
+
+        (`tissue_features.MIN_INTERFACE_PX` and the hysteresis band compare
+        against the raw double-sided count; they are unitless thresholds on
+        that count, not lengths, and are left as they are.)
+        """
+        return float(counted_px) / 2.0
+
+    def _tracking_fingerprint(self) -> Optional[int]:
+        """A cheap identity for the tracking table's CONTENT, so a cache
+        built in track space can tell that a correction has moved it on."""
+        if self._tracking_data is None:
+            return None
+        return int(pd.util.hash_pandas_object(self._tracking_data, index=True).sum())
+
+    def _event_lengths(self, frame: int) -> Optional[dict]:
+        """`{(track_a, track_b): true length px}` for one frame, from the
+        interface graph only -- a frame that fell back to dilation has no
+        interface lengths and returns `None` rather than overlap pixels."""
+        graph = self._t1_graph(frame)
+        if not graph or self._t1_adjacency_used.get(frame) != "interface":
+            return None
+        l2t = self._label_to_track(frame)
+        out = {}
+        for label, neighbours in graph.items():
+            track_a = l2t.get(label)
+            if track_a is None or not isinstance(neighbours, Mapping):
+                continue
+            for neighbour, weight in neighbours.items():
+                track_b = l2t.get(neighbour)
+                if track_b is None or track_b == track_a:
+                    continue
+                out[(min(track_a, track_b), max(track_a, track_b))] = self._true_length_px(weight)
+        return out
+
+    def get_t1_length_sweep(self) -> dict:
+        """Where the interface-length minimum should sit, read off THIS movie.
+
+        For every integer threshold from 1 px up to the p25 of all the
+        movie's interfaces (true length), the share of events that threshold
+        would remove, split by whether the event REVERSES at the single sample
+        f+2 or HOLDS there (both cells required present), for gains and losses
+        separately, with n. The default is the threshold where the gain side
+        separates best: the largest (removed share of reversing gains) minus
+        (removed share of settled gains) -- Youden's J with "reverses" as the
+        positive class -- and the smallest threshold among ties, so it never
+        removes more than it has to.
+
+        **Why the gain side alone picks it, while the rule stays two-sided.**
+        The rule is the published one and applies to both interfaces. But on
+        our movies the loss side does not separate the two groups -- a
+        reversing loss tends to be the LONGER interface (Round 32) -- so a
+        criterion read off the losses would point nowhere useful. Both sides
+        are reported at every threshold so that is visible, not assumed.
+        """
+        if self._tracking_data is None:
+            return {"error": "Track the movie first: the sweep judges whether each "
+                             "exchange holds, which needs tracks."}
+        key = (self._tracking_fingerprint(), self.t1_enter_px, self.t1_exit_px,
+               int(self.t1_min_interface_px), int(self.t1_gap_px))
+        cached = self._t1_length_sweep_cache
+        if cached is not None and cached["key"] == key:
+            return cached["result"]
+
+        frames = self.get_frame_numbers()
+        contacts, present, lengths = {}, {}, {}
+        all_lengths = []
+        for frame in frames:
+            here = self._contacts_at(frame)
+            if here is None:
+                continue
+            contacts[frame] = here
+            present[frame] = {tr for tr in self._label_to_track(frame).values() if tr is not None}
+            lengths[frame] = self._event_lengths(frame)
+            graph = self._t1_graph(frame)
+            if lengths[frame] is not None and graph:
+                all_lengths.extend(self._true_length_px(w) for a, nb in graph.items() if a
+                                   for b, w in nb.items() if b and a < b)
+
+        samples = {"gain": {"reversing": [], "settled": []},
+                   "loss": {"reversing": [], "settled": []}}
+        for frame in frames:
+            nxt, check = frame + 1, frame + 2
+            if not all(f in contacts for f in (frame, nxt, check)):
+                continue
+            both, alive, later = present[frame] & present[nxt], present[check], contacts[check]
+            for side, pairs, measured_at in (("gain", contacts[nxt] - contacts[frame], nxt),
+                                             ("loss", contacts[frame] - contacts[nxt], frame)):
+                table = lengths.get(measured_at)
+                if table is None:
+                    continue
+                for pair in pairs:
+                    if not (pair[0] in both and pair[1] in both):
+                        continue
+                    if not (pair[0] in alive and pair[1] in alive):
+                        continue
+                    length = table.get(pair)
+                    if length is None:
+                        continue
+                    reversed_ = (pair not in later) if side == "gain" else (pair in later)
+                    samples[side]["reversing" if reversed_ else "settled"].append(length)
+
+        size = self.pixel_size_um
+        p25 = float(np.percentile(all_lengths, 25)) if all_lengths else None
+        rows = []
+        for threshold in range(1, int(np.ceil(p25)) + 1 if p25 else 1):
+            row = {"threshold_px": threshold,
+                   "threshold_um": round(threshold * float(size), 3) if size else None}
+            for side in ("gain", "loss"):
+                for group in ("reversing", "settled"):
+                    values = samples[side][group]
+                    removed = sum(1 for v in values if v < threshold)
+                    row[f"{side}_{group}_n"] = len(values)
+                    row[f"{side}_{group}_removed_pct"] = (
+                        round(100.0 * removed / len(values), 1) if values else None)
+                for name in ("separation",):
+                    rev, sett = row[f"{side}_reversing_removed_pct"], row[f"{side}_settled_removed_pct"]
+                    row[f"{side}_{name}"] = (round(rev - sett, 1)
+                                             if rev is not None and sett is not None else None)
+            rows.append(row)
+
+        usable = [r for r in rows if r["gain_separation"] is not None]
+        best = max(usable, key=lambda r: (r["gain_separation"], -r["threshold_px"])) if usable else None
+        result = {
+            "rows": rows,
+            "all_interfaces": {"n": len(all_lengths), "p25_px": round(p25, 2) if p25 else None,
+                               "median_px": round(float(np.median(all_lengths)), 2) if all_lengths else None},
+            "default_px": best["threshold_px"] if best else None,
+            "default_um": best["threshold_um"] if best else None,
+            "default_reason": (
+                f"largest gain-side separation: at {best['threshold_px']} px it removes "
+                f"{best['gain_reversing_removed_pct']}% of reversing gains and "
+                f"{best['gain_settled_removed_pct']}% of settled ones (J = {best['gain_separation']} "
+                f"points); ties go to the smaller threshold") if best else
+                "no threshold below the p25 of interface lengths has events on both gain groups",
+            "reversal_check": "single sample at f+2, both cells present",
+            "pixel_size_um": size,
+            "parameters": {"enter_px": self.t1_enter_px, "exit_px": self.t1_exit_px,
+                           "min_interface_px": int(self.t1_min_interface_px),
+                           "gap_px": int(self.t1_gap_px)},
+        }
+        self._t1_length_sweep_cache = {"key": key, "result": result}
+        return result
+
+    def _t1_length_threshold_px(self, derive: bool) -> tuple:
+        """`(threshold_px, source)`. An explicit value wins; otherwise the
+        movie's derived default, computed only when `derive` (the sweep walks
+        the whole movie, so merely asking for parameters must not trigger
+        it)."""
+        if self.t1_min_length_px is not None:
+            return float(self.t1_min_length_px), "set by you"
+        cached = self._t1_length_sweep_cache
+        if cached is not None and cached["key"][0] == self._tracking_fingerprint():
+            default = cached["result"]["default_px"]
+            return (float(default) if default is not None else None), "derived from this movie"
+        if derive:
+            default = self.get_t1_length_sweep().get("default_px")
+            return (float(default) if default is not None else None), "derived from this movie"
+        return None, "not derived yet"
+
+    def _annotate_interface_lengths(self, events: dict, earlier: int) -> dict:
+        """Set `interface_px` (TRUE length) and `length_ok` on every event --
+        plus `interface_um` when a pixel size is known -- and return the
+        side-by-side tally.
+
+        A loss is measured on the frame it is lost FROM (`earlier`), a gain on
+        the frame it appears IN (`earlier + 1`): those are the shrinking and
+        the newly formed interface. Both must clear the minimum -- the
+        published two-sided rule, kept as specified. A frame that fell back to
+        dilation has no interface lengths and is left unjudged.
+
+        **Re-measured Round 33, in true length** (the Round 32 version of this
+        table used the double-sided count, so every pixel figure in it was 2x;
+        `pixel_size_um` 0.1083 is UTRN's recorded value, GAP43 and OE have
+        none). GT tracking, interface adjacency, reversal at the single sample
+        f+2, both cells present; the full sweep is in README Round 33.
+
+            cut: < 2 px of wall (true)     GAP43 30 s     OE 15 s       UTRN 15 s
+            gains removed: rev / held      46.8 / 27.8    30.4 / 19.2   27.8 / 16.4
+            losses removed: rev / held     29.7 / 35.4    18.0 / 22.4   15.3 / 21.4
+            n gains rev, held              126, 252       487, 720      453, 732
+            n losses rev, held             111, 268       482, 744      450, 771
+            (UTRN at 0.1083 um/px: 2 px = 0.217 um)
+
+        These are Round 32's percentages unchanged -- its "4 px" was 4 COUNTED
+        pixels, i.e. 2 px of wall -- relabelled to the true unit; every pixel
+        median Round 32 quoted halves the same way. The derived defaults are
+        2 px (GAP43), 3 px (OE) and 4 px (UTRN, 0.433 um). The old 2 um
+        default is ~18.5 px of wall at 0.1083 um/px and removes 99.6% of
+        reversing AND 99.2% of settled gains on UTRN -- the whole T1 result.
+
+        On the loss side the separation is <= 0 at every threshold below the
+        p25 on all three movies: the cut always removes a larger share of
+        exchanges that held than of flicker. The rule stays two-sided
+        regardless, as decided; this is the record of what that costs.
+        """
+        size = self.pixel_size_um
+        threshold_px, source = self._t1_length_threshold_px(derive=self.t1_length_filter)
+        tally = {
+            "enabled": bool(self.t1_length_filter),
+            "active": bool(self.t1_length_filter and threshold_px is not None),
+            "refused": ("no threshold yet: track the movie so one can be derived from it, "
+                        "or enter one") if self.t1_length_filter and threshold_px is None else None,
+            "min_length_px": threshold_px,
+            "min_length_um": round(threshold_px * float(size), 3) if (threshold_px and size) else None,
+            "source": source,
+            "gains_kept": 0, "gains_removed": 0, "losses_kept": 0, "losses_removed": 0,
+            "unjudged": 0,
+        }
+        for entry, frame in ([(e, earlier + 1) for e in events["gained"]]
+                             + [(e, earlier) for e in events["lost"]]):
+            table = self._event_lengths(frame)
+            length = table.get(entry["tracks"]) if table is not None else None
+            if length is None:
+                entry["interface_px"], entry["length_ok"] = None, None
+                tally["unjudged"] += 1
+                continue
+            entry["interface_px"] = length
+            if size:
+                entry["interface_um"] = round(length * float(size), 3)
+            if threshold_px is None:
+                entry["length_ok"] = None
+                continue
+            entry["length_ok"] = length >= threshold_px
+            side = "gains" if entry["type"] == "gain" else "losses"
+            tally[f"{side}_kept" if entry["length_ok"] else f"{side}_removed"] += 1
+        return tally
+
+    def set_t1_length_filter(self, enabled: bool = False, min_length_px: float = None,
+                             use_movie_default: bool = False) -> dict:
+        """Turn the two-sided interface-length minimum on or off.
+
+        The value is in TRUE pixels and needs no pixel size to run; microns are
+        only ever DISPLAYED, and only when a pixel size is set. Pass
+        `use_movie_default=True` to drop an explicit value and go back to the
+        threshold derived from this movie.
+        """
+        if use_movie_default:
+            self.t1_min_length_px = None
+        elif min_length_px is not None:
+            value = float(min_length_px)
+            if value < 0:
+                raise ValueError(f"minimum interface length must be >= 0 px, got {value}")
+            self.t1_min_length_px = value
+        self.t1_length_filter = bool(enabled)
+        if enabled:
+            threshold, _ = self._t1_length_threshold_px(derive=True)
+            if threshold is None:
+                self.t1_length_filter = False
+                return {"error": "No threshold to apply yet: track the movie so one can be "
+                                 "derived from it, or type one in.",
+                        **self.t1_length_settings()}
+        return self.t1_length_settings()
+
+    def t1_length_settings(self) -> dict:
+        size = self.pixel_size_um
+        threshold, source = self._t1_length_threshold_px(derive=False)
+        return {"enabled": bool(self.t1_length_filter),
+                "min_length_px": threshold,
+                "source": source,
+                "pixel_size_um": size,
+                # Microns are a display, and only when the acquisition says
+                # what a pixel is.
+                "min_length_um": round(threshold * float(size), 3) if (threshold and size) else None}
+
+    def set_t1_quartet_filter(self, enabled: bool = False) -> dict:
+        """Draw only gains that pass the four-cell permutation check."""
+        self.t1_quartet_filter = bool(enabled)
+        return self.t1_parameters()
+
+    def set_t1_min_interface_px(self, pixels: int = None) -> dict:
+        """The four-way-vertex cutoff: an interface of this many shared border
+        pixels or fewer is treated as a vertex, not a wall.
+
+        Two independent grounds for the default of 2 px, and Tissue Analyzer
+        is NOT one of them (see `tissue_features.build_interface_graph`).
+        """
+        value = int(pixels) if pixels is not None else tissue_features.MIN_INTERFACE_PX
+        if value < 0:
+            raise ValueError(f"min_interface_px must be >= 0, got {value}")
+        self.t1_min_interface_px = value
+        self._interface_graph_cache.clear()
+        self._t1_adjacency_used.clear()
+        return self.t1_parameters()
+
     def set_t1_event_filter(self, mode: str = "all") -> dict:
         """Which T1 orientation axes to draw: all / persistent /
         persistent_unjudgeable."""
@@ -1407,7 +2311,12 @@ class EpiQuantAPI:
     def set_t1_persistence(self, value: int = None) -> dict:
         """Set the T1 persistence horizon. 0 is TissueMiner's own unfiltered
         behaviour -- every raw event counts."""
-        self.t1_persist_frames = max(0, int(value)) if value is not None else 0
+        frames = max(0, int(value)) if value is not None else 0
+        self._t1_persist_frames_fallback = frames
+        # Seconds are the stored truth, so a frame count typed in the UI is
+        # converted on the spot rather than kept as a second, divergent copy.
+        if self.frame_interval_sec:
+            self._t1_min_duration_sec = frames * float(self.frame_interval_sec)
         return self.get_t1_persistence()
 
     def get_junction_min_px(self) -> dict:
@@ -1650,16 +2559,16 @@ class EpiQuantAPI:
 
     def _joined_features(self) -> pd.DataFrame:
         """`cells_info` joined with the shape and tissue tables on `Cell Index`."""
-        frame = self.cells_info.set_index("Cell Index")
-        for extra in (self.cells_shape, self.cells_tissue):
+        frame = self._cells_info.set_index("Cell Index")
+        for extra in (self._cells_shape, self._cells_tissue):
             if extra is not None and not extra.empty:
                 frame = frame.join(extra, how="left")
         return frame
 
     def has_efd_coefficients(self) -> bool:
         return bool(
-            self.cells_shape is not None
-            and any(str(c).startswith("efd_") for c in self.cells_shape.columns)
+            self._cells_shape is not None
+            and any(str(c).startswith("efd_") for c in self._cells_shape.columns)
         )
 
     def get_feature_options(self) -> dict:
@@ -1672,7 +2581,7 @@ class EpiQuantAPI:
         columns happens to come from `Cells_info.xlsx`, and the run would then
         fail after the user had already selected it.
         """
-        available = set(self._joined_features().columns) if self.cells_info is not None else set()
+        available = set(self._joined_features().columns) if self._cells_info is not None else set()
         families = {}
         for name, spec in pca_kmeans.FEATURE_FAMILIES.items():
             if name == "efd":
@@ -1706,17 +2615,56 @@ class EpiQuantAPI:
             }
         return {
             "families": families,
-            "has_shape": self.cells_shape is not None,
-            "has_tissue": self.cells_tissue is not None,
+            "has_shape": self._cells_shape is not None,
+            "has_tissue": self._cells_tissue is not None,
             "dataset_modes": ["time_series", "independent_samples"],
         }
 
+    def _efd_track_keys(self, index) -> dict:
+        """`track_ids` / `frames` for `efd.efd_features`, plus which front/back
+        convention they imply.
+
+        EFD's front/back decision is a sign choice on the long axis. Taken per
+        outline it is only as good as one contour's skewness, which for a cell
+        with little front/back asymmetry is noise -- so every even-harmonic
+        mode (PC2 bending and friends) flickers from frame to frame for the
+        same cell. `efd.front_back_by_track` decides it once per track instead,
+        which is what `figures/efd_figures/make_efd_figures.py:129` does.
+
+        The conflict this has to live with: Classify (step 3) runs BEFORE Track
+        (step 5), so the first classification of a project usually has no
+        tracking. Then the per-outline rule is all there is, and the choice is
+        recorded in the classification provenance so the time-series plots can
+        say so rather than silently disagreeing with the figures. A cell with
+        no track gets a track id of its own, i.e. the per-outline fallback for
+        that cell only."""
+        parsed = [re.match(r"Cell(\d+)_(\d+)", str(value)) for value in index]
+        if any(match is None for match in parsed):
+            raise ValueError("a feature row's index is not a 'Cell{frame}_{label}' key")
+        frames = [int(match.group(1)) for match in parsed]
+        if self._tracking_data is None:
+            return {"track_ids": None, "frames": None,
+                    "front_back": "per_outline", "untracked": len(parsed)}
+        label_to_track = {frame: self._label_to_track(frame) for frame in sorted(set(frames))}
+        track_ids, untracked = [], 0
+        for position, (match, frame) in enumerate(zip(parsed, frames)):
+            track = label_to_track[frame].get(int(match.group(2)))
+            if track is None:
+                untracked += 1
+                track_ids.append(f"untracked_{position}")
+            else:
+                track_ids.append(f"track_{track}")
+        return {"track_ids": track_ids, "frames": frames,
+                "front_back": "per_track", "untracked": untracked}
+
     def _feature_frame(
         self, feature_families: Optional[list], selected_features: Optional[list]
-    ) -> tuple[pd.DataFrame, str]:
-        """The matrix to hand PCA, plus the standardize mode the selection
-        mandates. Raises with a readable message rather than letting a missing
-        column surface as a bare `KeyError` from pandas."""
+    ) -> tuple[pd.DataFrame, str, dict]:
+        """The matrix to hand PCA, the standardize mode the selection mandates,
+        and a provenance dict for whatever the selection decided on its own
+        (currently the EFD front/back convention). Raises with a readable
+        message rather than letting a missing column surface as a bare
+        `KeyError` from pandas."""
         families = list(feature_families) if feature_families else ["basic"]
         unknown = [f for f in families if f not in pca_kmeans.FEATURE_FAMILIES]
         if unknown:
@@ -1786,6 +2734,7 @@ class EpiQuantAPI:
         sentinel_columns = [c for c in columns if c in data_input.CELLS_INFO_COLUMNS]
         if sentinel_columns:
             frame[sentinel_columns] = frame[sentinel_columns].mask(frame[sentinel_columns] == -1)
+        provenance: dict = {}
         if "efd" in families:
             # The table holds the RAW coefficients, which change with the cell's
             # size, its orientation in the image, the traversal direction and
@@ -1794,7 +2743,11 @@ class EpiQuantAPI:
             # on the WT/tmc/pyd pickles, raw-coefficient PC1-3 were mixtures of
             # size (|r| = 0.91 with PC2) and contour start phase, not shape.
             complete = frame.dropna()
-            normalized = efd.efd_features(complete.to_numpy(dtype=float).reshape(-1, efd_order, 4))
+            provenance = self._efd_track_keys(complete.index)
+            normalized = efd.efd_features(
+                complete.to_numpy(dtype=float).reshape(-1, efd_order, 4),
+                track_ids=provenance["track_ids"], frames=provenance["frames"],
+            )
             frame = pd.DataFrame(
                 np.atleast_2d(normalized), index=complete.index,
                 columns=efd.efd_feature_names(efd_order),
@@ -1808,7 +2761,8 @@ class EpiQuantAPI:
                 "Dropped %d cell(s) with missing or sentinel (-1) values from classification",
                 before - len(frame),
             )
-        return frame, standardize_mode
+        return frame, standardize_mode, {k: v for k, v in provenance.items()
+                                         if k in ("front_back", "untracked")}
 
     def run_classification(
         self,
@@ -1819,6 +2773,7 @@ class EpiQuantAPI:
         selected_features: Optional[list] = None,
         prune_correlation: Optional[float] = None,
         dataset_mode: str = "time_series",
+        variance_threshold: Union[int, float] = 0.85,
     ) -> dict:
         """PCA + K-means over the chosen feature set.
 
@@ -1834,8 +2789,19 @@ class EpiQuantAPI:
           explains 0.601 of PC1's variance under pooling. Cluster labels are
           then per-frame, so `cluster_1` in one image is unrelated to
           `cluster_1` in another.
+
+        `variance_threshold` decides how many components are kept, and it had
+        to become reachable from here (Round 34): a fraction below 1 keeps
+        enough components for that much cumulative variance, an integer of 1 or
+        more keeps exactly that many. The default 0.85 keeps only PC1-PC2 on
+        `AS_LE_lateral` (cum2 = 87.6%), while the manuscript's Supp. Fig. 1
+        morphospaces are PC1-PC3 -- so with the parameter stranded in
+        `compute_pca` those panels were not reachable from the product at all.
         """
-        features, standardize_mode = self._feature_frame(feature_families, selected_features)
+        features, standardize_mode, feature_provenance = self._feature_frame(
+            feature_families, selected_features)
+        variance_threshold = self._resolve_variance_threshold(
+            variance_threshold, features.shape[1])
 
         if isinstance(n_clusters, str) and n_clusters != "auto":
             n_clusters = int(n_clusters)
@@ -1844,27 +2810,36 @@ class EpiQuantAPI:
 
         if dataset_mode == "independent_samples":
             frames = pd.Series([str(i).split("_")[0] for i in features.index], index=features.index)
-            parts = []
+            parts, per_frame_components = [], []
             for frame_id, chunk in features.groupby(frames, sort=False):
                 if len(chunk) < 3:
                     logger.info("Skipping %s: only %d cell(s), too few to cluster", frame_id, len(chunk))
                     continue
                 chunk_pca = pca_kmeans.compute_pca(
-                    chunk, standardize_mode=standardize_mode, prune_correlation=prune_correlation
+                    chunk, standardize_mode=standardize_mode, prune_correlation=prune_correlation,
+                    sign_convention=True, variance_threshold=variance_threshold,
                 )
+                per_frame_components.append(int(chunk_pca.shape[1]))
                 parts.append(pca_kmeans.cluster_cells_kmeans(
                     chunk_pca, n_clusters=n_clusters, k_range=k_range, random_state=random_state
                 ))
             if not parts:
                 raise ValueError("No frame had enough cells to cluster independently.")
             clustering_df = pd.concat(parts, ignore_index=True)
+            # One number cannot describe a per-frame fit; report the range.
+            components_kept = sorted({n for n in per_frame_components})
+            components_kept = components_kept[0] if len(components_kept) == 1 else components_kept
         elif dataset_mode == "time_series":
             pca_df = pca_kmeans.compute_pca(
                 features,
                 output_dir=output_dir,
                 standardize_mode=standardize_mode,
                 prune_correlation=prune_correlation,
+                sign_convention=True,
+                variance_threshold=variance_threshold,
+                with_efd_descriptors="efd" in (feature_families or []),
             )
+            components_kept = int(pca_df.shape[1])
             clustering_df = pca_kmeans.cluster_cells_kmeans(
                 pca_df, output_dir=output_dir, n_clusters=n_clusters, k_range=k_range, random_state=random_state,
             )
@@ -1872,10 +2847,10 @@ class EpiQuantAPI:
             raise ValueError(f"unknown dataset mode {dataset_mode!r}; expected 'time_series' or 'independent_samples'")
 
         clustering_df["modified"] = False
-        self.clustering_data = clustering_df
+        self._clustering_data = clustering_df
         self._border_cell_cache.clear()
 
-        return {
+        summary = {
             "cluster_sizes": clustering_df["Cell_Type"].value_counts().to_dict(),
             "k_used": int(clustering_df["Cluster_Label"].nunique()),
             "features_used": list(features.columns),
@@ -1883,7 +2858,115 @@ class EpiQuantAPI:
             "standardize_mode": standardize_mode,
             "dataset_mode": dataset_mode,
             "cells_used": int(len(features)),
+            "variance_threshold": variance_threshold,
+            "components_kept": components_kept,
+            **feature_provenance,
         }
+        self._write_classification_provenance({
+            **summary,
+            "cluster_sizes": {str(k): int(v) for k, v in summary["cluster_sizes"].items()},
+            "sign_convention": True,
+            "prune_correlation": prune_correlation,
+            "random_state": random_state,
+            "n_clusters_requested": n_clusters if isinstance(n_clusters, int) else str(n_clusters),
+            "written_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        })
+        return summary
+
+    @staticmethod
+    def _resolve_variance_threshold(value, n_features: int):
+        """sklearn reads `n_components` as a fraction below 1 and as a count at
+        1 or above, which is a cliff the UI must not hand a user by accident:
+        `1` means one component, `0.99` means almost all of them. Normalise and
+        refuse the out-of-range cases here, where the feature count is known,
+        rather than letting PCA raise about `n_components` deep in a thread."""
+        number = float(value)
+        if number <= 0:
+            raise ValueError("Components to keep must be a positive number.")
+        if number < 1:
+            return number
+        count = int(round(number))
+        if abs(number - count) > 1e-9:
+            raise ValueError(
+                f"{value} is neither a cumulative-variance fraction (below 1) nor a whole "
+                "number of components."
+            )
+        if count > n_features:
+            raise ValueError(
+                f"Asked for {count} components but only {n_features} feature(s) were selected."
+            )
+        return count
+
+    # ---- Classification provenance -------------------------------------
+    #
+    # Two decisions the PCA table itself cannot carry: which front/back
+    # convention the EFD features were built with (0-2), and whether the PCA
+    # was fit once over the movie or once per frame (0-3). Both change what a
+    # PC score MEANS, and neither is visible in `Cells_info_PCA.xlsx`, so they
+    # are recorded beside it and read back by every consumer that plots a PC.
+
+    def _classification_provenance_path(self) -> Optional[str]:
+        if not self.output_dirs:
+            return None
+        return os.path.join(self.output_dirs["cell_classification_output"],
+                            "classification_provenance.json")
+
+    def _write_classification_provenance(self, record: dict) -> None:
+        path = self._classification_provenance_path()
+        if not path:
+            return
+        self._classification_provenance = record
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, indent=2, sort_keys=True, default=str)
+                handle.write("\n")
+        except OSError as error:
+            logger.warning("could not write %s: %s", path, error)
+
+    def _read_classification_provenance(self) -> dict:
+        if self._classification_provenance is not None:
+            return self._classification_provenance
+        path = self._classification_provenance_path()
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, encoding="utf-8") as handle:
+                self._classification_provenance = json.load(handle)
+        except (OSError, ValueError) as error:
+            logger.warning("could not read %s: %s", path, error)
+            return {}
+        return self._classification_provenance
+
+    def get_pc_availability(self) -> dict:
+        """Whether PC-valued columns may be plotted against time, and what to
+        say about them when they may.
+
+        Refused outright under `independent_samples`: that mode fits a separate
+        PCA per frame, so PC2 in frame 5 and PC2 in frame 6 are different axes
+        and a curve through them means nothing. Non-PC values (area, shape,
+        tissue) are unaffected, which is why this is a per-value gate and not a
+        whole-step one.
+
+        Warned about when the EFD front/back convention was decided per outline
+        but tracking now exists: the fit is self-consistent, just not the one
+        `/figures` uses. Re-fitting is the user's call -- it moves every label
+        in the movie, the same reason `_reextract_frames` leaves the PCA alone."""
+        record = self._read_classification_provenance()
+        if not record:
+            return {"allowed": True, "reason": None, "warning": None, "known": False}
+        if record.get("dataset_mode") == "independent_samples":
+            return {
+                "allowed": False, "known": True, "warning": None,
+                "reason": ("This classification was run in independent-samples mode, which fits a "
+                           "separate PCA per frame. PC axes are not comparable between frames, so "
+                           "PC values cannot be plotted over time. Other values are unaffected."),
+            }
+        warning = None
+        if record.get("front_back") == "per_outline" and self._tracking_data is not None:
+            warning = ("EFD PCA was fit with per-outline front/back; re-run Classify to use "
+                       "per-track (as in the figures).")
+        return {"allowed": True, "reason": None, "warning": warning, "known": True}
 
     def set_cluster_colors(self, color_map: dict) -> None:
         """Updates just the given cluster(s)' colors -- must merge, not
@@ -1894,9 +2977,9 @@ class EpiQuantAPI:
         self.cluster_color_map.update({int(k): v for k, v in color_map.items()})
 
     def get_cluster_legend(self) -> list[dict]:
-        if self.clustering_data is None:
+        if self._clustering_data is None:
             return []
-        counts = self.clustering_data.groupby(["Cluster_Label", "Cell_Type"]).size()
+        counts = self._clustering_data.groupby(["Cluster_Label", "Cell_Type"]).size()
         legend = [
             {
                 "cluster_label": int(label),
@@ -1937,13 +3020,13 @@ class EpiQuantAPI:
         all -- it recomputes the same adjacency check live from
         `clustering_data` + this frame's `boundary_labels`.
         """
-        if self.clustering_data is None:
+        if self._clustering_data is None:
             return None
         if frame_number in self._border_cell_cache:
             return self._border_cell_cache[frame_number]
         try:
             cells = manual_correction_classification.find_boundary_cells(
-                boundary_labels, frame_number, self.clustering_data,
+                boundary_labels, frame_number, self._clustering_data,
             )
         except ValueError:
             cells = None
@@ -1952,7 +3035,7 @@ class EpiQuantAPI:
         return result
 
     def get_classification_overlay(self, frame_number: int, render_mode: str = "mask") -> Optional[str]:
-        if self.clustering_data is None:
+        if self._clustering_data is None:
             return None
         loaded = self._load_frame(frame_number)
         if loaded is None:
@@ -1965,7 +3048,7 @@ class EpiQuantAPI:
         )
 
         overlay = rendering.render_classification_overlay(
-            label_array, base_image, frame_number, self.clustering_data, self.cluster_color_map,
+            label_array, base_image, frame_number, self._clustering_data, self.cluster_color_map,
             hidden_labels=self.hidden_cluster_labels or None,
             border_cell_indices=border_cell_indices,
             border_color=self.border_color,
@@ -1981,8 +3064,8 @@ class EpiQuantAPI:
         if cell_id is None:
             return None
         cell_index = f"Cell{frame_number}_{cell_id}"
-        if self.clustering_data is not None:
-            row = self.clustering_data[self.clustering_data["Cell_Index"] == cell_index]
+        if self._clustering_data is not None:
+            row = self._clustering_data[self._clustering_data["Cell_Index"] == cell_index]
             if not row.empty:
                 return {
                     "cell_index": cell_index,
@@ -1993,19 +3076,45 @@ class EpiQuantAPI:
 
     def reassign_cluster(self, cell_index: str, new_cluster_label: int) -> list[dict]:
         manual_correction_classification.update_clustering_data(
-            self.clustering_data, cell_index, int(new_cluster_label),
+            self._clustering_data, cell_index, int(new_cluster_label),
         )
         self._border_cell_cache.clear()
         return self.get_cluster_legend()
 
-    def save_classification(self) -> None:
+    #: What each save is allowed to write. The front end decides WHICH save to
+    #: call from the step the user is on; this decides whether the table it was
+    #: handed is the kind that belongs in that file. Two layers on purpose
+    #: (Round 29 §8): `currentStep()` is frontend code that will be
+    #: refactored, and the cost of it being wrong once is a classification
+    #: result written over a tracking table.
+    @staticmethod
+    def _refuse_wrong_table(table, kind: str) -> Optional[str]:
+        if table is None:
+            return f"Nothing to save: there is no {kind} table in memory."
+        columns = [str(c) for c in table.columns]
+        looks_tracking = any(re.fullmatch(r"Frame\d+", c) for c in columns)
+        looks_classification = "Cluster_Label" in columns or "Cell_Type" in columns
+        if kind == "classification" and (looks_tracking or not looks_classification):
+            return ("Refusing to save: this looks like a tracking table, not a classification "
+                    f"one (columns: {columns[:6]}). Nothing was written.")
+        if kind == "tracking" and (looks_classification or not looks_tracking):
+            return ("Refusing to save: this looks like a classification table, not a tracking "
+                    f"one (columns: {columns[:6]}). Nothing was written.")
+        return None
+
+    def save_classification(self) -> dict:
+        refusal = self._refuse_wrong_table(self._clustering_data, "classification")
+        if refusal:
+            logger.error(refusal)
+            return {"error": refusal}
         path = os.path.join(self.output_dirs["cell_classification_output"], "cells_clustering_results.xlsx")
-        common.save_modified_rows(self.clustering_data, path)
+        common.save_modified_rows(self._clustering_data, path)
+        return {"saved": path}
 
     def can_compute_leading_edge(self) -> bool:
-        if self.clustering_data is None:
+        if self._clustering_data is None:
             return False
-        return int(self.clustering_data["Cluster_Label"].nunique()) == 2
+        return int(self._clustering_data["Cluster_Label"].nunique()) == 2
 
     def compute_leading_edge_all_frames(self, threshold: float = 3) -> dict:
         if not self.can_compute_leading_edge():
@@ -2013,7 +3122,7 @@ class EpiQuantAPI:
 
         frame_numbers = sorted({
             int(match.group(1))
-            for match in (re.search(r"Cell(\d+)_", idx) for idx in self.cells_info["Cell Index"])
+            for match in (re.search(r"Cell(\d+)_", idx) for idx in self._cells_info["Cell Index"])
             if match
         })
         total = len(frame_numbers)
@@ -2024,25 +3133,25 @@ class EpiQuantAPI:
             if loaded is None:
                 continue
             _fill_labels, boundary_labels, _base_image = loaded
-            self.cells_info = manual_correction_classification.compute_leading_edge(
-                boundary_labels, frame_number, self.cells_info, self.clustering_data, threshold=threshold,
+            self._cells_info = manual_correction_classification.compute_leading_edge(
+                boundary_labels, frame_number, self._cells_info, self._clustering_data, threshold=threshold,
             )
             processed += 1
             self._notify("onProgress", {
                 "stage": "leading_edge", "message": f"Frame {frame_number}", "percent": int((i + 1) / total * 100),
             })
 
-        self.cells_info["modified"] = True
+        self._cells_info["modified"] = True
         return {"frames_processed": processed}
 
     def save_cells_info_leading_edge(self) -> None:
         path = os.path.join(self.output_dirs["cell_classification_output"], "Cells_info.xlsx")
-        manual_correction_classification.save_leading_edge_column(self.cells_info, path)
+        manual_correction_classification.save_leading_edge_column(self._cells_info, path)
 
     # ---- Track --------------------------------------------------------
 
     def get_tracking_mode_options(self) -> dict:
-        has_leading_edge = self.cells_info is not None and "leading_edge" in self.cells_info.columns
+        has_leading_edge = self._cells_info is not None and "leading_edge" in self._cells_info.columns
         return {
             "has_leading_edge": bool(has_leading_edge),
             "split_available": bool(has_leading_edge) and self.can_compute_leading_edge(),
@@ -2055,9 +3164,9 @@ class EpiQuantAPI:
 
     def _run_tracking(self, mode: str) -> None:
         try:
-            cells_info_for_tracking = self.cells_info
+            cells_info_for_tracking = self._cells_info
             if mode == "single":
-                cells_info_for_tracking = self.cells_info.drop(columns=["leading_edge"], errors="ignore")
+                cells_info_for_tracking = self._cells_info.drop(columns=["leading_edge"], errors="ignore")
             result = cell_tracking.track_all_populations(
                 cells_info_for_tracking, self.output_dirs["cell_track_output"],
                 progress_cb=self._progress_cb("track"),
@@ -2069,13 +3178,17 @@ class EpiQuantAPI:
                 motion_compensation=self.motion_compensation,
                 max_frame_gap=self.max_frame_gap,
                 drift_mode=self.drift_mode,
+                gate_scale=self.gate_scale,
                 drift_by_frame=(self._registration().get("drift_by_frame")
                                 if self.drift_mode != "none" else None),
             )
-            self.tracking_data = result
-            self.original_tracking_data = result.copy()
+            self._tracking_data = result
+            self._original_tracking_data = result.copy()
             self.tracking_drift_mode = self.drift_mode
-            self._notify("onTrackDone", {"track_count": int(len(result))})
+            counts = cell_tracking.count_tracks(result)
+            self._notify("onTrackDone", {"track_count": counts["rows"],
+                                         "tracks_with_cells": counts["with_cells"],
+                                         "empty_rows": counts["empty"]})
         except Exception as e:
             logger.exception("Tracking failed")
             self._notify("onTrackError", {"message": str(e)})
@@ -2228,8 +3341,8 @@ class EpiQuantAPI:
 
         fresh_info, _ = data_input.extract_cell_info(
             self.npy_folder, output_path=None, exclude_edge_cells=False, frames=set(frames))
-        self.cells_info = splice(self.cells_info, fresh_info)
-        self.cells_info.to_excel(os.path.join(folder, "Cells_info.xlsx"),
+        self._cells_info = splice(self._cells_info, fresh_info)
+        self._cells_info.to_excel(os.path.join(folder, "Cells_info.xlsx"),
                                  sheet_name="Cell", index=False)
         # The masks for these frames have just been re-read, which is the whole
         # reason this function exists -- so everything cached from the old ones
@@ -2242,14 +3355,14 @@ class EpiQuantAPI:
         if "Cells_shape.xlsx" in present:
             fresh_shape = shape_features.extract_shape_features(
                 self.npy_folder, output_path=None, frames=set(frames))
-            self.cells_shape = splice(self.cells_shape, fresh_shape)
-            self.cells_shape.to_excel(os.path.join(folder, "Cells_shape.xlsx"), index=False)
+            self._cells_shape = splice(self._cells_shape, fresh_shape)
+            self._cells_shape.to_excel(os.path.join(folder, "Cells_shape.xlsx"), index=False)
             report["recomputed"].append("shape")
         if "Cells_tissue.xlsx" in present:
             fresh_tissue = tissue_features.extract_tissue_features(
                 self.npy_folder, output_path=None, frames=set(frames))
-            self.cells_tissue = splice(self.cells_tissue, fresh_tissue)
-            self.cells_tissue.to_excel(os.path.join(folder, "Cells_tissue.xlsx"), index=False)
+            self._cells_tissue = splice(self._cells_tissue, fresh_tissue)
+            self._cells_tissue.to_excel(os.path.join(folder, "Cells_tissue.xlsx"), index=False)
             report["recomputed"].append("tissue")
 
         # C3a: the dataset-fitted tier CANNOT follow. The PCA basis is fit over
@@ -2276,7 +3389,7 @@ class EpiQuantAPI:
 
     def _run_local_retrack(self, start_frame: int, end_frame: int) -> None:
         try:
-            if self.cells_info is None or self.tracking_data is None:
+            if self._cells_info is None or self._tracking_data is None:
                 raise ValueError("Extract and track the movie before re-tracking a range.")
             cb = self._progress_cb("retrack")
 
@@ -2306,6 +3419,7 @@ class EpiQuantAPI:
                 drift_mode=self.drift_mode,
                 drift_by_frame=registration.get("drift_by_frame"),
                 max_frame_gap=self.max_frame_gap,
+                gate_scale=self.gate_scale,
             )
 
             # A3: the full run splits mes/epi into two INDEPENDENT assignment
@@ -2314,7 +3428,7 @@ class EpiQuantAPI:
             # full run cannot do -- and raises the displacement ceiling to the
             # max over both populations. Reuse `split_by_leading_edge` so the
             # split logic has exactly one implementation.
-            info = self.cells_info
+            info = self._cells_info
             if "leading_edge" in info.columns:
                 mes, epi = cell_tracking.split_by_leading_edge(info)
                 result = {"reconciled": [], "new_tracks": [], "frames": [], "relinked": 0}
@@ -2322,23 +3436,27 @@ class EpiQuantAPI:
                     if part.empty:
                         continue
                     piece = cell_tracking.retrack_frame_range(
-                        part.set_index("Cell Index"), self.tracking_data,
+                        part.set_index("Cell Index"), self._tracking_data,
                         start_frame, end_frame, **shared,
                     )
-                    self.tracking_data = piece.pop("tracking_data")
+                    self._tracking_data = piece.pop("tracking_data")
                     for key in ("reconciled", "new_tracks"):
                         result[key].extend(piece.get(key, []))
                     result["relinked"] += piece.get("relinked", 0)
                     result["frames"] = piece.get("frames", result["frames"])
             else:
                 result = cell_tracking.retrack_frame_range(
-                    info.set_index("Cell Index"), self.tracking_data,
+                    info.set_index("Cell Index"), self._tracking_data,
                     start_frame, end_frame, **shared,
                 )
-                self.tracking_data = result.pop("tracking_data")
+                self._tracking_data = result.pop("tracking_data")
 
             cb("Re-track complete.", 100)
-            self._notify("onRetrackDone", {**result, "track_count": int(len(self.tracking_data)),
+            self._notify("onRetrackDone", {
+                **result,
+                "track_count": int(len(self._tracking_data)),
+                "tracks_with_cells": cell_tracking.count_tracks(self._tracking_data)["with_cells"],
+                "empty_rows": cell_tracking.count_tracks(self._tracking_data)["empty"],
                                            "extraction": extraction})
         except Exception as e:
             logger.exception("Local re-track failed")
@@ -2475,32 +3593,32 @@ class EpiQuantAPI:
     def get_track_filmstrip(self, track_id: int) -> dict:
         """Which frames the track actually holds a cell in, so gaps are visible
         at a glance rather than discovered by stepping into them."""
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "No tracking data loaded."}
-        id_col = self.tracking_data.columns[0]
-        rows = self.tracking_data.index[self.tracking_data[id_col] == int(track_id)]
+        id_col = self._tracking_data.columns[0]
+        rows = self._tracking_data.index[self._tracking_data[id_col] == int(track_id)]
         if not len(rows):
             return {"error": f"Track {track_id} not found."}
         row = rows[0]
         frames = self.get_frame_numbers()
         held = [f for f in frames
-                if f"Frame{f}" in self.tracking_data.columns
-                and pd.notna(self.tracking_data.at[row, f"Frame{f}"])]
+                if f"Frame{f}" in self._tracking_data.columns
+                and pd.notna(self._tracking_data.at[row, f"Frame{f}"])]
         return {"track_id": int(track_id), "frames": frames, "held": held}
 
     def _anchor_window(self, track_id: int, anchor_frame: int, pad: int):
         """The one window shared by `anchor_frame` and its two neighbours."""
-        id_col = self.tracking_data.columns[0]
-        rows = self.tracking_data.index[self.tracking_data[id_col] == int(track_id)]
+        id_col = self._tracking_data.columns[0]
+        rows = self._tracking_data.index[self._tracking_data[id_col] == int(track_id)]
         if not len(rows):
             return None
         row = rows[0]
         boxes = []
         for number in (anchor_frame - 1, anchor_frame, anchor_frame + 1):
             column = f"Frame{number}"
-            if column not in self.tracking_data.columns:
+            if column not in self._tracking_data.columns:
                 continue
-            value = self.tracking_data.at[row, column]
+            value = self._tracking_data.at[row, column]
             if pd.isna(value):
                 continue
             loaded = self._load_frame(int(number))
@@ -2537,19 +3655,19 @@ class EpiQuantAPI:
         renders the neighbourhood so the gap can be seen, rather than going
         blank.
         """
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "No tracking data loaded."}
-        id_col = self.tracking_data.columns[0]
-        rows = self.tracking_data.index[self.tracking_data[id_col] == int(track_id)]
+        id_col = self._tracking_data.columns[0]
+        rows = self._tracking_data.index[self._tracking_data[id_col] == int(track_id)]
         if not len(rows):
             return {"error": f"Track {track_id} not found."}
         row = rows[0]
 
         def cell_at(number):
             column = f"Frame{number}"
-            if column not in self.tracking_data.columns:
+            if column not in self._tracking_data.columns:
                 return None
-            value = self.tracking_data.at[row, column]
+            value = self._tracking_data.at[row, column]
             return None if pd.isna(value) else str(value)
 
         loaded = self._load_frame(int(frame))
@@ -2613,7 +3731,7 @@ class EpiQuantAPI:
 
     def _census_masks(self) -> dict:
         masks = {}
-        for frame in tracking_benchmark.frame_numbers(self.tracking_data):
+        for frame in tracking_benchmark.frame_numbers(self._tracking_data):
             loaded = self._load_frame(frame)
             if loaded and loaded[0] is not None:
                 masks[frame] = loaded[0]
@@ -2649,7 +3767,7 @@ class EpiQuantAPI:
         registered tracker is the preprocessing mismatch that has already moved
         one figure from 4.9% to 14.0% on nothing but that switch.
         """
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "Track the movie before starting a census."}
         if mode not in ("census", "correct"):
             return {"error": f"Unknown census mode {mode!r}; expected 'census' or 'correct'."}
@@ -2668,10 +3786,10 @@ class EpiQuantAPI:
         if kind == "frame_pair":
             if frame is None:
                 return {"error": "A frame_pair census needs a frame number."}
-            items = census.frame_pair_items(self.tracking_data, masks, int(frame))
+            items = census.frame_pair_items(self._tracking_data, masks, int(frame))
         elif kind == "geometry_flagged":
             items = census.geometry_flagged_items(
-                self.tracking_data, masks, register=register, drift_by_frame=drift)
+                self._tracking_data, masks, register=register, drift_by_frame=drift)
         elif kind == "environment_flagged":
             # The repair tier (0.5), not the look tier (0.75): the look tier
             # flags several times as many cells, which is the wrong size for a
@@ -2685,24 +3803,25 @@ class EpiQuantAPI:
                 if per_frame:
                     scores[frame] = per_frame
             items = census.environment_flagged_items(
-                self.tracking_data, scores, masks,
+                self._tracking_data, scores, masks,
                 threshold=float(self.environment_repair_threshold))
         elif kind in ("forward_backward", "low_margin"):
             # Both re-solve the frame pairs, so both need the feature table and
             # the SAME cost the tracking ran under -- a queue built with a
             # different cost would be a queue for a different tracker. The
             # convention follows the run, like every other set here.
-            if self.cells_info is None:
+            if self._cells_info is None:
                 return {"error": "Extract the movie before building this set."}
-            info = self.cells_info.set_index("Cell Index")
+            info = self._cells_info.set_index("Cell Index")
             cost = {"overlap_weight": self.overlap_weight,
                     "centroid_weight": self.centroid_weight,
+                    "gate_scale": self.gate_scale,
                     "drift_mode": run_mode,
                     "drift_by_frame": drift}
             if kind == "forward_backward":
-                items = census.forward_backward_items(self.tracking_data, info, masks, **cost)
+                items = census.forward_backward_items(self._tracking_data, info, masks, **cost)
             else:
-                items = census.low_margin_items(self.tracking_data, info, masks,
+                items = census.low_margin_items(self._tracking_data, info, masks,
                                                 limit=self.low_margin_queue_limit, **cost)
         else:
             return {"error": f"Unknown census kind {kind!r}."}
@@ -2774,11 +3893,12 @@ class EpiQuantAPI:
             "frames": sorted(state["masks"]),
             "queue_size": len(state["queue"]),
             "tracking": {
-                "tracks": int(len(self.tracking_data)),
+                "tracks": int(len(self._tracking_data)),
                 "overlap_weight": self.overlap_weight,
                 "centroid_weight": self.centroid_weight,
                 "motion_compensation": self.motion_compensation,
                 "max_frame_gap": self.max_frame_gap,
+                "gate_scale": self.gate_scale,
                 "drift_mode": self.drift_mode,
                 # Which row set the tracking saw (Round 26 B2): since the
                 # border exclusion moved off the extraction path, a table
@@ -2930,7 +4050,7 @@ class EpiQuantAPI:
             # for (Round 17 C2b).
             image = rendering.draw_cell_labels(
                 image, labels, font_size=int(label_size),
-                matched_lookup=rendering.build_matched_lookup(self.tracking_data, int(frame_number)),
+                matched_lookup=rendering.build_matched_lookup(self._tracking_data, int(frame_number)),
                 frame_number=int(frame_number),
             )
         top, bottom, left, right = window
@@ -3545,10 +4665,10 @@ class EpiQuantAPI:
             return {"error": "Not a correction session."}
         if not state["edits"]:
             return {"error": "No pending corrections."}
-        snapshot = self.tracking_data.copy(deep=True)
+        snapshot = self._tracking_data.copy(deep=True)
         trial, displaced, taken_from = self._apply_census_edits_to(snapshot.copy(deep=True))
         report = manual_correction_tracking.diff_report(snapshot, trial)
-        assert self.tracking_data.astype(str).equals(snapshot.astype(str)), \
+        assert self._tracking_data.astype(str).equals(snapshot.astype(str)), \
             "previewing corrections must not mutate the live tracking table"
         return {
             **report,
@@ -3579,10 +4699,10 @@ class EpiQuantAPI:
             return {"error": "This batch would double-claim a cell or leave a track holding "
                              "nothing. Nothing was applied.", "preview": preview}
 
-        snapshot = self.tracking_data.copy(deep=True)
+        snapshot = self._tracking_data.copy(deep=True)
         asked_frames = sorted({e["frame"] + 1 for e in state["edits"].values()})
-        applied, displaced, taken_from = self._apply_census_edits_to(self.tracking_data)
-        self.tracking_data = applied
+        applied, displaced, taken_from = self._apply_census_edits_to(self._tracking_data)
+        self._tracking_data = applied
         state["undo"] = snapshot
         count = len(state["edits"])
         state["edits"] = {}
@@ -3632,7 +4752,7 @@ class EpiQuantAPI:
         state = getattr(self, "_census", None)
         if not state or state.get("undo") is None:
             return {"error": "Nothing to undo."}
-        self.tracking_data = state["undo"]
+        self._tracking_data = state["undo"]
         state["undo"] = None
         return {"restored": True}
 
@@ -3711,10 +4831,10 @@ class EpiQuantAPI:
         path = self._coverage_log_path()
         if path is None:
             return {"error": "Set up the project paths first."}
-        if self.cells_info is None:
+        if self._cells_info is None:
             return {"error": "Extract cell info before reading coverage."}
-        index = (self.cells_info["Cell Index"] if "Cell Index" in self.cells_info.columns
-                 else self.cells_info.index)
+        index = (self._cells_info["Cell Index"] if "Cell Index" in self._cells_info.columns
+                 else self._cells_info.index)
         cells_by_frame: dict = {}
         for value in index:
             match = re.match(r"Cell(\d+)_", str(value))
@@ -3734,13 +4854,13 @@ class EpiQuantAPI:
 
         The normal pipeline never reads `GT_*`; it is loaded only when asked.
         """
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "Track the movie before saving ground truth."}
         if not self.output_dirs:
             return {"error": "Set up the project paths first."}
         state = getattr(self, "_census", None)
         record = census.save_ground_truth(
-            self.output_dirs["cell_track_output"], self.tracking_data, self.tracking_data,
+            self.output_dirs["cell_track_output"], self._tracking_data, self._tracking_data,
             labeller=labeller or (state or {}).get("labeller", ""),
             note=note,
             session_id=(state or {}).get("session_id"),
@@ -3751,6 +4871,7 @@ class EpiQuantAPI:
                 "centroid_weight": self.centroid_weight,
                 "motion_compensation": self.motion_compensation,
                 "max_frame_gap": self.max_frame_gap,
+                "gate_scale": self.gate_scale,
                 "drift_mode": self.drift_mode,
                 # Which row set the tracking saw (Round 26 B2): since the
                 # border exclusion moved off the extraction path, a table
@@ -3771,7 +4892,7 @@ class EpiQuantAPI:
         if not self.output_dirs:
             return {"error": "Set up the project paths first."}
         found = census.load_ground_truth(self.output_dirs["cell_track_output"],
-                                         against=self.tracking_data)
+                                         against=self._tracking_data)
         if "error" in found:
             return found
         table = found.pop("table")
@@ -3796,13 +4917,13 @@ class EpiQuantAPI:
         GBE ground truth could only be produced by hand-writing a file.
         Ground truth remains the only judge that measures an accuracy.
         """
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "Track the movie before exporting links."}
         if path is None:
             path = os.path.join(self.output_dirs["cell_track_output"], "ground_truth_links.csv")
         if links is None:
             links = {}
-            for frame in tracking_benchmark.frame_numbers(self.tracking_data)[:-1]:
+            for frame in tracking_benchmark.frame_numbers(self._tracking_data)[:-1]:
                 here = self._label_to_track(frame)
                 there = {t: l for l, t in self._label_to_track(frame + 1).items()}
                 pairs = {label: there[track] for label, track in here.items() if track in there}
@@ -3822,9 +4943,9 @@ class EpiQuantAPI:
         if not os.path.exists(path):
             return {"error": f"No ground-truth file at {path}"}
         links = tracking_benchmark.load_link_csv(path)
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "Track the movie before scoring against ground truth."}
-        result = tracking_benchmark.ground_truth(self.tracking_data, gt_links=links)
+        result = tracking_benchmark.ground_truth(self._tracking_data, gt_links=links)
         result["path"] = path
         return result
 
@@ -3855,16 +4976,77 @@ class EpiQuantAPI:
         self._neighbor_graph_cache[frame_number] = graph
         return graph
 
+    def _get_weighted_neighbor_graph(self, frame_number: int) -> Optional[dict]:
+        """`{cell: {neighbour: overlap_px}}` -- the same dilation adjacency
+        with its strengths kept.
+
+        A separate cache rather than changing `_get_neighbor_graph`'s return
+        type: that one is the most widely shared of the per-frame caches
+        (`docs/cache-invalidation.md`), and every consumer of it treats the
+        value as a set."""
+        if frame_number in self._weighted_graph_cache:
+            return self._weighted_graph_cache[frame_number]
+        loaded = self._load_frame(frame_number)
+        graph = (adjacency.build_neighbor_graph(
+            loaded[0], dilation_px=int(self.t1_gap_px), return_weights=True)
+            if loaded is not None else None)
+        self._weighted_graph_cache[frame_number] = graph
+        return graph
+
+    def _get_interface_graph(self, frame_number: int) -> Optional[dict]:
+        """`{cell: {neighbour: shared_border_px}}` for `frame_number`, cached.
+
+        Costs 1.5-3.2x a dilation graph -- it bridges gaps first
+        (`segmentation_qc._bridge_gaps`), because Cellpose output often leaves
+        no two cells literally touching -- which is why it is cached at all:
+        the T1 overlay follows the player."""
+        if frame_number in self._interface_graph_cache:
+            return self._interface_graph_cache[frame_number]
+        loaded = self._load_frame(frame_number)
+        graph = (tissue_features.build_interface_graph(
+            loaded[0], min_interface_px=int(self.t1_min_interface_px),
+            max_gap_px=int(self.t1_gap_px), return_weights=True)
+            if loaded is not None else None)
+        self._interface_graph_cache[frame_number] = graph
+        return graph
+
+    def _t1_graph(self, frame_number: int) -> Optional[dict]:
+        """The adjacency T1 detection reads -- and, because this is the one
+        place that decides, the adjacency its persistence lookahead reads too.
+
+        Round 30 §A is why there is a single accessor: detection used the raw
+        graph while `_contacts_at` used a hysteretic one, so the two sides of
+        one verdict disagreed about what a contact is. Anything that wants
+        "the contacts T1 is working on" goes through here.
+
+        **One definition, not a menu** (Round 31 §D). The interface graph is
+        used; the dilation graph is the fallback for segmentation where
+        bridging still leaves no cell touching another, and which one was
+        used is recorded per frame rather than assumed."""
+        graph = self._get_interface_graph(frame_number)
+        if graph is not None and any(graph.values()):
+            self._t1_adjacency_used[frame_number] = "interface"
+            return graph
+        fallback = self._get_weighted_neighbor_graph(frame_number)
+        if fallback is None:
+            return graph
+        if graph is not None:
+            logger.warning("frame %s: the interface graph has no edges (segmentation where "
+                           "no two cells touch within %s px); falling back to dilation",
+                           frame_number, self.t1_gap_px)
+        self._t1_adjacency_used[frame_number] = "dilation (fallback)"
+        return fallback
+
     def _label_to_track(self, frame_number: int) -> dict:
         """`{raw_label: track_id}` for `frame_number`, from the live
         `tracking_data` -- recomputed per call (cheap) so it is never stale
         after a correction."""
         frame_col = f"Frame{frame_number}"
-        if self.tracking_data is None or frame_col not in self.tracking_data.columns:
+        if self._tracking_data is None or frame_col not in self._tracking_data.columns:
             return {}
-        id_col = self.tracking_data.columns[0]
+        id_col = self._tracking_data.columns[0]
         mapping = {}
-        for _, row in self.tracking_data[[id_col, frame_col]].dropna(subset=[frame_col]).iterrows():
+        for _, row in self._tracking_data[[id_col, frame_col]].dropna(subset=[frame_col]).iterrows():
             match = re.search(r"Cell\d+_(\d+)", str(row[frame_col]))
             if match:
                 mapping.setdefault(int(match.group(1)), int(row[id_col]))
@@ -3922,7 +5104,7 @@ class EpiQuantAPI:
         environment_direction: str = "prev", tint_other_cells: bool = False,
         show_nematic_axes: bool = True,
     ) -> Optional[str]:
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return None
         loaded = self._load_frame(frame_number)
         if loaded is None:
@@ -3935,7 +5117,7 @@ class EpiQuantAPI:
             if track_color_mode == "environment" else None
         )
         lifecycle_states = (
-            manual_correction_tracking.classify_track_lifecycle(self.tracking_data, frame_number)
+            manual_correction_tracking.classify_track_lifecycle(self._tracking_data, frame_number)
             if track_color_mode == "lifecycle" else None
         )
         dynamics_states = self._dynamics_states(frame_number) if track_color_mode == "dynamics" else None
@@ -3954,7 +5136,7 @@ class EpiQuantAPI:
             ]
 
         overlay = rendering.render_tracking_overlay(
-            label_array, base_image, frame_number, self.tracking_data, self.matched_color, self.unmatched_color,
+            label_array, base_image, frame_number, self._tracking_data, self.matched_color, self.unmatched_color,
             label_cells=show_labels, track_color_mode=track_color_mode, identity_palette=identity_palette,
             label_font_size=label_font_size,
             environment_scores=environment_scores, environment_lut=environment_lut,
@@ -3980,8 +5162,8 @@ class EpiQuantAPI:
         cell_index = f"Cell{frame_number}_{cell_id}"
         track_id = None
         frame_col = f"Frame{frame_number}"
-        if self.tracking_data is not None and frame_col in self.tracking_data.columns:
-            match = self.tracking_data[self.tracking_data[frame_col] == cell_index]
+        if self._tracking_data is not None and frame_col in self._tracking_data.columns:
+            match = self._tracking_data[self._tracking_data[frame_col] == cell_index]
             if not match.empty:
                 track_id = int(match.iloc[0, 0])
         return {"cell_index": cell_index, "cell_id": int(cell_id), "track_id": track_id}
@@ -3995,12 +5177,12 @@ class EpiQuantAPI:
         leaves every later frame still wrongly attached to `old_id`."""
         try:
             if propagate:
-                self.tracking_data, displaced = manual_correction_tracking.merge_tracks_from_frame(
-                    self.tracking_data, int(frame_number), int(old_id), int(new_id),
+                self._tracking_data, displaced = manual_correction_tracking.merge_tracks_from_frame(
+                    self._tracking_data, int(frame_number), int(old_id), int(new_id),
                 )
             else:
-                self.tracking_data, displaced = manual_correction_tracking.update_tracking_data(
-                    self.tracking_data, self.original_tracking_data, int(frame_number), int(old_id), int(new_id),
+                self._tracking_data, displaced = manual_correction_tracking.update_tracking_data(
+                    self._tracking_data, self._original_tracking_data, int(frame_number), int(old_id), int(new_id),
                 )
             return {"success": True, "displaced": displaced}
         except ValueError as e:
@@ -4009,11 +5191,11 @@ class EpiQuantAPI:
     def compute_propagation_stop_frame(
         self, frame_number: int, old_id: int, new_id: int, max_frames_ahead: int = 20,
     ) -> dict:
-        if self.tracking_data is None or self.cells_info is None:
+        if self._tracking_data is None or self._cells_info is None:
             return {"error": "No tracking data loaded."}
         try:
             return manual_correction_tracking.find_propagation_stop_frame(
-                self.tracking_data, self.cells_info,
+                self._tracking_data, self._cells_info,
                 lambda f: (self._load_frame(f) or (None, None, None))[0],
                 int(frame_number), int(old_id), int(new_id), max_frames_ahead=int(max_frames_ahead),
             )
@@ -4045,7 +5227,7 @@ class EpiQuantAPI:
            clean inverse. Every trial therefore runs against a deep copy and the
            live table is never touched until the caller applies a choice.
         """
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "No tracking data loaded."}
         masks = {}
         low = max(int(frame_number), 1)
@@ -4059,7 +5241,7 @@ class EpiQuantAPI:
             return {"error": "Not enough frames with masks to score this range."}
         drift = self._registration().get("drift_by_frame") if self.register_reference else None
 
-        snapshot = self.tracking_data.copy(deep=True)
+        snapshot = self._tracking_data.copy(deep=True)
         candidates, best = [], None
         for candidate in range(max(int(frame_number) + 1, int(end_frame) - int(span)),
                                int(end_frame) + int(span) + 1):
@@ -4083,7 +5265,7 @@ class EpiQuantAPI:
 
         # The live table must be untouched by scoring. Asserted, not assumed:
         # this is the whole safety property of an accept-and-revert loop.
-        assert self.tracking_data.astype(str).equals(snapshot.astype(str)), \
+        assert self._tracking_data.astype(str).equals(snapshot.astype(str)), \
             "scoring must not mutate the live tracking table"
 
         return {
@@ -4097,8 +5279,8 @@ class EpiQuantAPI:
 
     def apply_smart_stop_merge(self, frame_number: int, old_id: int, new_id: int, end_frame: int) -> dict:
         try:
-            self.tracking_data, displaced = manual_correction_tracking.merge_tracks_from_frame(
-                self.tracking_data, int(frame_number), int(old_id), int(new_id), end_frame=int(end_frame),
+            self._tracking_data, displaced = manual_correction_tracking.merge_tracks_from_frame(
+                self._tracking_data, int(frame_number), int(old_id), int(new_id), end_frame=int(end_frame),
             )
             return {"success": True, "displaced": displaced}
         except ValueError as e:
@@ -4119,11 +5301,11 @@ class EpiQuantAPI:
         matters (without it the walk can drift onto a neighbour another
         track legitimately owns and then follow the wrong cell for every
         later frame)."""
-        if self.tracking_data is None or self.cells_info is None:
+        if self._tracking_data is None or self._cells_info is None:
             return {"error": "No tracking data loaded."}
         try:
             return manual_correction_tracking.find_confirmed_identity_moves(
-                self.tracking_data, self.cells_info,
+                self._tracking_data, self._cells_info,
                 lambda f: (self._load_frame(f) or (None, None, None))[0],
                 int(frame_number), int(track_id), max_frames_ahead=int(max_frames_ahead),
                 restrict_to_unmatched=bool(restrict_to_unmatched),
@@ -4167,22 +5349,22 @@ class EpiQuantAPI:
         that assertion is the safety property of an accept-and-revert loop, and
         it is not optional.
         """
-        if self.tracking_data is None or self.cells_info is None:
+        if self._tracking_data is None or self._cells_info is None:
             return {"error": "No tracking data loaded."}
         if not moves:
             return {"error": "This plan has no moves to verify."}
 
         structural = manual_correction_tracking.verify_moves_plan(
-            self.tracking_data, int(track_id), moves)
+            self._tracking_data, int(track_id), moves)
         if not structural.get("ok"):
             return {"error": structural.get("error", "The plan could not be applied.")}
 
         # Per-move gate context. `distance` is already in the plan and nothing
         # displayed it; the gate is what admitted the step, so the ratio is the
         # readable number.
-        radii = (self.cells_info.set_index("Cell Index")["Circumscribed Circle Radius"]
-                 if "Cell Index" in self.cells_info.columns
-                 else self.cells_info["Circumscribed Circle Radius"])
+        radii = (self._cells_info.set_index("Cell Index")["Circumscribed Circle Radius"]
+                 if "Cell Index" in self._cells_info.columns
+                 else self._cells_info["Circumscribed Circle Radius"])
         annotated = []
         for move in moves:
             radius = float(radii.get(move["cell_index"], float("nan"))) if len(radii) else float("nan")
@@ -4205,12 +5387,12 @@ class EpiQuantAPI:
                     masks[frame] = loaded[0]
 
         delta = None
-        snapshot = self.tracking_data.copy(deep=True)
+        snapshot = self._tracking_data.copy(deep=True)
         if len(masks) >= 2:
             drift = self._registration().get("drift_by_frame") if self.register_reference else None
             drift_mode = "mask" if drift else "none"
-            cells = (self.cells_info.set_index("Cell Index")
-                     if "Cell Index" in self.cells_info.columns else self.cells_info)
+            cells = (self._cells_info.set_index("Cell Index")
+                     if "Cell Index" in self._cells_info.columns else self._cells_info)
             score = lambda table: tracking_benchmark.table_link_consistency(  # noqa: E731
                 table, cells, masks, frames=pairs,
                 drift_mode=drift_mode, drift_by_frame=drift)
@@ -4233,7 +5415,7 @@ class EpiQuantAPI:
 
         # The live table must be untouched by verification. Asserted, not
         # assumed: this is the whole safety property of an accept-and-revert.
-        assert self.tracking_data.astype(str).equals(snapshot.astype(str)), \
+        assert self._tracking_data.astype(str).equals(snapshot.astype(str)), \
             "verifying a plan must not mutate the live tracking table"
 
         return {
@@ -4246,8 +5428,8 @@ class EpiQuantAPI:
 
     def apply_confirmed_identity_moves(self, track_id: int, moves: list) -> dict:
         try:
-            self.tracking_data, displaced_list = manual_correction_tracking.apply_confirmed_identity_moves(
-                self.tracking_data, int(track_id), moves,
+            self._tracking_data, displaced_list = manual_correction_tracking.apply_confirmed_identity_moves(
+                self._tracking_data, int(track_id), moves,
             )
             return {"success": True, "displaced_list": displaced_list}
         except ValueError as e:
@@ -4261,18 +5443,18 @@ class EpiQuantAPI:
         try:
             if propagate:
                 result = manual_correction_tracking.swap_tracks_from_frame(
-                    self.tracking_data, int(frame_number), int(id_a), int(id_b),
+                    self._tracking_data, int(frame_number), int(id_a), int(id_b),
                 )
                 return {"success": True, **result}
             manual_correction_tracking.swap_tracks_at_frame(
-                self.tracking_data, int(frame_number), int(id_a), int(id_b),
+                self._tracking_data, int(frame_number), int(id_a), int(id_b),
             )
             return {"success": True}
         except ValueError as e:
             return {"error": str(e)}
 
     def suggest_match_candidates(self, frame_number: int, cell_index: str, top_k: int = 3) -> dict:
-        if self.cells_info is None or self.tracking_data is None:
+        if self._cells_info is None or self._tracking_data is None:
             return {"candidates": []}
         try:
             # Topology confirmation, when both frames' graphs are available.
@@ -4286,7 +5468,7 @@ class EpiQuantAPI:
                           self._label_to_track(int(frame_number) - 1),
                           self._label_to_track(int(frame_number)))
             candidates = manual_correction_tracking.suggest_match_candidates(
-                self.cells_info, self.tracking_data, int(frame_number), cell_index,
+                self._cells_info, self._tracking_data, int(frame_number), cell_index,
                 lambda f: (self._load_frame(f) or (None, None, None))[0],
                 top_k=int(top_k), topology_graphs=graphs,
             )
@@ -4296,25 +5478,47 @@ class EpiQuantAPI:
 
     def add_tracking_id(self, frame_number: int, new_index: int, cell_id_str: str) -> dict:
         try:
-            self.tracking_data, displaced = manual_correction_tracking.add_tracking_id(
-                self.tracking_data, int(frame_number), int(new_index), cell_id_str,
+            self._tracking_data, displaced = manual_correction_tracking.add_tracking_id(
+                self._tracking_data, int(frame_number), int(new_index), cell_id_str,
             )
             return {"success": True, "displaced": displaced}
         except KeyError as e:
             return {"error": str(e)}
 
-    def save_tracking(self) -> None:
+    def save_tracking(self) -> dict:
+        refusal = self._refuse_wrong_table(self._tracking_data, "tracking")
+        if refusal:
+            logger.error(refusal)
+            return {"error": refusal}
         path = os.path.join(
             self.output_dirs["cell_track_output"], "all_cell_tracking", "all_cell_merged_tracking_results.xlsx",
         )
-        manual_correction_tracking.save_tracking_data(self.tracking_data, path)
+        manual_correction_tracking.save_tracking_data(self._tracking_data, path)
+        return {"saved": path}
 
     # ---- Trajectory --------------------------------------------------------
 
-    def get_track_numbers(self) -> list[int]:
-        if self.tracking_data is None:
+    def get_track_numbers(self, with_cells_only: bool = True) -> list[int]:
+        """Track ids to offer in the picker.
+
+        Rows that claim no cell in any frame are left out by default: picking
+        one can only ever show "No frame data for this track", and a picker
+        37 entries longer than anything that can be displayed is the same
+        145-vs-108 confusion in another place. `with_cells_only=False` returns
+        every row, for anything that needs to reason about the file itself."""
+        if self._tracking_data is None:
             return []
-        return sorted(int(v) for v in self.tracking_data.iloc[:, 0].tolist())
+        table = self._tracking_data
+        if with_cells_only:
+            frame_columns = [c for c in table.columns if re.fullmatch(r"Frame\d+", str(c))]
+            if frame_columns:
+                table = table[table[frame_columns].notna().any(axis=1)]
+        return sorted(int(v) for v in table.iloc[:, 0].tolist())
+
+    def get_track_counts(self) -> dict:
+        """`{rows, with_cells, empty}` -- one definition, shared by every
+        reporter (`cell_tracking.count_tracks`)."""
+        return cell_tracking.count_tracks(self._tracking_data)
 
     # --- Track-level visual inspection (Round 27 4b) -----------------------
 
@@ -4323,13 +5527,13 @@ class EpiQuantAPI:
         `None` for a gap. Resolved here rather than taken from the frontend:
         the mark is evidence, and evidence about which cell was on screen must
         come from the table that put it there."""
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return None
         column = f"Frame{int(frame_number)}"
-        if column not in self.tracking_data.columns:
+        if column not in self._tracking_data.columns:
             return None
-        id_col = self.tracking_data.columns[0]
-        rows = self.tracking_data[self.tracking_data[id_col] == int(track_number)]
+        id_col = self._tracking_data.columns[0]
+        rows = self._tracking_data[self._tracking_data[id_col] == int(track_number)]
         if rows.empty:
             return None
         value = rows.iloc[0][column]
@@ -4338,12 +5542,19 @@ class EpiQuantAPI:
     def start_track_inspection(self, labeller: str = "") -> dict:
         """Begin a pass over every track. Writes nothing yet -- the file is
         created by the first mark, and the provenance by `finish`."""
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"error": "Track the movie before inspecting it."}
         tracks = self.get_track_numbers()
         if not tracks:
             return {"error": "This tracking table holds no tracks."}
+        # The pass covers tracks that can actually be DISPLAYED. A row holding
+        # no cell cannot be looked at, so counting it would inflate the
+        # denominator of "how much of this table was inspected". The counts go
+        # into the provenance so the change is on the record rather than
+        # implied by a number that quietly moved.
+        counts = self.get_track_counts()
         self._inspection = {
+            "track_counts": counts,
             "session_id": coverage_log.new_session_id(),
             "labeller": labeller,
             "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -4398,6 +5609,11 @@ class EpiQuantAPI:
             "labeller": state["labeller"],
             "kind": "track_inspection",
             "tracks_total": len(tracks),
+            # What "total" counts, spelled out: rows that hold at least one
+            # cell. A row claiming no cell anywhere cannot be displayed, so it
+            # is not part of the pass -- and the file's own row count is here
+            # beside it so the two can never read as a contradiction.
+            "track_counts": state.get("track_counts"),
             "tracks_inspected": len(seen),
             "tracks_not_inspected": unseen,
             "marks": summary["marks"],
@@ -4410,11 +5626,12 @@ class EpiQuantAPI:
             "min_cell_area_px": data_input.get_min_cell_area(),
             "exclude_edge_cells": self.exclude_edge_cells,
             "tracking": {
-                "tracks": int(len(self.tracking_data)),
+                "tracks": int(len(self._tracking_data)),
                 "overlap_weight": self.overlap_weight,
                 "centroid_weight": self.centroid_weight,
                 "motion_compensation": self.motion_compensation,
                 "max_frame_gap": self.max_frame_gap,
+                "gate_scale": self.gate_scale,
                 "drift_mode": self.tracking_drift_mode or self.drift_mode,
             },
         }
@@ -4429,9 +5646,9 @@ class EpiQuantAPI:
         return {**record, "marks_by_track": summary["marks_by_track"], "path": state["path"]}
 
     def get_track_frame_range(self, track_number: int) -> Optional[dict]:
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return None
-        cell_ids = trajectory_visualization.get_track_cell_ids(self.tracking_data, int(track_number))
+        cell_ids = trajectory_visualization.get_track_cell_ids(self._tracking_data, int(track_number))
         frames = [
             int(match.group(1))
             for cid in cell_ids if isinstance(cid, str)
@@ -4453,7 +5670,7 @@ class EpiQuantAPI:
         playback and zoom, which is what reading division / delamination / T1
         actually needs.
         """
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return None
         loaded = self._load_frame(frame_number)
         if loaded is None:
@@ -4473,7 +5690,7 @@ class EpiQuantAPI:
                     if axis.get("state", "persistent") in keep
                 ]
             overlay = rendering.render_tracking_overlay(
-                label_array, base_image, frame_number, self.tracking_data,
+                label_array, base_image, frame_number, self._tracking_data,
                 self.matched_color, self.unmatched_color,
                 label_cells=False, track_color_mode="dynamics",
                 dynamics_states=self._dynamics_states(frame_number),
@@ -4483,7 +5700,13 @@ class EpiQuantAPI:
             )
             return rendering.encode_png_base64(overlay)
 
-        cell_ids = trajectory_visualization.get_track_cell_ids(self.tracking_data, int(track_number))
+        # Round 32 T1-4: the highlight view needs a track, and the frontend
+        # can reach here without one (no track selected, or an empty track
+        # list). That used to be `int(None)` -> TypeError; it is now the same
+        # "nothing to highlight" exit as a track absent from this frame.
+        if track_number is None:
+            return None
+        cell_ids = trajectory_visualization.get_track_cell_ids(self._tracking_data, int(track_number))
         target_prefix = f"Cell{frame_number}_"
         match = next((cid for cid in cell_ids if isinstance(cid, str) and cid.startswith(target_prefix)), None)
         if match is None:
@@ -4508,7 +5731,7 @@ class EpiQuantAPI:
         # unreadable mask -- and each produced `{}`, which the render branch
         # draws as nothing at all. The view then looked identical to the mode
         # being switched off, so "is it broken?" was a hunt instead of a glance.
-        if self.tracking_data is None:
+        if self._tracking_data is None:
             return {"states": {}, "detail": {}, "counts": {}, "reason": "not_tracked",
                     "message": "Track the movie before checking link agreement."}
         frames = self.get_frame_numbers()
@@ -4526,7 +5749,7 @@ class EpiQuantAPI:
             masks[frame] = loaded[0]
         registration = self._registration()
         entries = tracking_benchmark.classify_links(
-            self.tracking_data, masks, frame_number,
+            self._tracking_data, masks, frame_number,
             register=bool(registration.get("register")) and self.register_reference,
             drift_by_frame=registration.get("drift_by_frame"),
         )
@@ -4570,7 +5793,7 @@ class EpiQuantAPI:
                     masks[frame] = loaded[0]
             if not masks:
                 return {"register": False, "drift_by_frame": {}}
-            info = self.cells_info.set_index("Cell Index") if self.cells_info is not None else None
+            info = self._cells_info.set_index("Cell Index") if self._cells_info is not None else None
             self._registration_cache = tracking_benchmark.registration_decision(masks, info)
         return self._registration_cache
 
@@ -4598,6 +5821,1902 @@ class EpiQuantAPI:
         self.register_reference = bool(enabled)
         return self.get_registration_status()
 
+    # ---- Plots: style, data layer, charts, export -------------------------
+    #
+    # One pattern for every chart in steps 7 and 8. `_chart` renders a figure
+    # and REMEMBERS how it was built; `export_chart` rebuilds it from that
+    # record rather than keeping a figure alive. So a PNG, an SVG and the
+    # source data always describe the same picture, and nothing is held in
+    # memory between a render and an export that may never come.
+
+    #: What each control is CALLED. R35 0-B: a menu entry is a name; the
+    #: millimetres and points went into the tooltips, because an option long
+    #: enough to widen its own control is a worse way to tell someone that a
+    #: double column is 180 mm.
+    SIZE_LABELS = {"single": "Single column", "one_and_half": "1.5 column",
+                   "double": "Double column"}
+    FONT_SIZE_LABELS = {"S": "Small", "M": "Medium", "L": "Large"}
+    LINE_LABELS = {"thin": "Thin", "normal": "Normal"}
+
+    def get_plot_options(self) -> dict:
+        """Everything the Figure-settings popover needs to populate itself."""
+        return {
+            "styles": plotkit.available_styles(),
+            "fonts": plotkit.available_fonts(),
+            "font_stack": plotkit.FONT_STACK,
+            "size_presets": [{"value": k, "label": self.SIZE_LABELS.get(k, k),
+                              "title": f"{v:g} mm wide"}
+                             for k, v in plotkit.WIDTH_MM.items()],
+            "font_sizes": [{"value": k, "label": self.FONT_SIZE_LABELS.get(k, k),
+                            "title": f"{v:g} pt"}
+                           for k, v in plotkit.FONT_PT.items()],
+            "line_widths": [{"value": k, "label": self.LINE_LABELS.get(k, k),
+                             "title": f"{v:g} pt"}
+                            for k, v in plotkit.LINE_PT.items()],
+            "error_bands": list(plots.ERROR_BANDS),
+            "current": dict(self.plot_settings),
+        }
+
+    # --- the bridge contract, checked rather than assumed ------------------
+
+    #: Methods the frontend is allowed not to have, and why. Everything else
+    #: `app.js` calls must exist here with a compatible signature.
+    _JS_CALL_EXEMPT: tuple = ()
+
+    @classmethod
+    def check_js_api_signatures(cls, app_js_path: str) -> list:
+        """Every `window.EpiQuantAPI.<name>(...)` in `app.js`, checked against
+        the real method. Returns a list of problem strings; empty is a pass.
+
+        This exists because the dev mock cannot check it. pywebview marshals a
+        JS call into **positional** Python arguments, so three things break
+        silently in the real window while the mock is happy:
+
+        - a `**kwargs` or keyword-only signature (JS passes an object, Python
+          sees one positional argument) -- Round 34's `set_plot_settings`;
+        - more arguments at the call site than the method accepts;
+        - a method the frontend calls that does not exist at all.
+
+        The scan is deliberately syntactic: it reads what `app.js` actually
+        writes rather than what anyone believes it writes."""
+        import inspect
+
+        source = open(app_js_path, encoding="utf-8").read()
+        problems = []
+        for match in re.finditer(r"window\.EpiQuantAPI\.([A-Za-z_]\w*)\s*\(", source):
+            name = match.group(1)
+            if name in cls._JS_CALL_EXEMPT:
+                continue
+            method = getattr(cls, name, None)
+            if method is None or not callable(method):
+                problems.append(f"{name}: app.js calls it, EpiQuantAPI has no such method")
+                continue
+            signature = inspect.signature(method)
+            parameters = [p for p in signature.parameters.values() if p.name != "self"]
+            bad_kinds = [p.name for p in parameters
+                         if p.kind in (p.VAR_KEYWORD, p.KEYWORD_ONLY)]
+            if bad_kinds:
+                problems.append(
+                    f"{name}: {', '.join(bad_kinds)} cannot be reached over the pywebview "
+                    "bridge, which passes arguments positionally")
+                continue
+            if any(p.kind == p.VAR_POSITIONAL for p in parameters):
+                continue                       # *args takes whatever it is given
+            passed = _count_js_arguments(source, match.end())
+            if passed is None:
+                continue                       # unparsable call; not a finding
+            if passed > len(parameters):
+                problems.append(
+                    f"{name}: app.js passes {passed} argument(s), the method takes "
+                    f"{len(parameters)}")
+        return problems
+
+    def set_plot_settings(self, settings: dict = None) -> dict:
+        """Session-only. A style change re-renders; it never touches a file.
+
+        **Takes the dict positionally, not `**kwargs`.** pywebview's bridge
+        passes JS arguments positionally, so a `**kwargs` signature raises
+        `takes 1 positional argument but 2 were given` the moment the frontend
+        calls it -- which is exactly what every Style / Font / Size / Error
+        change did in the real window after Round 34, while the dev mock
+        (whose own signature took one object) worked perfectly. See
+        `_check_js_api_signatures`, which now fails the build for this shape."""
+        settings = dict(settings or {})
+        unknown = [k for k in settings if k not in self.plot_settings]
+        if unknown:
+            raise ValueError(f"unknown plot setting(s) {unknown}")
+        self.plot_settings.update({k: v for k, v in settings.items() if v is not None})
+        _, note = plotkit.resolve_font(self.plot_settings.get("font_family"))
+        return {"settings": dict(self.plot_settings), "note": note}
+
+    def _cell_table(self):
+        """The project's data layer, rebuilt when the tracking table changes.
+
+        `tracking_saved` is false while there are unsaved corrections, and it
+        rides along into every figure's provenance -- a plot made from an
+        edited-but-unsaved table is reproducible only from this session."""
+        version = self._tracking_version()
+        unsaved = (self._tracking_data is not None and self._original_tracking_data is not None
+                   and not self._tracking_data.equals(self._original_tracking_data))
+        cached = getattr(self, "_cell_table_cache", None)
+        if cached is not None and cached.version == version:
+            # version is the TRACKING hash AND the table generation (R35 2-3):
+            # keyed on the tracking hash alone, re-extracting Cells_shape or
+            # Cells_tissue left this cache serving the old tables, because the
+            # tracking table had not changed.
+            cached.pixel_size_um = self.pixel_size_um
+            cached.frame_interval_sec = self.frame_interval_sec
+            cached.tracking_saved = not unsaved
+            return cached
+        table = cell_table.CellTable(
+            tracking_data=self._tracking_data,
+            cells_info=self._cells_info,
+            cells_shape=self._cells_shape,
+            cells_tissue=self._cells_tissue,
+            cells_pca=self._load_pca_scores(),
+            pixel_size_um=self.pixel_size_um,
+            frame_interval_sec=self.frame_interval_sec,
+            tracking_saved=not unsaved,
+            version=version,
+        )
+        self._cell_table_cache = table
+        return table
+
+    def _tracking_version(self) -> int:
+        """The cache key for everything derived from the source tables.
+
+        Two parts, because two different things can change: `_tables_version`
+        counts assignments to any source table (so a re-extracted
+        `Cells_shape` invalidates the cache even though tracking is
+        untouched), and the tracking hash catches a correction applied to
+        `_tracking_data` IN PLACE, which no assignment counter can see."""
+        generation = getattr(self, "_tables_version", 0)
+        if self._tracking_data is None:
+            return -1 - generation * 1_000_003
+        content = int(pd.util.hash_pandas_object(self._tracking_data, index=True).sum())
+        return content ^ (generation * 1_000_003)
+
+    def _load_pca_scores(self) -> Optional[pd.DataFrame]:
+        """`Cells_info_PCA.xlsx`, read once per project. It is written by
+        Classify and never corrected in place, so unlike the tracking table it
+        can be cached on the path alone."""
+        if not self.output_dirs:
+            return None
+        path = os.path.join(self.output_dirs["cell_classification_output"], "Cells_info_PCA.xlsx")
+        try:
+            stat = os.stat(path)
+            key = (path, stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            key = (path, None, None)
+        # Keyed on the path ALONE until R35 2-3 -- and re-running Classify
+        # writes the same path, so every PC plot went on using the previous
+        # run's scores. mtime and size are what make "the file changed"
+        # visible without reading it.
+        if getattr(self, "_pca_scores_key", None) == key:
+            return self._pca_scores_cache
+        self._pca_scores_key = key
+        self._pca_scores_cache = None
+        if key[1] is not None:
+            try:
+                scores = pd.read_excel(path, index_col=0)
+                # A table written before Round 34 still carries `PC_score`, a
+                # variance-weighted sum of arbitrarily-signed scores that only
+                # ever existed to sort the rows. It was retired, so it must not
+                # come back as a selectable value -- and on
+                # `AS_LE_lateral view_E-cad`, whose outputs predate that round,
+                # it is the column that emptied the whole value catalog.
+                retired = [c for c in scores.columns if c == "PC_score"]
+                if retired:
+                    logger.info("%s predates Round 34: dropping %s",
+                                os.path.basename(path), ", ".join(retired))
+                    scores = scores.drop(columns=retired)
+                self._pca_scores_cache = scores
+            except (OSError, ValueError) as error:
+                logger.warning("could not read %s: %s", path, error)
+        return self._pca_scores_cache
+
+    def get_value_catalog(self) -> dict:
+        """The searchable value list for the chip pickers, plus whether PC
+        values may be used at all (0-3) and what to warn about (0-2)."""
+        try:
+            table = self._cell_table()
+            catalog = table.value_catalog()
+            if self._tracking_data is not None:
+                # R35 3-3: mappable like any other value, and the only one that
+                # comes from the tracking table rather than a Cells_* sheet.
+                catalog.append({"column": self.TRACK_ID_VALUE, "source": "Tracking",
+                                "dimension": "none", "label": self.TRACK_ID_VALUE,
+                                "is_pc": False, "map_only": True})
+        except Exception as error:  # no tracking yet, or no tables loaded
+            return {"values": [], "error": str(error), "pc": self.get_pc_availability()}
+        return {"values": catalog, "error": None, "pc": self.get_pc_availability(),
+                # Columns this version does not recognise -- an older project's
+                # leftovers. Reported, not silently dropped.
+                "skipped": table.unknown_columns()}
+
+    # --- time window -------------------------------------------------------
+
+    def get_time_window(self, step: str = "trajectory") -> dict:
+        """The window's current bounds, in both frames and seconds.
+
+        Seconds are offered only when the frame interval is set; the rest of
+        the time the user types frame numbers, because a seconds field with no
+        interval behind it invents a timebase."""
+        try:
+            table = self._cell_table()
+            frames = table.frames()
+            first, last = int(frames.min()), int(frames.max())
+        except Exception as error:
+            return {"available": False, "reason": str(error)}
+        window = self.time_windows.get(step) or (first, last)
+        interval = self.frame_interval_sec
+        return {
+            "available": True, "first_frame": first, "last_frame": last,
+            "start_frame": int(window[0]), "end_frame": int(window[1]),
+            "frame_interval_sec": interval,
+            "unit": "seconds" if interval else "frames",
+            "start_sec": (window[0] - first) * interval if interval else None,
+            "end_sec": (window[1] - first) * interval if interval else None,
+        }
+
+    def set_time_window(self, start, end, step: str = "trajectory",
+                        unit: str = "frames") -> dict:
+        """Set the shared window for `step`. In seconds, time zero is the
+        movie's FIRST frame number, which is 0 on GBE and 1 elsewhere."""
+        table = self._cell_table()
+        frames = table.frames()
+        first, last = int(frames.min()), int(frames.max())
+        if unit == "seconds":
+            if not self.frame_interval_sec:
+                raise ValueError("No frame interval is set, so a window in seconds has no meaning.")
+            start = first + round(float(start) / self.frame_interval_sec)
+            end = first + round(float(end) / self.frame_interval_sec)
+        start, end = int(max(first, min(last, start))), int(max(first, min(last, end)))
+        if end < start:
+            start, end = end, start
+        self.time_windows[step] = (start, end)
+        self._chart_specs.clear()
+        return self.get_time_window(step)
+
+    def _window(self, step: str):
+        return self.time_windows.get(step)
+
+    # --- chart plumbing ----------------------------------------------------
+
+    def _style_kwargs(self) -> dict:
+        """`plot_settings` minus the entries that are not Matplotlib style --
+        the size preset is read by each builder (it decides the figure's
+        physical width) and the error band by the chart that draws one."""
+        return {k: v for k, v in self.plot_settings.items()
+                if k in ("style", "font_size", "line_width", "font_family")}
+
+    #: The preview is rendered at the SAME dpi the export uses (R35 1-4), so
+    #: what is on screen is the file that will be written.
+    PREVIEW_DPI = 600
+
+    def _figure_png(self, figure) -> str:
+        """The preview image: the export's own `savefig`, nothing else.
+
+        It used to be `dpi=150` **plus `bbox_inches="tight"`**, which crops to
+        the ink and so produces a different aspect ratio from the uncropped
+        export -- the preview and the saved figure were literally not the same
+        picture. Both now take the same path; only `dpi` could differ, and it
+        no longer does."""
+        buffer = BytesIO()
+        with mpl.rc_context({"svg.fonttype": "none", "path.simplify": False}):
+            figure.savefig(buffer, format="png", dpi=self.PREVIEW_DPI,
+                           facecolor=figure.get_facecolor(),
+                           edgecolor=figure.get_edgecolor())
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    def _chart(self, chart_id: str, build, spec: dict) -> dict:
+        """Render `build(spec)` and remember both, so the export menu can
+        rebuild exactly this picture."""
+        import matplotlib.pyplot as plt
+
+        self._chart_specs[chart_id] = (build, dict(spec))
+        with plotkit.style_context(**self._style_kwargs()):
+            result = build(spec)
+        figure = result["figure"]
+        payload = {
+            "image": self._figure_png(figure),
+            "note": result.get("note"),
+            "warning": result.get("warning"),
+            "chart_id": chart_id,
+            # The frontend shows the image at its PHYSICAL width, so a 600 dpi
+            # preview is crisp on a Retina screen instead of six times too big.
+            "width_mm": plotkit.WIDTH_MM[self.plot_settings["size_preset"]],
+        }
+        plt.close(result["figure"])
+        return payload
+
+    def _chart_provenance(self) -> dict:
+        """What every exported figure and source-data sheet carries.
+
+        `drift_mode` is the one the TRACKING RUN used, not the current UI
+        setting -- reading `self.drift_mode` here would report a convention the
+        data was not produced under (Round 18 D1)."""
+        table = self._cell_table()
+        return {
+            **table.provenance(),
+            "tracking_drift_mode": self.tracking_drift_mode,
+            "plot_settings": dict(self.plot_settings),
+            "exported_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        }
+
+    def export_chart(self, chart_id: str, kind: str = "png") -> dict:
+        """The right-click menu: `png` (600 dpi), `svg`, or `xlsx` of the
+        source data. Writes into `quantitative_analysis_output/` with a
+        timestamped name and never overwrites."""
+        import matplotlib.pyplot as plt
+
+        if chart_id not in self._chart_specs:
+            return {"error": "That chart has not been drawn yet."}
+        build, spec = self._chart_specs[chart_id]
+        directory = self.output_dirs["quantitative_analysis_output"]
+        if chart_id.startswith("cell_map"):
+            return self._export_image_chart(chart_id, kind, build, spec, directory)
+        with plotkit.style_context(**self._style_kwargs()):
+            result = build(spec)
+        figure = result["figure"]
+        try:
+            if kind in ("png", "svg"):
+                path = plotkit.timestamped(directory, chart_id, kind)
+                report = plotkit.save(figure, path, png_dpi=600, close=False)
+                return {"saved": path, **{k: v for k, v in report.items() if k != "font_pt"}}
+            if kind == "xlsx":
+                source = dict(result.get("source") or {})
+                if not source:
+                    return {"error": "This chart has no source table."}
+                provenance = pd.DataFrame(
+                    sorted((k, str(v)) for k, v in self._chart_provenance().items()),
+                    columns=["Setting", "Value"])
+                written = plotkit.write_tables(
+                    plotkit.timestamped(directory, chart_id, "xlsx"),
+                    {"Provenance": provenance, **source}, index=False)
+                return {"saved": written["path"], "sheets": written["sheets"],
+                        "notes": written["notes"], "csv_files": written["csv_files"]}
+            return {"error": f"unknown export kind {kind!r}"}
+        finally:
+            plt.close(figure)
+
+    def _export_image_chart(self, chart_id: str, kind: str, build, spec: dict,
+                            directory: str) -> dict:
+        """An image panel's exports: the PNG at the mask's own resolution, and
+        the frame's values. **No SVG** -- there is no vector form of a label
+        image, and offering one would write a file holding a single embedded
+        bitmap."""
+        result = build(spec)
+        if kind == "png":
+            path = plotkit.timestamped(directory, chart_id, "png")
+            os.makedirs(directory, exist_ok=True)
+            result["image"].save(path)
+            return {"saved": path}
+        if kind == "xlsx":
+            provenance = pd.DataFrame(
+                sorted((k, str(v)) for k, v in
+                       {**self._chart_provenance(), **spec}.items()),
+                columns=["Setting", "Value"])
+            written = plotkit.write_tables(
+                plotkit.timestamped(directory, chart_id, "xlsx"),
+                {"Provenance": provenance, **result["source"]}, index=False)
+            return {"saved": written["path"], "sheets": written["sheets"],
+                    "notes": written["notes"], "csv_files": written["csv_files"]}
+        return {"error": "An image panel has no SVG form."}
+
+    # --- step 7: clone cell data (4-1) -------------------------------------
+
+    def _check_pc_columns(self, columns) -> Optional[str]:
+        """Refuse a PC-valued plot the classification cannot support (0-3), or
+        return the warning that goes above it (0-2)."""
+        availability = self.get_pc_availability()
+        uses_pc = any(re.fullmatch(r"PC\d+", str(c)) for c in columns)
+        if uses_pc and not availability["allowed"]:
+            raise ValueError(availability["reason"])
+        return availability["warning"] if uses_pc else None
+
+    def get_single_track_plot(self, track_id: int, columns: list,
+                              layout: str = "small_multiples") -> dict:
+        """Clone cell data: one track, the chosen values over the window."""
+        columns = [str(c) for c in columns]
+        if not columns:
+            return {"error": "Pick at least one value."}
+        warning = self._check_pc_columns(columns)
+        table = self._cell_table()
+
+        def build(spec):
+            long = table.values(spec["columns"], tracks=[spec["track_id"]],
+                                window=self._window("trajectory"))
+            labels = {c: cell_table.axis_label(c, table.pixel_size_um) for c in spec["columns"]}
+            figure, note = plots.single_track(
+                long, spec["columns"], labels=labels, layout=spec["layout"],
+                size_preset=self.plot_settings["size_preset"],
+                is_time=bool(table.frame_interval_sec))
+            keep = ["Frame", "Time", "Track_ID", "Label"] + spec["columns"]
+            source = long[keep].rename(columns={"Time": "Time (s)"})
+            return {"figure": figure, "source": {"Track data": source},
+                    "note": ", ".join(p for p in (f"Track {spec['track_id']}", note) if p)}
+
+        try:
+            return {**self._chart(f"clone_cell_track{track_id}", build,
+                                  {"track_id": int(track_id), "columns": columns,
+                                   "layout": layout}),
+                    "warning": warning}
+        except ValueError as error:
+            return {"error": str(error)}
+
+    # --- step 7: cumulative dynamics events (4-2) ---------------------------
+
+    def get_cumulative_events(self) -> dict:
+        """The counts behind the cumulative-events curve, one row per frame
+        pair f -> f+1.
+
+        **Counting rule, deliberately the same code the picture uses.** A T1 is
+        counted once per ORANGE (loss) axis currently drawn, so every filter --
+        the event filter, hysteresis, `T1 must hold`, the interface-length
+        bound and the quartet check -- applies to the count exactly as it
+        applies to the display. Losses whose paired gain the quartet check
+        rejected are hidden, so they are not counted either; they are reported
+        separately on their own line, because a rosette is a real rearrangement
+        that this rule does not count and the user should see how many there
+        are.
+
+        Divisions and delaminations are counted only when CONFIRMED, from the
+        same store `save_lineage` writes, and dated to the mother's / the
+        leaving cell's last frame.
+
+        `N(f)` is the number of tracked, non-margin cells present in BOTH f and
+        f+1 -- the denominator Nat Commun 2023 normalises by. A margin cell is
+        excluded by `_is_margin_cell` for the same reason it is excluded from
+        delamination: it left the field of view, not the tissue."""
+        if self._tracking_data is None:
+            return {"error": "Track the movie before counting events."}
+        window = self._window("trajectory")
+        frames = sorted(int(f) for f in self._cell_table().frames())
+        if window:
+            frames = [f for f in frames if window[0] <= f <= window[1]]
+        pairs = list(zip(frames, frames[1:]))
+        if not pairs:
+            return {"error": "The time window holds fewer than two frames."}
+
+        found = self.get_dynamics_candidates()
+        division_at, delamination_at = {}, {}
+        for candidate in found.get("divisions", []):
+            if f"division:{candidate['mother']}:{candidate['frame']}" in self._confirmed_event_keys:
+                division_at[int(candidate["frame"])] = division_at.get(int(candidate["frame"]), 0) + 1
+        for candidate in found.get("delaminations", []):
+            if f"delamination:{candidate['track']}:{candidate['frame']}" in self._confirmed_event_keys:
+                frame = int(candidate["frame"])
+                delamination_at[frame] = delamination_at.get(frame, 0) + 1
+
+        keep = self._EVENT_FILTER_STATES[self.t1_event_filter]
+        rows, orphaned_total = [], 0
+        for first, second in pairs:
+            shown = self.get_t1_events(first)
+            if "error" in shown:
+                continue
+            # Exactly the axes on screen: `axes` has already had the quartet
+            # and interface-length filters applied, and the event filter is
+            # the same state test the overlay and the readout use.
+            losses = [axis for axis in shown["axes"]
+                      if axis["type"] == "loss" and axis.get("state", "persistent") in keep]
+            if self.t1_quartet_filter:
+                orphaned_total += int(shown.get("quartet_orphaned_losses", 0))
+            labels_a, labels_b = self._label_to_track(first), self._label_to_track(second)
+            cell_of = {track: f"Cell{first}_{label}" for label, track in labels_a.items()
+                       if track is not None}
+            both = set(cell_of) & {t for t in labels_b.values() if t is not None}
+            population = sum(1 for track in both if not self._is_margin_cell(cell_of[track]))
+            rows.append({
+                "Frame": first, "N": population, "T1": len(losses),
+                "division": division_at.get(first, 0),
+                "delamination": delamination_at.get(first, 0),
+            })
+        if not rows:
+            return {"error": "No frame pair in this window could be scored."}
+        counts = pd.DataFrame(rows)
+
+        return {"counts": counts.to_dict("records"),
+                "losses_without_a_paired_gain": orphaned_total,
+                "parameters": self.t1_parameters(),
+                "window": list(window) if window else [frames[0], frames[-1]]}
+
+    def get_cumulative_events_plot(self) -> dict:
+        """The cumulative-events curve for the current window and filters."""
+        data = self.get_cumulative_events()
+        if "error" in data:
+            return data
+        counts = pd.DataFrame(data["counts"]).set_index("Frame")
+        parameters = data["parameters"]
+        table = self._cell_table()
+        interval = table.frame_interval_sec
+        first = table.first_frame()
+        censored = None
+        hold = int(parameters.get("persist_frames") or 0)
+        if hold:
+            # An event in the last `hold` frame pairs cannot be judged settled,
+            # so the tail is artificially low. Shade it; do not trim it.
+            censored = counts.index.max() - hold
+
+        colours = {"T1": self.dynamics_colors["t1"],
+                   "division": self.dynamics_colors["division"],
+                   "delamination": self.dynamics_colors["delamination"]}
+
+        def build(spec):
+            index = counts.index.to_numpy(float)
+            shown = counts.copy()
+            if interval:
+                shown.index = (index - first) * interval
+                if spec["censored"] is not None:
+                    spec = {**spec, "censored": (spec["censored"] - first) * interval}
+            figure, censor_note = plots.cumulative_events(
+                shown, is_time=bool(interval), colours=colours,
+                censored_from=spec["censored"],
+                size_preset=self.plot_settings["size_preset"])
+            source = counts.copy()
+            for column in ("T1", "division", "delamination"):
+                source[f"cumulative_{column}"] = np.cumsum(
+                    np.divide(counts[column].to_numpy(float), counts["N"].to_numpy(float),
+                              out=np.zeros(len(counts)), where=counts["N"].to_numpy() > 0))
+            source.insert(0, "Time (s)", (counts.index.to_numpy(float) - first) * interval
+                          if interval else np.nan)
+            settings_note = (f"{parameters['event_filter']}, hold {hold} frame(s), "
+                             f"quartet {'on' if self.t1_quartet_filter else 'off'}")
+            return {"figure": figure, "source": {"Cumulative events": source.reset_index()},
+                    "note": "; ".join(p for p in (settings_note, censor_note) if p)}
+
+        payload = self._chart("cumulative_dynamics_events", build, {"censored": censored})
+        payload["losses_without_a_paired_gain"] = data["losses_without_a_paired_gain"]
+        payload["parameters"] = parameters
+        return payload
+
+    # --- step 8: capabilities, so a panel can say WHY it is off -------------
+
+    def get_playground_capabilities(self) -> dict:
+        """What each panel of step 8 can do with what this project has.
+
+        R36 8-1: step 8 unlocks after Extract, not after Track. Static crops
+        (one frame per individual) and sparsely sampled series like the 19D
+        demo have nothing to track and must not be asked to. A panel that
+        cannot run is disabled **with its reason attached** -- a greyed-out
+        control that does not say why is a bug report waiting to happen."""
+        extracted = self._cells_info is not None and len(self._cells_info) > 0
+        tracked = self._tracking_data is not None
+        classified = self._load_pca_scores() is not None
+        joint = bool(self.list_joint_pcas().get("comparisons"))
+
+        def panel(ok, reason):
+            return {"enabled": bool(ok), "reason": None if ok else reason}
+
+        return {
+            "extracted": extracted,
+            "has_tracking": tracked,
+            "panels": {
+                "tracks": panel(extracted and tracked, "Needs tracking (step 5)."),
+                "streamlines": panel(extracted and tracked, "Needs tracking (step 5)."),
+                "morphospace": panel(
+                    extracted and (classified or joint),
+                    "Needs a PCA: run Classify (step 3), or build a joint PCA in "
+                    "the Group comparator."),
+                "cellmap": panel(extracted, "Needs Extract (step 2)."),
+                "distributions": panel(extracted, "Needs Extract (step 2)."),
+                "comparator": panel(extracted, "Needs Extract (step 2)."),
+            },
+        }
+
+    # --- step 8: Data playground -------------------------------------------
+
+    def get_all_tracks_plot(self, columns: list, layout: str = "small_multiples",
+                            min_coverage: float = 0.9, error: str = None,
+                            by_cluster: bool = False) -> dict:
+        """5-1: every track's value over the window, plus the mean and a band.
+
+        `min_coverage` keeps tracks present for at least that fraction of the
+        window. The kept and total counts go on the figure, because keeping
+        only complete tracks selects the sample by the tracker having succeeded
+        on it -- the figure has to say so (CLAUDE.md rule 5, case 2)."""
+        columns = [str(c) for c in columns]
+        if not columns:
+            return {"error": "Pick at least one value."}
+        try:
+            warning = self._check_pc_columns(columns)
+        except ValueError as error_message:
+            return {"error": str(error_message)}
+        table = self._cell_table()
+        window = self._window("playground")
+        band = error or self.plot_settings["error_band"]
+
+        groups = None
+        if by_cluster:
+            groups = self._cluster_of_track()
+            if not groups:
+                return {"error": "Classify the cells before grouping tracks by cluster."}
+
+        def build(spec):
+            import matplotlib.pyplot as plt
+
+            coverage = table.coverage(window=window)
+            kept = list(coverage[coverage >= spec["min_coverage"]].index)
+            if not kept:
+                raise ValueError(
+                    f"No track covers {spec['min_coverage']:.0%} of the window; "
+                    f"the best covers {coverage.max():.0%}.")
+            columns = spec["columns"]
+            figure, axes = plotkit.panel_figure(
+                self.plot_settings["size_preset"], rows=len(columns), legend=bool(groups))
+            is_time = bool(table.frame_interval_sec)
+            source, band_note = {}, None
+            for index, (axis, column) in enumerate(zip(axes, columns)):
+                label = cell_table.axis_label(column, table.pixel_size_um)
+                wide = table.pivot(column, tracks=kept, window=window)
+                times, _ = cell_table.time_axis(
+                    wide.index, table.first_frame(), table.frame_interval_sec)
+                panel = column if len(columns) > 1 else None
+                if groups:
+                    for name in sorted({groups[t] for t in kept if t in groups}):
+                        chosen = [t for t in wide.columns if groups.get(t) == name]
+                        _, band_note = plots.all_tracks(
+                            wide[chosen], label, error=spec["band"], time=times,
+                            is_time=is_time, axis=axis, panel_name=panel,
+                            colour=self.cluster_color_map.get(name),
+                            group_label=f"cluster_{name + 1}")
+                else:
+                    _, band_note = plots.all_tracks(
+                        wide, label, error=spec["band"], time=times, is_time=is_time,
+                        axis=axis, panel_name=panel)
+                if index != len(columns) - 1:
+                    axis.set_xlabel("")
+                source[column] = wide
+            if groups:
+                handles, labels_ = axes[0].get_legend_handles_labels()
+                plotkit.outside_legend(figure, handles, labels_)
+            note = (f"{len(kept)} of {len(coverage)} tracks "
+                    f"(>= {spec['min_coverage']:.0%} of the window)")
+            return {"figure": figure, "source": source,
+                    "note": "; ".join(p for p in (note, band_note) if p)}
+
+        try:
+            return {**self._chart("clone_multiple_cells", build,
+                                  {"columns": columns, "layout": layout,
+                                   "min_coverage": float(min_coverage), "band": band}),
+                    "warning": warning}
+        except ValueError as error_message:
+            return {"error": str(error_message)}
+
+    def _cluster_of_track(self) -> dict:
+        """`{track_id: cluster_label}` by majority vote over the track's cells.
+
+        A track can cross a cluster boundary -- the classification is per cell,
+        per frame, and nothing stops a growing cell changing side. The majority
+        is a choice, and it is recorded in the figure's source data rather than
+        hidden."""
+        if self._clustering_data is None or self._tracking_data is None:
+            return {}
+        keys = self._cell_table().key_table()
+        labels = self._clustering_data.set_index("Cell_Index")["Cluster_Label"]
+        joined = pd.DataFrame({
+            "Track_ID": keys["Track_ID"].to_numpy(),
+            "Cluster_Label": labels.reindex(keys["Cell Index"].to_numpy()).to_numpy(),
+        }).dropna()
+        if joined.empty:
+            return {}
+        vote = joined.groupby("Track_ID")["Cluster_Label"].agg(
+            lambda values: int(values.value_counts().idxmax()))
+        return {int(k): int(v) for k, v in vote.items()}
+
+    def _pca_for_morphospace(self):
+        scores = self._load_pca_scores()
+        if scores is None or self._clustering_data is None:
+            raise ValueError("Run Classify first: the morphospace is drawn in its PC space.")
+        components = [c for c in scores.columns if re.fullmatch(r"PC\d+", str(c))]
+        labels = self._clustering_data.set_index("Cell_Index")["Cluster_Label"]
+        aligned = labels.reindex(scores.index)
+        return scores[components], aligned
+
+    def get_morphospace_plot(self, x: str = "PC1", y: str = "PC2", hulls: bool = True,
+                             boundary: bool = True, exemplars: bool = False) -> dict:
+        """5-2: two PCs, with robust hulls, the k-means boundary and optional
+        exemplar outlines.
+
+        Reads whichever PCA the `PCA source` menu selects. On a **joint** PCA
+        the points are every cell of every folder in the comparison, coloured
+        by GROUP, with one 95% hull per group -- and there is no k-means
+        boundary to draw, because a joint PCA is a shared basis, not a
+        clustering (R36 6-2). Exemplar outlines come from each cell's own
+        folder."""
+        source = getattr(self, "_pca_source", "project")
+        if source != "project":
+            return self._joint_morphospace(source.split(":", 1)[1], x, y, hulls, exemplars)
+        try:
+            self._check_pc_columns([x, y])
+            scores, labels = self._pca_for_morphospace()
+        except ValueError as error_message:
+            return {"error": str(error_message)}
+        for name in (x, y):
+            if name not in scores.columns:
+                return {"error": f"{name} is not in this classification "
+                                 f"(it kept {', '.join(scores.columns)}). Raise "
+                                 f"'Components to keep' in Classify and re-run."}
+        components = list(scores.columns)
+        usable = labels.notna()
+        scores, labels = scores[usable], labels[usable].astype(int)
+        # k-means centroids ARE the cluster means in the space it clustered,
+        # so they can be recovered from the scores rather than stored.
+        centers = scores.groupby(labels.to_numpy()).mean().to_numpy()
+        colours = {int(k): v for k, v in self.cluster_color_map.items()}
+
+        def build(spec):
+            figure, note = plots.morphospace(
+                scores, spec["x"], spec["y"], cluster=labels.to_numpy(),
+                colours=colours, hulls=spec["hulls"],
+                centers=centers if spec["boundary"] else None,
+                axes_index=(components.index(spec["x"]), components.index(spec["y"])),
+                exemplars=self._exemplar_lookup(scores.index) if spec["exemplars"] else None,
+                size_preset=self.plot_settings["size_preset"])
+            source = scores.copy()
+            source.insert(0, "Cluster_Label", labels.to_numpy())
+            return {"figure": figure, "source": {"Morphospace": source.reset_index()},
+                    "note": "; ".join(p for p in (
+                        "descriptive: cells within one movie", note) if p)}
+
+        return self._chart(f"morphospace_{x}_{y}", build,
+                           {"x": x, "y": y, "hulls": bool(hulls),
+                            "boundary": bool(boundary), "exemplars": bool(exemplars)})
+
+    def _joint_morphospace(self, comparison: str, x: str, y: str,
+                           hulls: bool, exemplars: bool) -> dict:
+        loaded = self.load_joint_pca(comparison)
+        if "error" in loaded:
+            return loaded
+        scores, entry = loaded["scores"], loaded["entry"]
+        components = [c for c in scores.columns if re.fullmatch(r"PC\d+", str(c))]
+        for name in (x, y):
+            if name not in components:
+                return {"error": f"{name} is not in the joint PCA {comparison!r} "
+                                 f"(it kept {', '.join(components)})."}
+        groups = sorted(set(scores["Group"]))
+        colour_cycle = [plotkit.LE, plotkit.AS, plotkit.LEC, plotkit.HB,
+                        plotkit.TAN, plotkit.MID_GREY]
+        colours = {name: colour_cycle[i % len(colour_cycle)] for i, name in enumerate(groups)}
+        codes = {name: i for i, name in enumerate(groups)}
+
+        def build(spec):
+            import matplotlib.pyplot as plt
+
+            numeric = scores[[spec["x"], spec["y"]]].to_numpy(float)
+            labels = np.array([codes[g] for g in scores["Group"]])
+            figure, axes = plotkit.panel_figure(
+                self.plot_settings["size_preset"], rows=1, legend=True)
+            axis = axes[0]
+            import morphospace as ms
+            for name in groups:
+                chosen = labels == codes[name]
+                axis.scatter(numeric[chosen, 0], numeric[chosen, 1], s=4, lw=0,
+                             color=colours[name], alpha=0.7, label=name,
+                             rasterized=plotkit.rasterize_threshold(int(chosen.sum())))
+                if spec["hulls"] and chosen.sum() >= 10:
+                    hull = ms.hull95(numeric[chosen])
+                    axis.plot(hull[:, 0], hull[:, 1], color=colours[name],
+                              lw=plotkit.lw(1.0))
+            axis.set_xlabel(spec["x"])
+            axis.set_ylabel(spec["y"])
+            if spec["exemplars"]:
+                ms.exemplar_grid(axis, numeric, list(scores.index),
+                                 self._joint_mask_lookup(scores))
+            plotkit.outside_legend(figure, markerscale=3)
+            source = scores.reset_index().rename(columns={scores.index.name or "index":
+                                                          "Cell Index"})
+            return {"figure": figure, "source": {"Morphospace": source},
+                    "note": f"joint PCA {comparison!r}: {len(scores)} cells from "
+                            f"{len(entry['folders'])} folder(s) in "
+                            f"{len(groups)} group(s); no k-means boundary (a joint "
+                            f"PCA is a shared basis, not a clustering)"}
+
+        return self._chart(f"morphospace_joint_{comparison}_{x}_{y}", build,
+                           {"x": x, "y": y, "hulls": bool(hulls),
+                            "exemplars": bool(exemplars), "comparison": comparison,
+                            "manifest": entry["manifest"]})
+
+    def _joint_mask_lookup(self, scores: pd.DataFrame):
+        """An exemplar glyph for a joint comparison comes from the cell's OWN
+        folder -- the cells are pooled across projects, and this one is not
+        necessarily the current project."""
+        folder_of = dict(zip(scores.index, scores["Folder"]))
+        cache = {}
+
+        def lookup(cell_index):
+            folder = folder_of[cell_index]
+            match = re.match(r"Cell(\d+)_(\d+)$", str(cell_index))
+            frame, label = int(match.group(1)), int(match.group(2))
+            if folder not in cache:
+                cache[folder] = data_input.prepare_segmentation_folder(
+                    os.path.join(folder, "masks"),
+                    image_folder=os.path.join(folder, "images"))
+            names = data_input.list_segmentation_files(cache[folder])
+            numbers = data_input.resolve_frame_numbers(names)
+            path = next((os.path.join(cache[folder], n) for n, f in numbers.items()
+                         if int(f) == frame), None)
+            labels = data_input.load_label_array(path, data_input.get_min_cell_area())
+            mask = labels == label
+            rows, columns = np.where(mask)
+            return mask[rows.min():rows.max() + 1, columns.min():columns.max() + 1]
+
+        return lookup
+
+    def _exemplar_lookup(self, cell_indices):
+        """`(keys, lookup)` for `morphospace.exemplar_grid` -- a cell's own
+        binary mask, cropped, loaded on demand."""
+        def lookup(cell_index):
+            match = re.match(r"Cell(\d+)_(\d+)$", str(cell_index))
+            frame, label = int(match.group(1)), int(match.group(2))
+            loaded = self._load_frame(frame)
+            if loaded is None:
+                raise ValueError(f"frame {frame} could not be loaded")
+            mask = loaded[0] == label
+            rows, columns = np.where(mask)
+            return mask[rows.min():rows.max() + 1, columns.min():columns.max() + 1]
+        return list(cell_indices), lookup
+
+    #: The Track ID is not in any `Cells_*` table -- it is the tracking table's
+    #: own key -- but a user mapping "which cell is which track" is asking for
+    #: exactly the same picture as any other value, so it is offered as one.
+    TRACK_ID_VALUE = "Track ID"
+
+    def _cell_map_values(self, frame_number: int, column: str) -> dict:
+        """`{raw label: value}` for one frame, for any value including the
+        Track ID."""
+        table = self._cell_table()
+        if column == self.TRACK_ID_VALUE:
+            keys = table.key_table()
+            keys = keys[keys["Frame"] == int(frame_number)]
+            return dict(zip(keys["Label"].astype(int), keys["Track_ID"].astype(float)))
+        values = table.values([column], window=(int(frame_number), int(frame_number)))
+        usable = values[values[column].notna()]
+        return dict(zip(usable["Label"].astype(int), usable[column].astype(float)))
+
+    def get_cell_map(self, frame_number: int, column: str, colormap: str = None,
+                     fixed_scale: bool = True) -> dict:
+        """5-3: one value painted back onto the cells of one frame.
+
+        A PC gets a diverging map centred on zero -- it is a signed score, and
+        a sequential map would put the visual midpoint wherever this frame's
+        data happens to sit. Across a movie the colour scale is fixed to the
+        whole movie's 1st-99th percentile, so a frame's colours mean the same
+        thing in every frame; per-frame autoscaling makes every frame look
+        equally variable.
+
+        **Registered with `_chart` like every other chart** (Round 35 3-2).
+        It used to return a bare PNG string while `index.html` carried a
+        hard-coded `data-chart="cell_map"`, so the right-click menu looked up a
+        spec that had never been stored and answered "has not been drawn yet".
+
+        `Track ID` is coloured by the identity palette the Correct Tracking
+        step uses, not by a continuous map: track ids are consecutive integers,
+        so any ramp gives neighbouring tracks indistinguishable colours."""
+        table = self._cell_table()
+        if frame_number is None or column is None:
+            return {"error": "Pick a frame and a value to map."}
+        frame_number = int(frame_number)
+        if self._load_frame(frame_number) is None:
+            return {"error": f"Frame {frame_number} could not be loaded."}
+        by_label = self._cell_map_values(frame_number, column)
+        is_track = column == self.TRACK_ID_VALUE
+        is_pc = bool(re.fullmatch(r"PC\d+", str(column)))
+
+        if is_track:
+            low = high = None
+            unit_note = f"{len(by_label)} track(s) in this frame"
+        else:
+            if fixed_scale:
+                whole = table.values([column])[column].to_numpy(float)
+                whole = whole[np.isfinite(whole)]
+                low, high = (np.percentile(whole, [1, 99]) if len(whole) else (0.0, 1.0))
+            else:
+                finite = np.array(list(by_label.values()), float)
+                low, high = (finite.min(), finite.max()) if len(finite) else (0.0, 1.0)
+            if is_pc:
+                limit = max(abs(low), abs(high))
+                low, high = -limit, limit
+            label = cell_table.axis_label(column, table.pixel_size_um)
+            scope = "whole movie" if fixed_scale else "this frame"
+            unit_note = f"Range ({scope}): {low:.3g} - {high:.3g} {label}"
+
+        chosen = colormap or ("RdBu_r" if is_pc else "viridis")
+
+        def build(spec):
+            loaded = self._load_frame(spec["frame"])
+            fill_labels, _boundary, base_image = loaded
+            if spec["is_track"]:
+                colours = rendering.assign_identity_colors(
+                    sorted({int(v) for v in by_label.values()}), "golden_angle")
+                image = base_image.copy()
+                for raw_label, track in by_label.items():
+                    image[fill_labels == raw_label] = colours[int(track)]
+                overlay = rendering.Image.fromarray(image)
+            else:
+                overlay = rendering.render_value_map(
+                    fill_labels, base_image, by_label, cmap=spec["cmap"],
+                    vmin=spec["vmin"], vmax=spec["vmax"])
+            source = pd.DataFrame({
+                "Frame": spec["frame"],
+                "Label": list(by_label),
+                column: list(by_label.values()),
+            })
+            keys = table.key_table()
+            keys = keys[keys["Frame"] == spec["frame"]][["Label", "Track_ID"]]
+            source = source.merge(keys, on="Label", how="left")
+            return {"image": overlay, "source": {"Cell map": source},
+                    "note": unit_note}
+
+        spec = {"frame": frame_number, "value": column, "cmap": chosen,
+                "vmin": low, "vmax": high, "is_track": is_track,
+                "fixed_scale": bool(fixed_scale)}
+        return self._image_chart(f"cell_map_{column}_frame{frame_number}", build, spec)
+
+    def _image_chart(self, chart_id: str, build, spec: dict) -> dict:
+        """`_chart` for an IMAGE panel.
+
+        Separate because an image is not a Matplotlib figure: it is written at
+        the mask's own pixel resolution (Round 34 2-3 -- enlarging a label
+        image to 600 dpi adds nothing), it has no style context to apply, and
+        it has no SVG form, so the export menu must hide that entry."""
+        self._chart_specs[chart_id] = (build, dict(spec))
+        result = build(spec)
+        return {
+            "image": rendering.encode_png_base64(result["image"]),
+            "note": result.get("note"),
+            "chart_id": chart_id,
+            "kinds": ["png", "xlsx"],
+        }
+
+    def export_ta_track_map(self, start_frame: int = None, end_frame: int = None) -> dict:
+        """5-3: the whole movie as Tissue Analyzer-style `tracked_cells_resized.tif`
+        frames, with the Track ID packed into the RGB value.
+
+        Byte-for-byte the inverse of the decoder in
+        `figures/benchmark_results/tracker_comparison.py:173-175`: pixel =
+        `(R << 16) | (G << 8) | B`, boundaries and background `0xFFFFFF`. The
+        directory layout follows TA's so `tissue_miner` can read it, with one
+        folder per frame named after this project's own mask file."""
+        from PIL import Image
+
+        table = self._cell_table()
+        keys = table.key_table()
+        if int(keys["Track_ID"].max()) >= 0xFFFFFF:
+            return {"error": f"Track ID {int(keys['Track_ID'].max())} does not fit in 24 bits; "
+                             "this export cannot encode it."}
+        # Same one-second collision the figure exports had: the stamp has
+        # second resolution, so two exports in a row would otherwise refuse the
+        # second one for colliding with the first.
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = os.path.join(self.output_dirs["quantitative_analysis_output"],
+                            f"TA_tracked_cells_{stamp}")
+        root, attempt = base, 2
+        while os.path.exists(root):
+            root = f"{base}-{attempt}"
+            attempt += 1
+        names = data_input.list_segmentation_files(self.npy_folder)
+        numbers = data_input.resolve_frame_numbers(names)
+        stem_of = {int(frame): os.path.splitext(name)[0] for name, frame in numbers.items()}
+        path_of = {int(frame): os.path.join(self.npy_folder, name)
+                   for name, frame in numbers.items()}
+        if start_frame is not None:
+            keys = keys[keys["Frame"] >= int(start_frame)]
+        if end_frame is not None:
+            keys = keys[keys["Frame"] <= int(end_frame)]
+        if keys.empty:
+            return {"error": "No tracked frame falls in that range."}
+        written, skipped = [], []
+        for frame, group in keys.groupby("Frame"):
+            # The label array directly, NOT `_load_frame`: this export writes
+            # label colours and never touches the microscopy image, and going
+            # through `_load_frame` both decoded an image per frame for nothing
+            # and made the export fail outright on a project whose images are
+            # missing.
+            source = path_of.get(int(frame))
+            fill_labels = (data_input.load_label_array(source, data_input.get_min_cell_area())
+                           if source else None)
+            if fill_labels is None:
+                skipped.append(int(frame))
+                continue
+            track_of = np.zeros(int(fill_labels.max()) + 1, dtype=np.int64)
+            for label, track in zip(group["Label"], group["Track_ID"]):
+                track_of[int(label)] = int(track)
+            packed = track_of[fill_labels]
+            packed[packed == 0] = 0xFFFFFF  # background and boundaries, as TA writes them
+            rgb = np.dstack([(packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF]
+                            ).astype(np.uint8)
+            folder = os.path.join(root, stem_of.get(int(frame), f"frame{int(frame):04d}"))
+            os.makedirs(folder, exist_ok=True)
+            Image.fromarray(rgb).save(os.path.join(folder, "tracked_cells_resized.tif"))
+            written.append(folder)
+        if not written:
+            return {"error": "No frame in that range could be read from "
+                             f"{self.npy_folder}; nothing was written."}
+        return {"saved": root, "frames": len(written), "skipped": skipped,
+                "max_track_id": int(keys["Track_ID"].max())}
+
+    def get_streamlines_plot(self, start_frame: int = None, end_frame: int = None,
+                             step_sec: float = None, colour_by_track: bool = False,
+                             registration: str = "as_tracked") -> dict:
+        """5-4: the displacement field between two frames, as streamlines.
+
+        `registration` (R35 4-1):
+
+        - `"as_tracked"` (default, and the only behaviour before this round)
+          follows `tracking_drift_mode` -- the convention the LINKS were made
+          under, never the current UI setting, which is a mutable control that
+          may have moved since (Round 18 D1);
+        - `"on"` subtracts the measured drift whether or not tracking did,
+          and refuses if no drift can be measured;
+        - `"off"` uses raw coordinates.
+
+        Whichever applies is returned in the note and written into the export's
+        Provenance; the figure itself says nothing."""
+        table = self._cell_table()
+        frames = sorted(int(f) for f in table.frames())
+        window = self._window("playground") or (frames[0], frames[-1])
+        start = int(start_frame if start_frame is not None else window[0])
+        if end_frame is not None:
+            end = int(end_frame)
+        elif step_sec and table.frame_interval_sec:
+            end = start + max(1, int(round(step_sec / table.frame_interval_sec)))
+        else:
+            end = int(window[1])
+        end = min(end, frames[-1])
+        if end <= start:
+            return {"error": "The end frame must be after the start frame."}
+
+        if registration not in ("as_tracked", "on", "off"):
+            return {"error": f"unknown registration option {registration!r}"}
+        run_mode = self.tracking_drift_mode
+        if registration == "off":
+            apply_drift, convention = False, "unregistered (Registration: off)"
+        elif registration == "on":
+            apply_drift = True
+            convention = "registered (Registration: on)"
+        else:
+            apply_drift = bool(run_mode and run_mode != "none")
+            convention = (f"registered as tracked ({run_mode})" if apply_drift
+                          else "unregistered as tracked (drift_mode='none')")
+
+        drift = (0.0, 0.0)
+        if apply_drift:
+            by_frame = self._registration().get("drift_by_frame", {})
+            if not by_frame:
+                return {"error": "No frame-to-frame drift could be measured for this movie, "
+                                 "so Registration: On has nothing to subtract."}
+            total = np.zeros(2)
+            for frame in range(start, end):
+                shift = by_frame.get(frame) or by_frame.get(str(frame)) or (0.0, 0.0)
+                total += np.asarray(shift, float)[:2]
+            drift = tuple(total)
+
+        def build(spec):
+            vectors = trajectory_visualization.compute_displacement_vectors(
+                self._tracking_data, self._cells_info, spec["start"], spec["end"])
+            if vectors.empty:
+                raise ValueError(f"No cell is tracked through both frame {spec['start']} "
+                                 f"and frame {spec['end']}.")
+            vectors = vectors.copy()
+            # `drift_by_frame` is `{frame: (dx, dy)}` -- `_estimate_drift`
+            # returns it that way (`cell_tracking.py:363`) and EVERY other
+            # consumer reads `shift[0]` as x: `cell_tracking.py:1112/1138`,
+            # `tracking_benchmark.py:248/617/785/1259`, `candidate_probe.py:73`,
+            # and the magnifier paths in this file. This one line had them
+            # crossed, so with Registration on (or a tracking run that
+            # registered) the compensation was applied along the wrong axis --
+            # and on a movie that drifts diagonally the result still looks like
+            # a plausible flow field.
+            vectors["dX"] -= spec["drift"][0]
+            vectors["dY"] -= spec["drift"][1]
+            field = trajectory_visualization.interpolate_vector_field(vectors)
+            loaded = self._load_frame(spec["start"])
+            tissue = None
+            if loaded is not None:
+                labels = loaded[0]
+                X = field[0]
+                rows = np.clip(np.round(field[1]).astype(int), 0, labels.shape[0] - 1)
+                columns = np.clip(np.round(X).astype(int), 0, labels.shape[1] - 1)
+                tissue = labels[rows, columns] > 0
+            figure, _ = plots.streamlines(
+                field, tissue_mask=tissue,
+                size_preset=self.plot_settings["size_preset"])
+            return {"figure": figure, "source": {"Displacement": vectors},
+                    "note": f"frames {spec['start']}-{spec['end']}, {convention}"}
+
+        try:
+            return self._chart("cell_streamlines", build,
+                               {"start": start, "end": end, "drift": drift,
+                                "registration": registration, "convention": convention})
+        except ValueError as error_message:
+            return {"error": str(error_message)}
+
+    # ---- Part 6: movie maker ---------------------------------------------
+
+    def start_movie_render(self, step: str, start_frame: int, end_frame: int,
+                           value: str = None, track_number: int = None) -> bool:
+        """Render one PNG per frame of a step's own visualization.
+
+        Every frame goes through the SAME `get_*_overlay` the step draws with,
+        at the mask's own pixel resolution -- upscaling a label image adds
+        nothing. What the frames cannot contain is anything the browser draws
+        on top: the inset view, the legend, the popovers. The dialog says so;
+        there is no way to capture them from here, and a movie quietly missing
+        its legend is worse than one that said it would be.
+
+        T1 is slow by construction: its hysteresis chain has to be walked from
+        the first frame for every frame rendered."""
+        self._movie_cancelled = False
+        self._movie_track = int(track_number) if track_number is not None else None
+        thread = threading.Thread(
+            target=self._run_movie_render,
+            args=(step, int(start_frame), int(end_frame), value), daemon=True)
+        thread.start()
+        return True
+
+    def cancel_movie_render(self) -> bool:
+        self._movie_cancelled = True
+        return True
+
+    def _run_movie_render(self, step: str, start_frame: int, end_frame: int,
+                          value: Optional[str]) -> None:
+        try:
+            # R35 3-3: the Track ID map is a TA-format export, not a stack of
+            # PNGs. Same encoding, same directory layout, same round-trip test
+            # the standalone button had -- only the frame range now comes from
+            # this dialog, and the dialog's own wording and controls are
+            # untouched.
+            if step == "cellmap" and value == self.TRACK_ID_VALUE:
+                result = self.export_ta_track_map(start_frame, end_frame)
+                self._notify("onMovieDone", {
+                    "folder": result.get("saved"), "frames": result.get("frames", 0),
+                    "error": result.get("error"), "cancelled": False})
+                return
+            frames = [f for f in self.get_frame_numbers() if start_frame <= f <= end_frame]
+            if not frames:
+                self._notify("onMovieDone", {"error": "No frame falls in that range."})
+                return
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            folder = os.path.join(self.output_dirs["quantitative_analysis_output"],
+                                  f"movie_{re.sub(r'[^A-Za-z0-9_-]+', '_', step)}_{stamp}")
+            if os.path.exists(folder):
+                self._notify("onMovieDone", {"error": f"{folder} already exists; nothing written."})
+                return
+            os.makedirs(folder)
+            written = 0
+            for position, frame in enumerate(frames):
+                if self._movie_cancelled:
+                    break
+                image = self._movie_frame(step, frame, value)
+                if image is None:
+                    continue
+                prefix = "data:image/png;base64,"
+                payload = image[len(prefix):] if image.startswith(prefix) else image
+                with open(os.path.join(folder, f"frame_{position:04d}.png"), "wb") as handle:
+                    handle.write(base64.b64decode(payload))
+                written += 1
+                self._notify("onMovieProgress", {
+                    "percent": int((position + 1) / len(frames) * 100),
+                    "message": f"Frame {frame} ({position + 1} of {len(frames)})"})
+            settings = {
+                "step": step, "value": value, "frames": [int(f) for f in frames],
+                "written": written, "cancelled": bool(self._movie_cancelled),
+                "tracking_drift_mode": self.tracking_drift_mode,
+                "t1_parameters": self.t1_parameters() if step == "trajectory" else None,
+                "pixel_size_um": self.pixel_size_um,
+                "frame_interval_sec": self.frame_interval_sec,
+                "written_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            }
+            with open(os.path.join(folder, "settings.json"), "w", encoding="utf-8") as handle:
+                json.dump(settings, handle, indent=2, sort_keys=True, default=str)
+                handle.write("\n")
+            self._notify("onMovieDone", {"folder": folder, "frames": written,
+                                         "cancelled": bool(self._movie_cancelled)})
+        except Exception as error:  # the thread must report, not vanish
+            logger.exception("movie render failed")
+            self._notify("onMovieDone", {"error": str(error)})
+
+    def _movie_frame(self, step: str, frame: int, value: Optional[str]) -> Optional[str]:
+        """One frame of a movie, from the step's own overlay function."""
+        if step == "cellmap":
+            if not value:
+                raise ValueError("Pick a value in the Cell map panel first.")
+            return self.get_cell_map(frame, value)
+        if step == "trajectory":
+            # The Trajectory view is drawn for a TRACK, so a movie of it needs
+            # one; `movie_track` is set by `start_movie_render` from whatever
+            # the player has selected.
+            return self.get_trajectory_overlay(
+                self._movie_track, frame,
+                color_mode="dynamics" if self._movie_track is None else "highlight")
+        if step == "correct-tracking":
+            return self.get_tracking_overlay(frame)
+        if step in ("classify", "correct-classification"):
+            return self.get_classification_overlay(frame)
+        if step == "extract":
+            return self.get_raw_frame_image(frame)
+        raise ValueError(f"Step {step!r} has no frame view to record.")
+
+    # ---- Part 7: group comparator ----------------------------------------
+
+    _JOINT_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+
+    def _read_project_tables(self, folder: str) -> dict:
+        """The three per-cell tables and the Extract settings of ANOTHER
+        project folder, read only.
+
+        Only what is on disk: the current project's in-memory corrections are
+        its own, and a comparison that silently mixed one live project with
+        several archived ones would not be reproducible from the folders."""
+        classification = os.path.join(folder, "cell_classification_output")
+        if not os.path.isdir(classification):
+            raise ValueError(f"{folder} has no cell_classification_output; it is not an "
+                             "Epi-Quant project folder.")
+        tables = {}
+        for key, name in (("info", "Cells_info.xlsx"), ("shape", "Cells_shape.xlsx"),
+                          ("tissue", "Cells_tissue.xlsx")):
+            path = os.path.join(classification, name)
+            tables[key] = pd.read_excel(path) if os.path.exists(path) else None
+        if tables["info"] is None:
+            raise ValueError(f"{folder} has no Cells_info.xlsx; run Extract there first.")
+        settings_path = os.path.join(classification, "extract_settings.json")
+        settings = {}
+        if os.path.exists(settings_path):
+            with open(settings_path, encoding="utf-8") as handle:
+                settings = json.load(handle)
+        tables["settings"] = settings
+        tables["folder"] = folder
+        return tables
+
+    def build_joint_pca(self, comparison: str, groups: list,
+                        feature_families: list = None,
+                        selected_features: list = None) -> dict:
+        """7-3: one PCA fit over every cell of every folder in `groups`.
+
+        Weighting, as in `/figures`: the cells are pooled and nothing is
+        weighted by group or by embryo. A joint basis is the only way PC values
+        can be compared across folders at all -- each folder's own
+        `Cells_info_PCA.xlsx` has its own axes, and comparing PC2 between two
+        of them compares two different directions.
+
+        Pixel size has to agree: either every folder has one (values are
+        converted to um first) or none does (everything stays in px). A mix is
+        refused, because pooling 0.133 um/px with 0.25 um/px makes the leading
+        component partly "which microscope".
+
+        `feature_families` / `selected_features` (R36 6-1) are resolved the
+        same way Classify's `_feature_frame` resolves them -- the EFD family is
+        exclusive and unstandardized, `-1` is a `Cells_info` failure sentinel
+        and becomes NaN -- so the two steps cannot drift apart. They default to
+        the basic 13, which is what this did unconditionally before. A folder
+        missing a selected family's table is refused **by name**, saying which
+        table it lacks, rather than silently dropping its cells.
+
+        Nothing is written until every target has been checked. An existing
+        file under the same comparison name stops the whole write and names
+        every conflict -- a half-written comparison is worse than none."""
+        comparison = str(comparison or "").strip()
+        if not self._JOINT_NAME.match(comparison):
+            return {"error": "A comparison name may use letters, digits, '_' and '-' only."}
+        groups = [g for g in (groups or []) if g.get("folders")]
+        if len(groups) < 2:
+            return {"error": "Define at least two groups, each with at least one folder."}
+
+        try:
+            loaded = []
+            for group in groups:
+                for folder in group["folders"]:
+                    tables = self._read_project_tables(folder)
+                    tables["group"] = group["name"]
+                    loaded.append(tables)
+        except (OSError, ValueError) as error:
+            return {"error": str(error)}
+
+        sizes = [t["settings"].get("pixel_size_um") for t in loaded]
+        if any(sizes) and not all(sizes):
+            without = [t["folder"] for t, s in zip(loaded, sizes) if not s]
+            return {"error": "Some folders have a pixel size and some do not, so a joint PCA "
+                             "would mix microns with pixels. Set one in: " + ", ".join(without)}
+
+        families = list(feature_families) if feature_families else ["basic"]
+        unknown = [f for f in families if f not in pca_kmeans.FEATURE_FAMILIES]
+        if unknown:
+            return {"error": f"unknown feature family {unknown[0]!r}"}
+        is_efd = "efd" in families
+        if is_efd and len(families) > 1:
+            return {"error": "The elliptic-Fourier family is used on its own - "
+                             "deselect the other families."}
+        # Same rule as `_feature_frame`: only the EFD family declares one.
+        standardize_mode = (pca_kmeans.FEATURE_FAMILIES["efd"]["standardize"]
+                            if is_efd else "global")
+        if is_efd:
+            columns = None          # resolved per folder from the EFD order
+        else:
+            columns = (list(selected_features) if selected_features
+                       else pca_kmeans.family_columns(families, include_default_off=True))
+        frames = []
+        for tables, pixel_size in zip(loaded, sizes):
+            joined = tables["info"].set_index("Cell Index")
+            for extra in ("shape", "tissue"):
+                if tables[extra] is not None and not tables[extra].empty:
+                    other = tables[extra]
+                    if "Cell Index" in other.columns:
+                        other = other.set_index("Cell Index")
+                    joined = joined.join(other, how="left")
+            if is_efd:
+                order = sum(str(c).startswith("efd_") for c in joined.columns) // 4
+                if not order:
+                    return {"error": f"{tables['folder']} has no elliptic-Fourier coefficients "
+                                     "(Cells_shape.xlsx with 'Raw elliptic-Fourier coefficients'). "
+                                     "Run that extraction there, or pick another family."}
+                columns = pca_kmeans.efd_preset(order)
+            missing = [c for c in columns if c not in joined.columns]
+            if missing:
+                needed = sorted({
+                    "Cells_shape.xlsx" if c in shape_features.CELLS_SHAPE_COLUMNS
+                    else "Cells_tissue.xlsx" if c in tissue_features.CELLS_TISSUE_COLUMNS
+                    else "Cells_info.xlsx" for c in missing})
+                return {"error": f"{tables['folder']} is missing {len(missing)} of the selected "
+                                 f"columns (for example {', '.join(missing[:3])}); it has no "
+                                 f"{' or '.join(needed)}. Run that extraction step there, or "
+                                 "choose another family."}
+            values = joined.loc[:, columns].apply(pd.to_numeric, errors="coerce")
+            sentinel = [c for c in columns if c in data_input.CELLS_INFO_COLUMNS]
+            values[sentinel] = values[sentinel].mask(values[sentinel] == -1)
+            if pixel_size:
+                for column in columns:
+                    values[column] = cell_table.convert(values[column].to_numpy(float),
+                                                        column, pixel_size)
+            values = values.dropna()
+            if is_efd:
+                # The raw coefficients change with size, orientation, traversal
+                # direction and where the tracer started; PCA must see the
+                # normalized shape. Same chain Classify uses, including the
+                # per-track front/back decision where the folder is tracked.
+                normalized = efd.efd_features(
+                    values.to_numpy(float).reshape(-1, order, 4))
+                values = pd.DataFrame(np.atleast_2d(normalized), index=values.index,
+                                      columns=efd.efd_feature_names(order))
+            values.index = [f"{tables['folder']}::{i}" for i in values.index]
+            values["__group"] = tables["group"]
+            values["__folder"] = tables["folder"]
+            frames.append(values)
+        pooled = pd.concat(frames)
+        if pooled.empty:
+            return {"error": "No cell in these folders has a complete feature set."}
+
+        targets = []
+        for tables in loaded:
+            directory = os.path.join(tables["folder"], "cell_classification_output")
+            for name in (f"Cells_info_PCA_joint_{comparison}.xlsx",
+                         f"PCA_Components_joint_{comparison}.xlsx",
+                         f"joint_{comparison}_manifest.json"):
+                targets.append(os.path.join(directory, name))
+        existing = [p for p in targets if os.path.exists(p)]
+        if existing:
+            return {"error": "These files already exist, so nothing was written:\n"
+                             + "\n".join(existing)}
+
+        features = pooled.drop(columns=["__group", "__folder"])
+        scaled = pca_kmeans.standardize(features, mode=standardize_mode)
+        model, scores = pca_kmeans.fit_pca(scaled, 0.85, sign_convention=True)
+        score_frame = pd.DataFrame(
+            scores, index=features.index,
+            columns=[f"PC{i + 1}" for i in range(scores.shape[1])])
+
+        scaler_mean = features.mean().to_dict()
+        scaler_std = features.std(ddof=0).to_dict()
+        written = []
+        for tables in loaded:
+            directory = os.path.join(tables["folder"], "cell_classification_output")
+            prefix = f"{tables['folder']}::"
+            mine = score_frame[[i.startswith(prefix) for i in score_frame.index]].copy()
+            mine.index = [i[len(prefix):] for i in mine.index]
+            mine.index.name = "Cell Index"
+            mine.to_excel(os.path.join(directory, f"Cells_info_PCA_joint_{comparison}.xlsx"),
+                          sheet_name="Cell1")
+            local = features[[i.startswith(prefix) for i in features.index]]
+            pca_kmeans.write_pca_components(
+                os.path.join(directory, f"PCA_Components_joint_{comparison}.xlsx"),
+                components=model.components_,
+                explained_variance_ratio=model.explained_variance_ratio_,
+                feature_names=list(features.columns), scores=mine,
+                raw_features=local.set_axis(mine.index))
+            manifest = {
+                "comparison": comparison,
+                "groups": {g["name"]: list(g["folders"]) for g in groups},
+                "feature_columns": list(features.columns),
+                "feature_families": families,
+                "standardize_mode": standardize_mode,
+                "scaler_mean": scaler_mean, "scaler_std": scaler_std,
+                "components_kept": int(scores.shape[1]),
+                "sign_convention": True,
+                "pixel_size_um": {t["folder"]: t["settings"].get("pixel_size_um") for t in loaded},
+                "cells_per_folder": {
+                    t["folder"]: int(sum(1 for i in features.index
+                                         if i.startswith(f"{t['folder']}::")))
+                    for t in loaded},
+                "cells_info_sha256": {t["folder"]: self._file_sha256(
+                    os.path.join(t["folder"], "cell_classification_output", "Cells_info.xlsx"))
+                    for t in loaded},
+                "written_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            }
+            with open(os.path.join(directory, f"joint_{comparison}_manifest.json"),
+                      "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2, sort_keys=True, default=str)
+                handle.write("\n")
+            written.append(directory)
+        return {"comparison": comparison, "cells": int(len(features)),
+                "folders": len(loaded), "components": int(scores.shape[1]),
+                "written": written}
+
+    @staticmethod
+    def _file_sha256(path: str) -> Optional[str]:
+        import hashlib
+        if not os.path.exists(path):
+            return None
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def check_joint_pca(self, comparison: str, folders: list) -> dict:
+        """Is a stored joint PCA still valid? A folder whose `Cells_info.xlsx`
+        no longer hashes to what the manifest recorded has been re-extracted
+        since, so its scores are stale and every PC plot built on them must
+        refuse and say which folder moved."""
+        stale, missing = [], []
+        for folder in folders:
+            path = os.path.join(folder, "cell_classification_output",
+                                f"joint_{comparison}_manifest.json")
+            if not os.path.exists(path):
+                missing.append(folder)
+                continue
+            with open(path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            recorded = (manifest.get("cells_info_sha256") or {}).get(folder)
+            current = self._file_sha256(os.path.join(folder, "cell_classification_output",
+                                                     "Cells_info.xlsx"))
+            if recorded and current and recorded != current:
+                stale.append(folder)
+        return {"ok": not stale and not missing, "stale": stale, "missing": missing}
+
+    # --- R36 8-2: Distributions ---------------------------------------------
+
+    BOOTSTRAP_N = 5000
+
+    @staticmethod
+    def _bootstrap_individuals(means, n: int = 5000, seed: int = 0) -> tuple:
+        """Percentile CI for a group's mean, resampling **individuals**.
+
+        The unit is the individual, not the cell: cells inside one sample are
+        not independent, so a CI over cells answers a question nobody asked
+        and is far too narrow. Same shape as `make_efd_figures._boot`."""
+        values = np.asarray(means, float)
+        rng = np.random.default_rng(seed)
+        draws = np.array([values[rng.integers(0, len(values), len(values))].mean()
+                          for _ in range(n)])
+        return float(values.mean()), float(np.percentile(draws, 2.5)), \
+            float(np.percentile(draws, 97.5))
+
+    def get_distributions_plot(self, column: str, paired: bool = False) -> dict:
+        """8-2: one value, grouped the way the Group comparator is set.
+
+        Three modes, and the statistics follow the mode rather than the other
+        way round:
+
+        - **no comparator**: every cell of this project, one column. The
+          individual is the project.
+        - **Clusters comparison**: one column per cluster of this project.
+          Descriptive only -- the clusters were defined on these very values
+          and the cells share one sample (Round 34 7-1). No interval.
+        - **Multi-groups comparison**: one column per group, one point per
+          folder. A group with two or more folders gets a bootstrap CI over
+          **individuals**; a group with one gets none, and the note says so."""
+        mode = getattr(self, "_group_mode", "clusters")
+        groups = getattr(self, "_groups", [])
+        available = {entry["column"] for entry in self._cell_table().value_catalog()}
+        if mode != "folders" and column not in available:
+            return {"error": f"{column!r} is not in any table this project has loaded. "
+                             "Run the extraction step that produces it, or reload the project."}
+        try:
+            if mode == "folders" and groups:
+                cells, note = self._distribution_cells_from_folders(column, groups)
+                intervals = {}
+                single = []
+                for name, part in cells.groupby("Group"):
+                    means = part.groupby("Individual")[column].mean().to_numpy(float)
+                    if len(means) > 1:
+                        intervals[name] = self._bootstrap_individuals(means, self.BOOTSTRAP_N)
+                    else:
+                        single.append(name)
+                if single:
+                    note += (f"; no interval for {', '.join(single)} -- one individual, "
+                             "nothing to resample")
+                else:
+                    note += f"; 95% CI bootstrapped over individuals ({self.BOOTSTRAP_N} resamples)"
+            else:
+                cells, note = self._distribution_cells_from_project(column, mode)
+                intervals = {}
+                if mode == "clusters":
+                    note += "; descriptive only -- clusters were defined on these values"
+        except ValueError as error:
+            return {"error": str(error)}
+        if cells.empty:
+            return {"error": f"No cell has a value for {column!r}."}
+
+        label = cell_table.axis_label(column, self.pixel_size_um)
+        colours = {name: self.cluster_color_map.get(index)
+                   for index, name in enumerate(dict.fromkeys(cells["Group"]))}
+
+        def build(spec):
+            figure, counts = plots.superplot(
+                cells, column, label, colours=colours, intervals=intervals or None,
+                paired=spec["paired"], size_preset=self.plot_settings["size_preset"])
+            summary = (cells.groupby(["Group", "Individual"])[column]
+                       .agg(["count", "mean", "std"]).reset_index())
+            return {"figure": figure,
+                    "source": {"Cells": cells, "Individual means": summary},
+                    "note": f"{counts}; {note}"}
+
+        return self._chart(f"distributions_{column}", build, {"paired": bool(paired)})
+
+    def _distribution_cells_from_project(self, column: str, mode: str) -> tuple:
+        """Cells of the current project, optionally split by cluster."""
+        table = self._cell_table()
+        values = table.values([column])
+        values = values[values[column].notna()].copy()
+        name = os.path.basename(os.path.dirname(
+            self.output_dirs["cell_classification_output"])) or "this project"
+        values["Individual"] = name
+        if mode == "clusters" and self._clustering_data is not None:
+            labels = self._clustering_data.set_index("Cell_Index")["Cell_Type"]
+            values["Group"] = labels.reindex(values["Cell Index"].to_numpy()).to_numpy()
+            values = values[values["Group"].notna()]
+            return values, "clusters of this project"
+        values["Group"] = name
+        return values, "every cell of this project"
+
+    def _distribution_cells_from_folders(self, column: str, groups: list) -> tuple:
+        """Cells from every folder of every group, one individual per folder."""
+        frames = []
+        for group in groups:
+            for folder in group.get("folders", []):
+                tables = self._read_project_tables(folder)
+                joined = tables["info"].set_index("Cell Index")
+                for extra in ("shape", "tissue"):
+                    if tables[extra] is not None and not tables[extra].empty:
+                        other = tables[extra]
+                        if "Cell Index" in other.columns:
+                            other = other.set_index("Cell Index")
+                        joined = joined.join(other, how="left")
+                if column not in joined.columns:
+                    raise ValueError(
+                        f"{folder} has no column {column!r} -- run the matching "
+                        "extraction step there, or pick another value.")
+                pixel = tables["settings"].get("pixel_size_um")
+                series = pd.to_numeric(joined[column], errors="coerce")
+                if column in data_input.CELLS_INFO_COLUMNS:
+                    series = series.mask(series == -1)
+                converted = cell_table.convert(series.to_numpy(float), column, pixel)
+                frames.append(pd.DataFrame({
+                    "Cell Index": joined.index, "Group": group["name"],
+                    "Individual": os.path.basename(folder.rstrip("/")) or folder,
+                    "Folder": folder, column: converted,
+                }))
+        if not frames:
+            raise ValueError("No folder in any group holds cells.")
+        pooled = pd.concat(frames, ignore_index=True)
+        pooled = pooled[pooled[column].notna()]
+        return pooled, f"{len(groups)} group(s), one individual per folder"
+
+    def get_group_extraction_status(self, groups: list = None) -> dict:
+        """Which of the groups' folders still have no `Cells_info.xlsx`.
+
+        One folder is one individual, so a four-group comparison of static
+        crops is two dozen projects. Checking here is what lets the button
+        below say how much work it is about to do before it starts."""
+        groups = groups or getattr(self, "_groups", [])
+        ready, missing, broken = [], [], []
+        for group in groups:
+            for folder in group.get("folders", []):
+                info = os.path.join(folder, "cell_classification_output", "Cells_info.xlsx")
+                if os.path.exists(info):
+                    ready.append(folder)
+                elif os.path.isdir(os.path.join(folder, "masks")):
+                    missing.append(folder)
+                else:
+                    broken.append(folder)
+        return {"ready": ready, "missing": missing, "no_masks": broken,
+                "total": len(ready) + len(missing) + len(broken)}
+
+    def start_group_extraction(self, groups: list = None) -> bool:
+        """Run Extract on every group folder that has no `Cells_info.xlsx`.
+
+        The settings are **this session's** -- the same minimum cell area,
+        border rule and mask handling the user has set here -- and they go into
+        the report so a comparison built on them can say what produced its
+        inputs. Folders that already have a table are left alone: re-extracting
+        them would overwrite the user's own output for no reason."""
+        self._group_extract_cancelled = False
+        thread = threading.Thread(target=self._run_group_extraction,
+                                  args=(groups or getattr(self, "_groups", []),), daemon=True)
+        thread.start()
+        return True
+
+    def cancel_group_extraction(self) -> bool:
+        self._group_extract_cancelled = True
+        return True
+
+    def _run_group_extraction(self, groups: list) -> None:
+        try:
+            status = self.get_group_extraction_status(groups)
+            todo = status["missing"]
+            if status["no_masks"]:
+                self._notify("onGroupExtractDone", {
+                    "error": "These folders have no masks/ directory: "
+                             + ", ".join(status["no_masks"])})
+                return
+            if not todo:
+                self._notify("onGroupExtractDone", {"extracted": 0, "already": len(status["ready"])})
+                return
+            done, failed = [], []
+            for position, folder in enumerate(todo):
+                if self._group_extract_cancelled:
+                    break
+                self._notify("onProgress", {
+                    "stage": "group_extract",
+                    "message": f"{os.path.basename(folder)} ({position + 1} of {len(todo)})",
+                    "percent": int(position / len(todo) * 100)})
+                try:
+                    # A separate API object per folder: `set_project` resets
+                    # project state (R35 2-3), and doing this on `self` would
+                    # throw away the project the user is actually looking at.
+                    worker = EpiQuantAPI()
+                    worker.set_project(os.path.join(folder, "masks"),
+                                       os.path.join(folder, "images"), folder)
+                    worker._run_extraction(mask_type="auto", background_area_ratio=10.0,
+                                           exclude_edge_cells=self.exclude_edge_cells)
+                    if worker._cells_info is None:
+                        raise RuntimeError("extraction produced no table")
+                    done.append(folder)
+                except Exception as error:
+                    failed.append(f"{os.path.basename(folder)}: {error}")
+            self._notify("onGroupExtractDone", {
+                "extracted": len(done), "already": len(status["ready"]),
+                "failed": failed, "cancelled": bool(self._group_extract_cancelled),
+                "settings": {"min_cell_area_px": data_input.get_min_cell_area(),
+                             "exclude_edge_cells": bool(self.exclude_edge_cells)}})
+        except Exception as error:
+            logger.exception("group extraction failed")
+            self._notify("onGroupExtractDone", {"error": str(error)})
+
+    def set_group_state(self, mode: str = "clusters", groups: list = None) -> dict:
+        """The Group comparator's mode and groups, kept on the API so the
+        Distributions panel and the joint-PCA search can see them."""
+        self._group_mode = mode
+        self._groups = [{"name": str(g.get("name")), "folders": list(g.get("folders", []))}
+                        for g in (groups or [])]
+        self._chart_specs.clear()
+        return {"mode": self._group_mode, "groups": self._groups}
+
+    # --- R36 6-2: a joint PCA has to be findable, loadable and plottable ---
+
+    def _joint_search_folders(self) -> list:
+        """Where a joint-PCA manifest might be: this project, plus every
+        folder currently in a group."""
+        folders = []
+        if self.output_dirs:
+            folders.append(os.path.dirname(self.output_dirs["cell_classification_output"]))
+        folders += [f for group in getattr(self, "_groups", []) for f in group.get("folders", [])]
+        return list(dict.fromkeys(folders))
+
+    def list_joint_pcas(self) -> dict:
+        """Every joint comparison reachable from here, by name.
+
+        Round 34 wrote `Cells_info_PCA_joint_<name>.xlsx` and a manifest into
+        every participating folder, and Round 35 left them there: nothing
+        listed them and nothing could draw them. This is the entry point the
+        `PCA source` menu is built from."""
+        found = {}
+        for folder in self._joint_search_folders():
+            directory = os.path.join(folder, "cell_classification_output")
+            if not os.path.isdir(directory):
+                continue
+            for name in sorted(os.listdir(directory)):
+                match = re.fullmatch(r"joint_(.+)_manifest\.json", name)
+                if not match:
+                    continue
+                try:
+                    with open(os.path.join(directory, name), encoding="utf-8") as handle:
+                        manifest = json.load(handle)
+                except (OSError, ValueError):
+                    continue
+                found.setdefault(match.group(1), {
+                    "comparison": match.group(1),
+                    "manifest": os.path.join(directory, name),
+                    "groups": manifest.get("groups", {}),
+                    "components_kept": manifest.get("components_kept"),
+                    "feature_families": manifest.get("feature_families"),
+                    "folders": sorted({f for folders in manifest.get("groups", {}).values()
+                                       for f in folders}),
+                })
+        return {"comparisons": list(found.values())}
+
+    def load_joint_pca(self, comparison: str) -> dict:
+        """Scores for every cell of a joint comparison, with its group and
+        folder. Refuses outright if any folder's `Cells_info` has changed
+        since the fit -- and names the folder (R34 7-3)."""
+        entry = next((c for c in self.list_joint_pcas()["comparisons"]
+                      if c["comparison"] == comparison), None)
+        if entry is None:
+            return {"error": f"No joint PCA named {comparison!r} was found."}
+        state = self.check_joint_pca(comparison, entry["folders"])
+        if not state["ok"]:
+            parts = []
+            if state["stale"]:
+                parts.append("re-extracted since the fit: " + ", ".join(state["stale"]))
+            if state["missing"]:
+                parts.append("no manifest in: " + ", ".join(state["missing"]))
+            return {"error": f"The joint PCA {comparison!r} is out of date -- " + "; ".join(parts)
+                             + ". Build it again in the Group comparator."}
+        folder_group = {folder: name for name, folders in entry["groups"].items()
+                        for folder in folders}
+        frames = []
+        for folder in entry["folders"]:
+            path = os.path.join(folder, "cell_classification_output",
+                                f"Cells_info_PCA_joint_{comparison}.xlsx")
+            if not os.path.exists(path):
+                return {"error": f"{folder} has no scores for {comparison!r}; build it again."}
+            scores = pd.read_excel(path, index_col=0)
+            scores.insert(0, "Folder", folder)
+            scores.insert(0, "Group", folder_group.get(folder, "?"))
+            frames.append(scores)
+        pooled = pd.concat(frames)
+        return {"scores": pooled, "entry": entry}
+
+    def get_joint_pca_options(self) -> dict:
+        """The `PCA source` menu: this project, plus each joint comparison."""
+        options = [{"value": "project", "label": "This project",
+                    "available": self._load_pca_scores() is not None}]
+        for entry in self.list_joint_pcas()["comparisons"]:
+            options.append({
+                "value": f"joint:{entry['comparison']}",
+                "label": f"Joint: {entry['comparison']}",
+                "available": True,
+                "folders": len(entry["folders"]),
+                "groups": list(entry["groups"]),
+            })
+        return {"options": options, "current": getattr(self, "_pca_source", "project")}
+
+    def set_pca_source(self, source: str = "project") -> dict:
+        """Which PCA the Morphospace, Distributions and Cell map read."""
+        if source != "project":
+            name = source.split(":", 1)[1] if ":" in source else source
+            loaded = self.load_joint_pca(name)
+            if "error" in loaded:
+                return loaded
+        self._pca_source = source
+        self._chart_specs.clear()
+        return {"source": source}
+
+    def get_group_dynamics_plot(self, kind: str = "dtw", column: str = "Cell Area",
+                                max_pairs: int = dynamics_compare.DEFAULT_MAX_PAIRS) -> dict:
+        """7-4: DTW, detrended oscillation, or distance/heading between two
+        groups of tracks.
+
+        Within one movie the groups are clusters, so this is descriptive;
+        across folders the statistical unit is the embryo and the caller has
+        already said so. Either way the window, the coverage filter and the
+        pair cap are reported on the figure, because all three select the
+        sample."""
+        import matplotlib.pyplot as plt
+
+        table = self._cell_table()
+        window = self._window("playground")
+        groups = self._cluster_of_track()
+        if not groups:
+            return {"error": "Classify the cells first: the groups are the clusters."}
+        names = sorted(set(groups.values()))
+        if len(names) != 2:
+            return {"error": f"This comparison needs exactly two groups; the classification has "
+                             f"{len(names)}."}
+        coverage = table.coverage(window=window)
+        kept = [t for t in coverage[coverage >= 0.9].index if t in groups]
+        if len(kept) < 4:
+            return {"error": "Fewer than four tracks cover 90% of the window."}
+        wide = table.pivot(column, tracks=kept, window=window)
+        label = cell_table.axis_label(column, table.pixel_size_um)
+        by_group = {f"cluster_{n + 1}": {t: wide[t].dropna().to_numpy()
+                                         for t in wide.columns if groups.get(t) == n}
+                    for n in names}
+
+        def build(spec):
+            if spec["kind"] == "dtw":
+                pairs = dynamics_compare.dtw_pairs(by_group, max_pairs=spec["max_pairs"])
+                figure, axes = plotkit.panel_figure(
+                    self.plot_settings["size_preset"], rows=1, legend=True)
+                axis = axes[0]
+                for name, part in pairs.groupby("pair"):
+                    axis.hist(part["dtw"], bins=30, histtype="step", density=True, label=name)
+                axis.set_xlabel(f"DTW distance ({label})")
+                axis.set_ylabel("Density")
+                plotkit.outside_legend(figure)
+                used = pairs.groupby("pair")[["pairs_available", "pairs_used"]].first()
+                return {"figure": figure, "source": {"DTW pairs": pairs},
+                        "note": "pairs used: " + "; ".join(
+                            f"{k} {int(v.pairs_used)} of {int(v.pairs_available)}"
+                            for k, v in used.iterrows())}
+
+            if spec["kind"] == "oscillation":
+                if not table.frame_interval_sec:
+                    raise ValueError("The detrending window is 5.5 min, so this needs the frame "
+                                     "interval. Set it in Extract.")
+                width = dynamics_compare.frames_for(
+                    dynamics_compare.DETREND_WINDOW_SEC, table.frame_interval_sec, odd=True)
+                rows = []
+                for name, tracks in by_group.items():
+                    for track, series in tracks.items():
+                        stats = dynamics_compare.detrended_stats(series, width)
+                        if not stats:
+                            continue
+                        lag, value = dynamics_compare.acf_first_minimum(stats["acf"])
+                        rows.append({"group": name, "Track_ID": track,
+                                     "amplitude_pct": stats["amplitude_pct"],
+                                     "amplitude_abs": stats["amplitude_abs"],
+                                     "acf_first_min_lag": lag,
+                                     "acf_first_min_sec": (lag * table.frame_interval_sec
+                                                           if lag else None),
+                                     "acf_first_min_value": value})
+                if not rows:
+                    raise ValueError(f"No track is long enough for a {width}-frame detrending window.")
+                stats_frame = pd.DataFrame(rows)
+                figure, _ = plots.columns_plot(
+                    {name: part["amplitude_pct"].to_numpy()
+                     for name, part in stats_frame.groupby("group")},
+                    "Detrended amplitude (% of running mean)", kind="box",
+                    size_preset=self.plot_settings["size_preset"])
+                return {"figure": figure, "source": {"Oscillation": stats_frame},
+                        "note": f"detrend window {width} frames (5.5 min); "
+                                "the ACF first minimum is in the source data"}
+
+            long = table.values([column], tracks=kept, window=window)
+            long["group"] = [f"cluster_{groups[t] + 1}" for t in long["Track_ID"]]
+            long["cell"] = long["Track_ID"]
+            result = dynamics_compare.group_distance_and_angle(
+                long.rename(columns={column: "value"}), ["value"],
+                frame_interval_sec=table.frame_interval_sec or 1.0)
+            figure, axes = plotkit.panel_figure(
+                self.plot_settings["size_preset"], rows=2)
+            low = min(v.min() for v in result["reference_distance"].values() if len(v))
+            high = max(v.max() for v in result["reference_distance"].values() if len(v))
+            axes[0].axhspan(low, high, color=plotkit.LIGHT_GREY, lw=0, zorder=0)
+            axes[0].plot(result["frames"], result["distance"], color=plotkit.AS)
+            axes[0].set_ylabel("Euclidean\ndistance")
+            band_low = min(v.min() for v in result["reference_angle"].values() if len(v))
+            band_high = max(v.max() for v in result["reference_angle"].values() if len(v))
+            axes[1].axhspan(band_low, band_high, color=plotkit.LIGHT_GREY, lw=0, zorder=0)
+            axes[1].plot(result["angle_frames"], result["angle"], color=plotkit.LE)
+            axes[1].axhline(90, color=plotkit.INK, lw=0.5, ls=(0, (3, 2)))
+            axes[1].set_ylim(0, 180)
+            axes[1].set_yticks([0, 90, 180])
+            axes[1].set_ylabel("Angle between\ndirections (deg)")
+            axes[1].set_xlabel("Frame")
+            source = pd.DataFrame({"Frame": result["frames"], "distance": result["distance"]})
+            angles = pd.DataFrame({"Frame": result["angle_frames"], "angle_deg": result["angle"]})
+            return {"figure": figure,
+                    "source": {"Distance": source, "Heading angle": angles},
+                    "note": "the grey band is the same statistic between random halves "
+                            "of one group"}
+
+        try:
+            return self._chart(f"group_dynamics_{kind}", build,
+                               {"kind": kind, "max_pairs": int(max_pairs)})
+        except ValueError as error_message:
+            return {"error": str(error_message)}
+
 
 if __name__ == "__main__":
     import argparse
@@ -4616,6 +7735,263 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.self_test:
+        # --- R29 §10: nothing a DataFrame can be reached through, publicly.
+        # An empty instance first: this is what `app.py` hands to pywebview.
+        fresh_api = EpiQuantAPI()
+        assert not bridge_hazards(fresh_api), bridge_hazards(fresh_api)
+        # And with the six populated, which is the state that actually froze
+        # the UI -- an empty instance would pass even with the bug present.
+        fresh_api._cells_info = pd.DataFrame({"Cell Index": ["Cell1_1"]})
+        fresh_api._tracking_data = pd.DataFrame({"Index": [1], "Frame1": ["Cell1_1"]})
+        fresh_api._original_tracking_data = fresh_api._tracking_data.copy()
+        fresh_api._clustering_data = pd.DataFrame({"Cluster_Label": [0]})
+        fresh_api._cells_shape = pd.DataFrame({"solidity": [0.9]})
+        fresh_api._cells_tissue = pd.DataFrame({"density": [1.0]})
+        assert not bridge_hazards(fresh_api), bridge_hazards(fresh_api)
+        # The guard has to be able to FAIL, or it is decoration: put one back
+        # in public view and confirm it is named.
+        fresh_api.tracking_data = fresh_api._tracking_data
+        caught = bridge_hazards(fresh_api)
+        assert any(h.startswith("tracking_data") for h in caught), caught
+        del fresh_api.tracking_data
+        print("R29 10: no public DataFrame/ndarray on the object pywebview walks;")
+        print("  a public one is caught by name (%s)." % caught[0])
+
+        # --- R30 A: the Schmitt band must reach DETECTION, not only the
+        # persistence lookahead. This assertion FAILED before this round --
+        # that is the point of it. `detect_t1_transitions` took no band, so
+        # `get_t1_events` returned identical counts with the band off and on,
+        # while `api.py`'s own comment quoted "1,229 / 978 at 25/15" as if the
+        # program produced them.
+        def _lattice(touch: bool):
+            # Four cells on a 2x2 lattice, 1 px gaps. With `touch`, cell 4
+            # reaches across the middle and shares a 2 px interface with cell
+            # 2 -- the "meets at a corner" case, which is what a band is for.
+            # (Under R31 D the graph is the interface one, so the strengths
+            # are shared border pixels: 2 px here against the 75-83 px the
+            # cells share with the background region.)
+            array = np.zeros((26, 26), dtype=np.int32)
+            array[2:12, 2:12], array[2:12, 13:23] = 1, 2
+            array[14:24, 2:12], array[14:24, 13:23] = 3, 4
+            if touch:
+                array[12:14, 12:14] = 4
+            return array
+
+        lattice = {1: _lattice(False), 2: _lattice(True), 3: _lattice(False)}
+        t1_probe = EpiQuantAPI()
+        t1_probe._tracking_data = pd.DataFrame({"Index": [1]})
+        # A real (if blank) base image: the dynamics renderer copies it, and a
+        # `None` there fails for a reason that has nothing to do with T1.
+        t1_probe._load_frame = lambda frame: (
+            (lattice[frame], lattice[frame], np.zeros(lattice[frame].shape + (3,), np.uint8))
+            if frame in lattice else None)
+        t1_probe._label_to_track = lambda frame: {
+            int(v): int(v) for v in np.unique(lattice[frame]) if v}
+        t1_probe.get_frame_numbers = lambda: sorted(lattice)
+        # Real centroids, so the probe exercises the axis path too -- an
+        # empty centroid map silently skips it, and R31 B's annotation rides
+        # on the axes.
+        t1_probe._t1_centroids = lambda frame, l2t: {
+            int(v): (float(np.nonzero(lattice[frame] == v)[1].mean()),
+                     float(np.nonzero(lattice[frame] == v)[0].mean()))
+            for v in np.unique(lattice[frame]) if v}
+
+        off = t1_probe.get_t1_events(1)
+        assert off["gained"] == 1, off          # the 2 px corner interface
+        assert not off["parameters"]["band_active"]
+        assert off["parameters"]["adjacency_used"] == ["interface"], off["parameters"]
+        t1_probe.set_t1_hysteresis(enter_px=6, exit_px=4)
+        t1_probe._invalidate_frame_caches(reason="self-test")
+        on = t1_probe.get_t1_events(1)
+        assert on["parameters"]["band_active"], on["parameters"]
+        assert (on["gained"], on["lost"]) != (off["gained"], off["lost"]), (off, on)
+        assert on["gained"] == 0, on
+        print("R30 A: the band reaches detection -- gains %d -> %d, losses %d -> %d "
+              "with enter/exit 6/4 on the same frames." % (
+                  off["gained"], on["gained"], off["lost"], on["lost"]))
+
+        # --- R31 B: the pair-level annotation, and the distribution that has
+        # to be read before any threshold is chosen. On this lattice the one
+        # offending pair gains at frame 1 and loses it again at frame 2, so
+        # it is a two-crossing pair -- exactly the shape the real movies are
+        # full of (68.7% of OE's events come from pairs crossing 4+ times).
+        t1_probe.set_t1_hysteresis(None, None)
+        t1_probe._invalidate_frame_caches(reason="self-test")
+        annotated = t1_probe.get_t1_events(1)
+        axes = annotated["axes"]
+        assert axes and axes[0]["pair_event_count"] == 2 and axes[0]["pair_event_rank"] == 1, axes
+        index = t1_probe._pair_event_index()
+        assert index[(2, 4)] == [(1, "gain"), (2, "loss")], index
+        distribution = t1_probe.get_pair_event_distribution()
+        assert distribution["events"] == 2 and distribution["distinct_pairs"] == 1, distribution
+        assert distribution["histogram"] == {"2": 1}, distribution
+        assert distribution["contact_strength_by_group"]["2-3"]["pairs"] == 1, distribution
+        print("R31 B: the offending pair is annotated with its whole-movie count "
+              "(%s) and the distribution reports the histogram, not a cut-off."
+              % distribution["histogram"])
+
+        # --- R34 4-2: the cumulative-events curve, on the same lattice. Cell 4
+        # reaches the middle at frame 2 and withdraws at frame 3, so the pair
+        # (2, 4) gains once and loses once -- two T1 events, of which the
+        # counting rule (count the LOSS side, as Nat Commun 2023 does) counts
+        # one. N is the tracked, non-margin cells in both frames of a pair, so
+        # 4 here, and the curve must be 0 then 1/4. Checking the value and not
+        # just the shape is the point: a curve normalised by the wrong N, or
+        # counting both sides, still looks like a plausible rising line.
+        events_probe = EpiQuantAPI()
+        events_probe.output_dirs = {}
+        events_probe._tracking_data = pd.DataFrame({
+            "Track_ID": [1, 2, 3, 4],
+            **{f"Frame{f}": [f"Cell{f}_{label}" for label in (1, 2, 3, 4)] for f in (1, 2, 3)},
+        })
+        centres = {1: (7, 7), 2: (18, 7), 3: (7, 18), 4: (18, 18)}
+        events_probe._cells_info = pd.DataFrame({
+            "Cell Index": [f"Cell{f}_{label}" for f in (1, 2, 3) for label in (1, 2, 3, 4)],
+            "Cell Area": [100.0] * 12,
+            "Center X Coordinate": [float(centres[l][0]) for _ in (1, 2, 3) for l in (1, 2, 3, 4)],
+            "Center Y Coordinate": [float(centres[l][1]) for _ in (1, 2, 3) for l in (1, 2, 3, 4)],
+            "Circumscribed Circle Radius": [7.0] * 12,
+        })
+        events_probe._load_frame = t1_probe._load_frame
+        events_probe._t1_centroids = t1_probe._t1_centroids
+        events_probe.get_frame_numbers = lambda: sorted(lattice)
+        events_probe.set_t1_event_filter("all")
+        events_probe.set_t1_persistence(0)
+        counted = events_probe.get_cumulative_events()
+        assert "error" not in counted, counted
+        rows = pd.DataFrame(counted["counts"]).set_index("Frame")
+        assert list(rows.index) == [1, 2], rows
+        assert list(rows["N"]) == [4, 4], rows["N"].tolist()
+        assert list(rows["T1"]) == [0, 1], (
+            "expected the exchange to be counted on its loss side only: %s" % rows["T1"].tolist())
+        cumulative = np.cumsum(rows["T1"].to_numpy(float) / rows["N"].to_numpy(float))
+        assert np.allclose(cumulative, [0.0, 0.25]), cumulative
+        # Filtering has to move the count, or it is not the same rule the
+        # picture uses. `persistent` judges the frame-1 gain over frame 3,
+        # where it has reversed, and leaves the frame-2 loss unjudgeable.
+        events_probe.set_t1_event_filter("persistent")
+        events_probe.set_t1_persistence(1)
+        filtered = pd.DataFrame(events_probe.get_cumulative_events()["counts"])
+        assert filtered["T1"].sum() == 0, (
+            "the display filter must reach the count: %s" % filtered["T1"].tolist())
+        print("R34 4-2: 3-frame lattice, one exchange and its reversal -> C(t) = "
+              "[0.000, 0.250] per tracked cell (N=4); with 'settled only' the same "
+              "frames count %d." % int(filtered["T1"].sum()))
+        events_probe.set_t1_event_filter("all")
+        events_probe.set_t1_persistence(1)
+
+        # R31 D: one adjacency, and the interface graph now carries lengths,
+        # so the band acts on it instead of being silently inert.
+        t1_probe.set_t1_hysteresis(enter_px=6, exit_px=4)
+        assert t1_probe.t1_parameters()["band_active"], t1_probe.t1_parameters()
+        assert not hasattr(t1_probe, "set_t1_adjacency_source"), \
+            "the adjacency menu was removed in R31 D; one definition, not a choice"
+
+        # --- R32 T1-4: `track_number=None` must not raise, in either colour
+        # mode. The highlight branch did `int(None)`; nothing had called it
+        # with None, which is how the crash reached the user.
+        for mode in ("highlight", "dynamics"):
+            try:
+                result = t1_probe.get_trajectory_overlay(None, 2, color_mode=mode)
+            except Exception as error:   # pragma: no cover - the regression itself
+                raise AssertionError(f"get_trajectory_overlay(None, color_mode={mode!r}) "
+                                     f"raised {type(error).__name__}: {error}")
+            assert mode == "dynamics" or result is None, (mode, result)
+        print("R32 T1-4: get_trajectory_overlay(track_number=None) returns without raising "
+              "in both highlight and dynamics mode.")
+
+        # --- R32 T1-1, corrected R33: the two-sided minimum is stored in TRUE
+        # pixels, runs without a pixel size, and microns are display only.
+        # The lattice's corner interface is 2 counted pixels = 1 px of wall.
+        t1_probe.set_t1_hysteresis(None, None)
+        t1_probe._invalidate_frame_caches(reason="self-test")
+        t1_probe.pixel_size_um = None
+        applied = t1_probe.set_t1_length_filter(True, min_length_px=1)
+        assert applied["enabled"] and applied["min_length_um"] is None, applied
+        kept = t1_probe.get_t1_events(1)
+        assert kept["length_filter"]["active"] and kept["length_filter"]["gains_kept"] == 1, \
+            kept["length_filter"]
+        t1_probe.set_t1_length_filter(True, min_length_px=2)   # the 1 px corner fails 2 px
+        cut = t1_probe.get_t1_events(1)
+        assert cut["gained"] == 1, "raw counts never move"
+        assert cut["length_filter"]["gains_removed"] == 1, cut["length_filter"]
+        assert not cut["axes"], "a removed gain's axis is not drawn"
+        # Back to the movie's own default: this lattice has one reversing gain
+        # and no settled one, so there is no separation to read and enabling
+        # must say so rather than invent a number.
+        no_default = t1_probe.set_t1_length_filter(True, use_movie_default=True)
+        assert "error" in no_default and not no_default["enabled"], no_default
+        t1_probe.set_t1_length_filter(False)
+        print("R33: the length minimum runs in true pixels without a pixel size, removes from "
+              "the drawing while the raw count stays, and refuses to invent a default the "
+              "movie cannot support.")
+
+        # --- R33: a straight 30 px wall is 30 px long, not 60. The interface
+        # graph counts both sides of a border; Round 32 multiplied that count
+        # by the pixel size and showed every interface at twice its length.
+        def _wall(split: bool):
+            array = np.zeros((40, 40), dtype=np.int32)
+            array[5:35, 5:20], array[5:35, 20:35] = 1, 2      # a 30 px vertical wall
+            if split:
+                array[5:35, 19:22] = 0                         # pulled apart beyond the gap
+            return array
+        walls = {1: _wall(False), 2: _wall(True)}
+        wall_probe = EpiQuantAPI()
+        wall_probe._tracking_data = pd.DataFrame({"Index": [1]})
+        wall_probe._load_frame = lambda f: ((walls[f], walls[f],
+                                             np.zeros(walls[f].shape + (3,), np.uint8))
+                                            if f in walls else None)
+        wall_probe._label_to_track = lambda f: {1: 1, 2: 2}
+        wall_probe.get_frame_numbers = lambda: sorted(walls)
+        wall_probe.pixel_size_um = 0.1083
+        lost = {"gained": [], "lost": [{"tracks": (1, 2), "type": "loss"}]}
+        wall_probe._annotate_interface_lengths(lost, 1)
+        entry = lost["lost"][0]
+        assert entry["interface_px"] == 30.0, entry
+        assert abs(entry["interface_um"] - 30 * 0.1083) < 1e-6, entry
+        print("R33: a 30 px wall reads interface_px = %.0f and interface_um = %.3f "
+              "(= 30 x 0.1083, not 60 x)." % (entry["interface_px"], entry["interface_um"]))
+
+        # --- The hysteresis chain is in TRACK space, so a tracking correction
+        # must drop it as R33 made the pair-event index do. This probe uses
+        # the real `_label_to_track`, which reads `_tracking_data`; the T1
+        # probe above stubs it, and so could never see the staleness.
+        def _band_probe(table):
+            probe = EpiQuantAPI()
+            probe._tracking_data = table
+            probe._load_frame = t1_probe._load_frame
+            probe.get_frame_numbers = lambda: sorted(lattice)
+            probe.set_t1_hysteresis(enter_px=6, exit_px=4)
+            return probe
+        band_table = pd.DataFrame({"Index": [1, 2, 3, 4], **{
+            f"Frame{f}": [f"Cell{f}_{label}" for label in (1, 2, 3, 4)] for f in lattice}})
+        band_probe = _band_probe(band_table.copy())
+        before = band_probe._contacts_at(1)
+        band_probe._contacts_at(2)                       # cache a later frame of the chain too
+        # Swap tracks 1 and 2 in frame 1 only, as a swap correction would.
+        band_probe._tracking_data.loc[[0, 1], "Frame1"] = ["Cell1_2", "Cell1_1"]
+        reference = _band_probe(band_probe._tracking_data.copy())
+        assert reference._contacts_at(1) != before, "the swap must move contacts, or this proves nothing"
+        for frame in (1, 2):
+            assert band_probe._contacts_at(frame) == reference._contacts_at(frame), (
+                frame, band_probe._contacts_at(frame), reference._contacts_at(frame))
+        print("Hysteresis cache: a track swap in frame 1 moves the band's contacts "
+              "(%s -> %s), and the chain after it is rebuilt." % (
+                  sorted(before), sorted(band_probe._contacts_at(1))))
+
+        # --- R30 E: the persistence horizon is stored in SECONDS, so the same
+        # requirement is a different number of frames on each movie.
+        horizon_probe = EpiQuantAPI()
+        assert horizon_probe.t1_persist_frames == 1, "no interval known -> the stored fallback"
+        horizon_probe.frame_interval_sec = 30.0
+        assert horizon_probe.t1_persist_frames == 5, horizon_probe.t1_persist_frames
+        horizon_probe.frame_interval_sec = 15.0
+        assert horizon_probe.t1_persist_frames == 10, horizon_probe.t1_persist_frames
+        assert horizon_probe.t1_persist_bounds()["max_frames"] == 40
+        print("R30 E: 150 s is %d frames at 30 s/frame and %d at 15 s/frame; "
+              "the UI bound follows the interval (%d frames here), not a literal 10." % (
+                  5, 10, horizon_probe.t1_persist_bounds()["max_frames"]))
+
         # --- C1 (R20): the candidate list is a MERGE, not a truncation.
         # It used to accumulate four sources and take `[:3]`, so sources 3 and 4
         # were unreachable whenever source 2 yielded three -- and for an
@@ -4623,7 +7999,7 @@ if __name__ == "__main__":
         # the offered list *always exactly* the IoU ranking's top three.
         probe = EpiQuantAPI()
         probe._census = {"register": False, "drift_by_frame": None}
-        probe.cells_info = None
+        probe._cells_info = None
         probe._census_crop = lambda *a, **k: ""
 
         height, width = 80, 400
@@ -4746,7 +8122,7 @@ if __name__ == "__main__":
 
         rprobe = EpiQuantAPI()
         rprobe._load_frame = lambda frame: None
-        rprobe.tracking_data = None
+        rprobe._tracking_data = None
         rprobe._census = {"queue": [r_item], "masks": {5: r_before, 6: r_after},
                           "register": False, "drift_by_frame": None,
                           "search_drift_by_frame": {5: r_drift}, "cell_radius_px": 13.0,
@@ -4788,17 +8164,17 @@ if __name__ == "__main__":
         # stays. Before Round 24 `dropna` was the only filter, so the first row
         # below entered StandardScaler with a -1 perimeter.
         fp = EpiQuantAPI()
-        fp.cells_info = pd.DataFrame({
+        fp._cells_info = pd.DataFrame({
             "Cell Index": ["Cell1_1", "Cell1_2", "Cell1_3", "Cell1_4"],
             "Cell Area": [100.0, 120.0, 140.0, 160.0],
             "Cell Perimeter": [-1.0, 44.0, 48.0, 52.0],
         })
-        fp.cells_shape = pd.DataFrame(
+        fp._cells_shape = pd.DataFrame(
             {"signed_shape": [0.5, -1.0, 0.2, 0.1]},
             index=pd.Index(["Cell1_1", "Cell1_2", "Cell1_3", "Cell1_4"], name="Cell Index"),
         )
-        fp.cells_tissue = None
-        kept, _ = fp._feature_frame(["basic"], ["Cell Area", "Cell Perimeter", "signed_shape"])
+        fp._cells_tissue = None
+        kept, _, _ = fp._feature_frame(["basic"], ["Cell Area", "Cell Perimeter", "signed_shape"])
         assert list(kept.index) == ["Cell1_2", "Cell1_3", "Cell1_4"], list(kept.index)
         assert kept.loc["Cell1_2", "signed_shape"] == -1.0, kept
         print("S (R24): Cells_info -1 sentinel dropped (Cell1_1); a -1 in the shape")
@@ -4812,14 +8188,14 @@ if __name__ == "__main__":
         restored = ["Fitted Ellipse Angle", "Circularity"]
         old = EpiQuantAPI()
         rng_o = np.random.default_rng(0)
-        old.cells_info = pd.DataFrame(
+        old._cells_info = pd.DataFrame(
             {c: rng_o.uniform(5, 50, 6) for c in data_input.CELLS_INFO_COLUMNS if c not in restored})
-        old.cells_info.insert(0, "Cell Index", [f"Cell1_{i}" for i in range(1, 7)])
-        old.cells_shape = old.cells_tissue = None
+        old._cells_info.insert(0, "Cell Index", [f"Cell1_{i}" for i in range(1, 7)])
+        old._cells_shape = old._cells_tissue = None
         basic = old.get_feature_options()["families"]["basic"]
         assert basic["ready"] and basic["missing"] == [], basic
         assert sorted(basic["unavailable"]) == sorted(restored), basic["unavailable"]
-        default_old, _ = old._feature_frame(["basic"], None)
+        default_old, _, _ = old._feature_frame(["basic"], None)
         assert list(default_old.columns) == pca_kmeans.family_columns(["basic"]), list(default_old.columns)
         try:
             old._feature_frame(["basic"], ["Cell Area", "Circularity"])
@@ -4827,8 +8203,8 @@ if __name__ == "__main__":
         except ValueError as exc:
             assert "Re-run Extract" in str(exc), str(exc)
         fresh = EpiQuantAPI()
-        fresh.cells_info = old.cells_info.assign(**{c: 1.0 for c in restored})
-        fresh.cells_shape = fresh.cells_tissue = None
+        fresh._cells_info = old._cells_info.assign(**{c: 1.0 for c in restored})
+        fresh._cells_shape = fresh._cells_tissue = None
         assert fresh.get_feature_options()["families"]["basic"]["unavailable"] == []
         print("O (R24): a 15-column pre-R24 table keeps basic ready with the default")
         print("  columns; the restored two are `unavailable` (disabled), and asking for one")
@@ -4861,12 +8237,12 @@ if __name__ == "__main__":
         feats = []
         for transform in (lambda i, sh: sh, moved):
             e_api = EpiQuantAPI()
-            e_api.cells_info = pd.DataFrame(
+            e_api._cells_info = pd.DataFrame(
                 {"Cell Index": [f"Cell1_{i}" for i in range(12)],
                  **{c: rng_e.uniform(5, 50, 12) for c in data_input.CELLS_INFO_COLUMNS}})
-            e_api.cells_shape = efd_table(transform)
-            e_api.cells_tissue = None
-            frame_e, mode_e = e_api._feature_frame(["efd"], None)
+            e_api._cells_shape = efd_table(transform)
+            e_api._cells_tissue = None
+            frame_e, mode_e, prov_e = e_api._feature_frame(["efd"], None)
             assert mode_e == "none" and frame_e.shape == (12, 40), (mode_e, frame_e.shape)
             feats.append(frame_e.to_numpy())
         drift = np.abs(feats[0] - feats[1]).max()
@@ -4874,10 +8250,253 @@ if __name__ == "__main__":
         assert drift < 1e-9, f"EFD Classify features depend on pose: {drift:.3e}"
         assert raw_drift > 1.0, "fixture did not move the raw coefficients"
         assert np.allclose(np.sqrt((feats[0][:, :4] ** 2).sum(axis=1)), 1.0), "harmonic 1 must be unit norm"
-        e_api.cells_shape.iloc[0, 5] = np.nan
+        assert prov_e["front_back"] == "per_outline", prov_e
+        e_api._cells_shape.iloc[0, 5] = np.nan
         assert len(e_api._feature_frame(["efd"], None)[0]) == 11, "a cell with a NaN coefficient must drop"
         print(f"EFD (2026-09-19): Classify features are pose-invariant (max drift {drift:.1e};")
         print(f"  the raw columns moved by {raw_drift:.1f}), unit harmonic-1, NaN rows dropped.")
+
+        # --- 0-2 (R34): with tracking loaded, the front/back decision must be
+        # made per TRACK, i.e. the features must equal `efd.efd_features` fed
+        # the same track ids -- which is `make_efd_figures.py:129-131`. The same
+        # outlines are shown twice, as one 4-frame track each, with the frame
+        # order shuffled in the table to prove the rows need not be sorted.
+        t_api = EpiQuantAPI()
+        order_shuffle = np.random.default_rng(7).permutation(12)
+        index_t = [f"Cell{1 + i % 4}_{1 + i // 4}" for i in order_shuffle]
+        t_api._cells_info = pd.DataFrame(
+            {"Cell Index": index_t,
+             **{c: rng_e.uniform(5, 50, 12) for c in data_input.CELLS_INFO_COLUMNS}})
+        shape_t = efd_table(lambda i, sh: sh).iloc[order_shuffle].copy()
+        shape_t.index = index_t
+        t_api._cells_shape, t_api._cells_tissue = shape_t, None
+        # Three tracks of four frames; `Frame{n}` holds `Cell{n}_{label}`.
+        t_api._tracking_data = pd.DataFrame({
+            "Track_ID": [1, 2, 3],
+            **{f"Frame{f}": [f"Cell{f}_{label}" for label in (1, 2, 3)] for f in range(1, 5)},
+        })
+        frame_t, _, prov_t = t_api._feature_frame(["efd"], None)
+        assert prov_t == {"front_back": "per_track", "untracked": 0}, prov_t
+        expected_t = efd.efd_features(
+            shape_t.to_numpy(float).reshape(-1, 10, 4),
+            track_ids=[f"track_{1 + (int(i.split('_')[1]) - 1)}" for i in index_t],
+            frames=[int(i[4:].split("_")[0]) for i in index_t],
+        )
+        assert np.array_equal(frame_t.to_numpy(), expected_t), "per-track EFD features diverged"
+        per_outline_t = efd.efd_features(shape_t.to_numpy(float).reshape(-1, 10, 4))
+        differing = int((np.abs(per_outline_t - expected_t).max(axis=1) > 1e-9).sum())
+        t_api._tracking_data = None
+        assert t_api._feature_frame(["efd"], None)[2]["front_back"] == "per_outline"
+        print(f"0-2 (R34): with tracking loaded the EFD front/back is decided per track "
+              f"({differing}/12 outlines")
+        print("  differ from the per-outline rule); without tracking it falls back and says so.")
+
+        # --- R35 0-A: the pywebview bridge contract. The dev mock cannot
+        # check this -- its own signatures are JS, so an object argument fits
+        # whatever it declares. Round 34 shipped `set_plot_settings(**settings)`
+        # and every Style/Font/Size change in the real window raised
+        # "takes 1 positional argument but 2 were given", while the mock was
+        # green. Negative controls below prove the check can fail.
+        import tempfile
+
+        app_js = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "app.js")
+        problems = EpiQuantAPI.check_js_api_signatures(app_js)
+        assert not problems, "app.js and EpiQuantAPI disagree:\n  " + "\n  ".join(problems)
+
+        class _BridgeProbe(EpiQuantAPI):
+            def takes_kwargs(self, **settings):
+                pass
+
+            def takes_two(self, a, b=None):
+                pass
+
+        probe_js = os.path.join(tempfile.mkdtemp(), "probe.js")
+        with open(probe_js, "w", encoding="utf-8") as handle:
+            handle.write(
+                "window.EpiQuantAPI.takes_kwargs({a: 1});\n"
+                "window.EpiQuantAPI.takes_two(1, 2, 3);\n"
+                "window.EpiQuantAPI.no_such_method(1);\n"
+                "window.EpiQuantAPI.takes_two(1, {x: [1, 2], y: (a, b) => a + b},);\n"
+                "window.EpiQuantAPI.takes_two('a string, with a comma');\n")
+        caught = _BridgeProbe.check_js_api_signatures(probe_js)
+        assert len(caught) == 3, caught
+        assert any("positionally" in c and "takes_kwargs" in c for c in caught), caught
+        assert any("passes 3 argument(s)" in c and "takes_two" in c for c in caught), caught
+        assert any("no such method" in c for c in caught), caught
+        print("R35 0-A: app.js and EpiQuantAPI agree on every call; the check catches "
+              "**kwargs, an over-long call and a missing method, and is not fooled by "
+              "an object literal, an arrow function, a trailing comma or a quoted comma.")
+
+        # --- R35 3-3: the TA Track-ID export, now reached through Movie
+        # maker instead of its own button. The round trip is the test that
+        # matters: decode with `tracker_comparison.py`'s OWN expression and
+        # require every cell region to carry exactly one track id.
+        ta_dir = tempfile.mkdtemp()
+        masks = os.path.join(ta_dir, "masks")
+        os.makedirs(masks)
+        lattice = np.zeros((20, 20), dtype=np.uint16)
+        lattice[2:9, 2:9], lattice[2:9, 11:18] = 1, 2
+        lattice[11:18, 2:9], lattice[11:18, 11:18] = 3, 4
+        for frame in range(3):
+            np.save(os.path.join(masks, f"ta{frame:04d}_seg.npy"),
+                    {"masks": lattice, "outlines": lattice}, allow_pickle=True)
+        ta_api = EpiQuantAPI()
+        ta_api.set_project(masks, masks, ta_dir)
+        # `npy_folder` is resolved by extraction; this fixture skips extraction
+        # because the export needs only the masks and the tracking table --
+        # which is also why it has no images, the case that used to make this
+        # export fail.
+        ta_api.npy_folder = masks
+        # Four cells, four tracks, one of them deliberately above 0xFF so the
+        # red and green bytes both have to carry something.
+        ta_api._tracking_data = pd.DataFrame({
+            "Track_ID": [1, 2, 300, 70000],
+            **{f"Frame{f}": [f"Cell{f}_{label}" for label in (1, 2, 3, 4)] for f in range(3)},
+        })
+        ta_api._original_tracking_data = ta_api._tracking_data.copy()
+        ta_api._run_movie_render("cellmap", 0, 2, ta_api.TRACK_ID_VALUE)
+        folders = sorted(glob.glob(os.path.join(
+            ta_dir, "quantitative_analysis_output", "TA_tracked_cells_*")))
+        assert folders, "Movie maker wrote no TA export for the Track ID value"
+        frames_written = sorted(d for d in os.listdir(folders[-1])
+                                if os.path.isdir(os.path.join(folders[-1], d)))
+        assert len(frames_written) == 3, frames_written
+        from PIL import Image as _Image
+        for position, folder in enumerate(frames_written):
+            picture = np.array(_Image.open(os.path.join(
+                folders[-1], folder, "tracked_cells_resized.tif"))).astype(np.int64)
+            # tracker_comparison.py:173-175, verbatim.
+            decoded = (picture[..., 0] << 16) | (picture[..., 1] << 8) | picture[..., 2]
+            background = decoded == 0xFFFFFF
+            decoded[background] = 0
+            for label, track in ((1, 1), (2, 2), (3, 300), (4, 70000)):
+                inside = np.unique(decoded[lattice == label])
+                assert inside.tolist() == [track], (folder, label, inside.tolist())
+            assert background[0, 0], "the background must be 0xFFFFFF"
+        # And the frame range comes from the dialog, not from the whole movie.
+        ta_api._run_movie_render("cellmap", 1, 1, ta_api.TRACK_ID_VALUE)
+        latest = sorted(glob.glob(os.path.join(
+            ta_dir, "quantitative_analysis_output", "TA_tracked_cells_*")))[-1]
+        assert len([d for d in os.listdir(latest)
+                    if os.path.isdir(os.path.join(latest, d))]) == 1
+        print("R35 3-3: Track ID exports through Movie maker in TA format; "
+              "tracker_comparison's own decoder reads back 1, 2, 300 and 70000 "
+              "exactly, background 0xFFFFFF, and the frame range is the dialog's.")
+
+        # --- R36 1: the registration compensation must be subtracted along
+        # the axis it was measured on. Two movies, each a PURE translation of a
+        # rigid lattice: after compensation the residual field must be ~0. With
+        # the two lines crossed, the x-drift movie leaves its whole drift in
+        # dY and vice versa -- which is why `assert_compensates` is run with
+        # the lines swapped as well, and must fail.
+        def translation_api(dx: int, dy: int, frames: int = 4):
+            """A movie where nothing moves except the whole field of view."""
+            folder = tempfile.mkdtemp()
+            masks = os.path.join(folder, "masks")
+            os.makedirs(masks)
+            base = np.zeros((120, 120), dtype=np.uint16)
+            label = 0
+            centres = {}
+            for row in range(3):
+                for column in range(3):
+                    label += 1
+                    top, left = 12 + row * 32, 12 + column * 32
+                    base[top:top + 18, left:left + 18] = label
+                    centres[label] = (left + 8.5, top + 8.5)
+            arrays = {}
+            for frame in range(frames):
+                moved = np.zeros_like(base)
+                shifted = np.roll(np.roll(base, dy * frame, axis=0), dx * frame, axis=1)
+                moved[:] = shifted
+                arrays[frame] = moved
+                # `img` embedded, Cellpose-style: `_registration` loads every
+                # frame through `_load_frame`, which insists on a base image.
+                np.save(os.path.join(masks, f"drift{frame:04d}_seg.npy"),
+                        {"masks": moved, "outlines": moved,
+                         "img": (moved > 0).astype(np.uint8) * 200}, allow_pickle=True)
+            probe = EpiQuantAPI()
+            probe.set_project(masks, masks, folder)
+            probe.npy_folder = masks
+            rows = []
+            for frame in range(frames):
+                for label, (cx, cy) in centres.items():
+                    rows.append({"Cell Index": f"Cell{frame}_{label}",
+                                 "Center X Coordinate": cx + dx * frame,
+                                 "Center Y Coordinate": cy + dy * frame,
+                                 "Cell Area": 324.0,
+                                 "Circumscribed Circle Radius": 12.7})
+            probe._cells_info = pd.DataFrame(rows)
+            probe._tracking_data = pd.DataFrame({
+                "Track_ID": list(centres),
+                **{f"Frame{f}": [f"Cell{f}_{l}" for l in centres] for f in range(frames)},
+            })
+            probe._original_tracking_data = probe._tracking_data.copy()
+            return probe
+
+        def residual(probe, registration):
+            result = probe.get_streamlines_plot(0, 3, None, False, registration)
+            assert "error" not in result, result
+            build, spec = probe._chart_specs["cell_streamlines"]
+            vectors = trajectory_visualization.compute_displacement_vectors(
+                probe._tracking_data, probe._cells_info, spec["start"], spec["end"]).copy()
+            vectors["dX"] -= spec["drift"][0]
+            vectors["dY"] -= spec["drift"][1]
+            return float(np.hypot(vectors["dX"], vectors["dY"]).max())
+
+        for name, (dx, dy) in (("x-only", (7, 0)), ("y-only", (0, 7))):
+            probe = translation_api(dx, dy)
+            measured = probe._registration().get("drift_by_frame", {})
+            assert measured, f"{name}: no drift measured, the fixture does not drift"
+            before = residual(probe, "off")
+            after = residual(probe, "on")
+            assert before > 15, f"{name}: the fixture barely drifts ({before:.2f} px)"
+            assert after < 0.5, f"{name}: residual {after:.2f} px after compensation"
+            # The crossed version, which is what shipped in Round 35.
+            crossed = trajectory_visualization.compute_displacement_vectors(
+                probe._tracking_data, probe._cells_info, 0, 3).copy()
+            _, spec = probe._chart_specs["cell_streamlines"]
+            crossed["dX"] -= spec["drift"][1]
+            crossed["dY"] -= spec["drift"][0]
+            swapped = float(np.hypot(crossed["dX"], crossed["dY"]).max())
+            assert swapped > 15, (
+                f"{name}: swapping the axes must NOT compensate, got {swapped:.2f} px")
+            print(f"R36 1: {name} drift -- residual {before:.1f} px off, {after:.2f} px on, "
+                  f"{swapped:.1f} px with dx/dy crossed (Round 35's bug).")
+
+        # --- A project written before Round 34. `AS_LE_lateral view_E-cad`
+        # is one: its `Cells_info_PCA.xlsx` still has the retired `PC_score`,
+        # and reading it blanked every value picker in the app, so Clone
+        # multiple cells and Morphospace read as "cannot load this project".
+        legacy_dir = tempfile.mkdtemp()
+        legacy_api = EpiQuantAPI()
+        legacy_api.output_dirs = common.setup_output_dirs(legacy_dir)
+        legacy_scores = pd.DataFrame(
+            {"PC1": [0.5, -0.5, 0.1], "PC2": [0.2, 0.3, -0.4],
+             "PC_score": [0.4, -0.2, 0.0]},
+            index=pd.Index([f"Cell1_{i}" for i in (1, 2, 3)], name="Cell Index"))
+        legacy_scores.to_excel(os.path.join(
+            legacy_api.output_dirs["cell_classification_output"], "Cells_info_PCA.xlsx"))
+        loaded = legacy_api._load_pca_scores()
+        assert loaded is not None, "the old table did not load at all"
+        assert "PC_score" not in loaded.columns, "the retired column came back"
+        assert list(loaded.columns) == ["PC1", "PC2"], list(loaded.columns)
+
+        legacy_api._cells_info = pd.DataFrame({
+            "Cell Index": [f"Cell1_{i}" for i in (1, 2, 3)],
+            "Cell Area": [100.0, 110.0, 120.0]})
+        legacy_api._tracking_data = pd.DataFrame({
+            "Track_ID": [1, 2, 3],
+            "Frame1": [f"Cell1_{i}" for i in (1, 2, 3)]})
+        legacy_api._original_tracking_data = legacy_api._tracking_data.copy()
+        catalog = legacy_api.get_value_catalog()
+        assert catalog["error"] is None, catalog["error"]
+        columns = {entry["column"] for entry in catalog["values"]}
+        assert {"Cell Area", "PC1", "PC2"} <= columns, columns
+        assert "PC_score" not in columns
+        assert catalog.get("skipped") == [], catalog.get("skipped")
+        print("R36 fix: a pre-Round-34 Cells_info_PCA.xlsx loads, its retired "
+              "PC_score is dropped on read, and the value catalog keeps "
+              f"{len(columns)} values instead of collapsing to none.")
 
         print("\nAll api self-tests passed.")
         raise SystemExit(0)
@@ -4893,10 +8512,10 @@ if __name__ == "__main__":
 
     print("\n== extraction ==")
     api._run_extraction(mask_type="auto", background_area_ratio=10.0, exclude_edge_cells=False)
-    assert api.cells_info is not None, "extraction failed, see log above"
-    print(f"Extracted {len(api.cells_info)} cells, {api.get_frame_count()} frames")
+    assert api._cells_info is not None, "extraction failed, see log above"
+    print(f"Extracted {len(api._cells_info)} cells, {api.get_frame_count()} frames")
 
-    first_frame = int(re.search(r"Cell(\d+)_", api.cells_info["Cell Index"].iloc[0]).group(1))
+    first_frame = int(re.search(r"Cell(\d+)_", api._cells_info["Cell Index"].iloc[0]).group(1))
     raw_img = api.get_raw_frame_image(first_frame)
     print(f"Raw frame {first_frame} image: {len(raw_img) if raw_img else 0} base64 chars")
 
@@ -4906,7 +8525,7 @@ if __name__ == "__main__":
             include_tissue=True, efd_order=10, n_contour_points=256,
             smoothing_sigma_fraction=0.02, with_coefficients=True,
         )
-        assert api.cells_shape is not None, "shape extraction failed, see log above"
+        assert api._cells_shape is not None, "shape extraction failed, see log above"
         summary = api.get_shape_feature_summary()
         for table, block in summary.items():
             medians = {k: round(v["median"], 3) for k, v in list(block["columns"].items())[:5] if v["median"] is not None}
@@ -4959,15 +8578,15 @@ if __name__ == "__main__":
         presets = api.get_palette_presets()
         print(f"Palette presets available: {list(presets.keys())}")
         tab10 = presets["tab10"]
-        labels = sorted(int(l) for l in api.clustering_data["Cluster_Label"].unique())
+        labels = sorted(int(l) for l in api._clustering_data["Cluster_Label"].unique())
         api.set_cluster_colors({lbl: tab10[i % len(tab10)] for i, lbl in enumerate(labels)})
         print("Legend after coloring:", api.get_cluster_legend())
 
         overlay_b64 = api.get_classification_overlay(first_frame)
         print(f"Classification overlay for frame {first_frame}: {len(overlay_b64) if overlay_b64 else 0} base64 chars")
 
-        first_cell_index = api.clustering_data["Cell_Index"].iloc[0]
-        old_label = int(api.clustering_data["Cluster_Label"].iloc[0])
+        first_cell_index = api._clustering_data["Cell_Index"].iloc[0]
+        old_label = int(api._clustering_data["Cluster_Label"].iloc[0])
         new_label = labels[(labels.index(old_label) + 1) % len(labels)]
         print(f"\n== manual cluster correction: {first_cell_index} {old_label} -> {new_label} ==")
         print("Legend after reassignment:", api.reassign_cluster(first_cell_index, new_label))
@@ -4980,15 +8599,21 @@ if __name__ == "__main__":
             api.save_cells_info_leading_edge()
             print("Saved leading_edge column.")
         else:
-            print(f"\ncan_compute_leading_edge() is False (k={api.clustering_data['Cluster_Label'].nunique()}) -- skipping.")
+            print(f"\ncan_compute_leading_edge() is False (k={api._clustering_data['Cluster_Label'].nunique()}) -- skipping.")
 
     print("\n== tracking ==")
     mode_options = api.get_tracking_mode_options()
     print("Tracking mode options:", mode_options)
     mode = "split" if mode_options["split_available"] else "single"
     api._run_tracking(mode=mode)
-    assert api.tracking_data is not None, "tracking failed, see log above"
-    print(f"Tracked {len(api.tracking_data)} tracks (mode={mode})")
+    assert api._tracking_data is not None, "tracking failed, see log above"
+    print(f"Tracked {len(api._tracking_data)} tracks (mode={mode})")
+
+    # The state that froze the UI is a POPULATED api, so check it here too and
+    # not only on the empty instance in `--self-test` (R29 10).
+    hazards = bridge_hazards(api)
+    assert not hazards, f"public attributes pywebview would walk: {hazards}"
+    print("No public DataFrame/ndarray on the bridged object (checked with every table loaded).")
 
     track_overlay = api.get_tracking_overlay(first_frame)
     print(f"Tracking overlay for frame {first_frame}: {len(track_overlay) if track_overlay else 0} base64 chars")
@@ -5012,8 +8637,8 @@ if __name__ == "__main__":
             print("swap_tracks (expect a graceful dict, error or success):",
                   api.swap_tracks(frame_range["min_frame"], old_id, other_track))
 
-            first_cell_at_min_frame = api.cells_info[
-                api.cells_info["Cell Index"].str.startswith(f"Cell{frame_range['min_frame']}_")
+            first_cell_at_min_frame = api._cells_info[
+                api._cells_info["Cell Index"].str.startswith(f"Cell{frame_range['min_frame']}_")
             ]["Cell Index"].iloc[0]
             print("suggest_match_candidates (expect a graceful dict):",
                   api.suggest_match_candidates(frame_range["min_frame"], first_cell_at_min_frame))
@@ -5030,9 +8655,9 @@ if __name__ == "__main__":
             print("\n== coverage log ==")
             frames_present = sorted({int(m.group(1)) for m in
                                      (re.match(r"Cell(\d+)_", str(c))
-                                      for c in api.cells_info["Cell Index"]) if m})
+                                      for c in api._cells_info["Cell Index"]) if m})
             looked_at, never_opened = frames_present[0], frames_present[-1]
-            cells_here = [c for c in api.cells_info["Cell Index"]
+            cells_here = [c for c in api._cells_info["Cell Index"]
                           if str(c).startswith(f"Cell{looked_at}_")]
             api.log_coverage_event("frame_shown", looked_at, ms_elapsed=9000,
                                    zoom_percent=200, render_mode="mask", color_mode="identity")
@@ -5070,10 +8695,10 @@ if __name__ == "__main__":
             if plan is None:
                 print("  no track produced a non-empty plan on this movie -- nothing to verify")
             else:
-                before_table = api.tracking_data.copy(deep=True)
+                before_table = api._tracking_data.copy(deep=True)
                 report = api.verify_confirmed_identity_moves(plan_track, plan["moves"])
                 assert not report.get("error"), report
-                assert api.tracking_data.astype(str).equals(before_table.astype(str)), \
+                assert api._tracking_data.astype(str).equals(before_table.astype(str)), \
                     "verifying a plan must not mutate the live tracking table"
                 print(f"  track #{plan_track}: {len(plan['moves'])} move(s) -- "
                       f"{len(report['double_claimed'])} double-claim, "
@@ -5101,11 +8726,11 @@ if __name__ == "__main__":
             if started.get("error"):
                 print("  census unavailable:", started["error"])
             else:
-                table_before = api.tracking_data.copy(deep=True)
+                table_before = api._tracking_data.copy(deep=True)
                 assert api.queue_census_edit(0, 1).get("error"), "a census session must not edit"
                 assert api.apply_census_edits().get("error"), "a census session must not apply"
                 api.submit_census_verdict(0, "correct", None, 1200.0)
-                assert api.tracking_data.astype(str).equals(table_before.astype(str)), \
+                assert api._tracking_data.astype(str).equals(table_before.astype(str)), \
                     "a census session must never mutate the tracking table"
 
                 # Round 23 D: a "wrong" verdict with a tile chosen must record
@@ -5135,7 +8760,7 @@ if __name__ == "__main__":
                     print(f"  a chosen tile is recorded with its source and rank: "
                           f"{last['chosen_reason']} at rank {last['chosen_rank']}, "
                           f"register={last['register']}.")
-                    assert api.tracking_data.astype(str).equals(table_before.astype(str)), \
+                    assert api._tracking_data.astype(str).equals(table_before.astype(str)), \
                         "a census session must never mutate the tracking table"
                 gt_size = os.path.getsize(gt_path)
                 print(f"  census mode: {started['n_real']} links, "
@@ -5154,15 +8779,15 @@ if __name__ == "__main__":
                     "queueing the tracker's own answer must be refused as a no-op"
                 api.queue_census_edit(0, alternative["label"])
                 preview = api.preview_census_edits()
-                snapshot = api.tracking_data.copy(deep=True)
+                snapshot = api._tracking_data.copy(deep=True)
                 applied = api.apply_census_edits()
                 assert applied.get("applied") == 1, applied
-                assert not api.tracking_data.astype(str).equals(snapshot.astype(str)), \
+                assert not api._tracking_data.astype(str).equals(snapshot.astype(str)), \
                     "applying a correction must actually change the table"
                 assert os.path.getsize(gt_path) == gt_size, \
                     "a correction session must not append to ground_truth_links.csv"
                 api.undo_census_edits()
-                assert api.tracking_data.astype(str).equals(snapshot.astype(str)), \
+                assert api._tracking_data.astype(str).equals(snapshot.astype(str)), \
                     "undo must restore the snapshot exactly"
                 print(f"  correction mode: no decoys/repeats; verdicts refused; "
                       f"{preview['pending']} pending applied as one batch; "
@@ -5190,6 +8815,17 @@ if __name__ == "__main__":
                 print(f"  anchor frame {anchor}: {sizes}")
                 print("  every crop within +/-1 shares one window; beyond that it re-centres "
                       "and says so.")
+
+            # --- Round 32 T1-4: the trajectory overlay with NO track. It
+            # reached the user as `int(None)` because nothing had ever called
+            # it that way; the frontend sends `null` when no track is selected.
+            print("\n== trajectory overlay without a track (R32 T1-4) ==")
+            mid = api.get_frame_numbers()[len(api.get_frame_numbers()) // 2]
+            for mode in ("highlight", "dynamics"):
+                result = api.get_trajectory_overlay(None, mid, color_mode=mode)
+                assert mode == "dynamics" or result is None, (mode, type(result))
+                print(f"  {mode:9s}: no exception, returned "
+                      f"{'an image' if result else 'None (nothing to highlight)'}")
 
             # --- Round 17 C3: `settled only` must leave NO transient T1 cell
             # fill on the frame. Asserted by counting painted pixels, not by
@@ -5220,13 +8856,25 @@ if __name__ == "__main__":
                     # A cell is FILLED when most of its pixels changed; a few
                     # changed pixels are a neighbouring settled event's axis
                     # line crossing it, which is not a fill.
-                    filled = set()
+                    # A cell can also be painted by the DIVISION or
+                    # delamination layer, which this test is not about. Round
+                    # 30 hit exactly that: the continuation-division detector
+                    # added 2026-10-19 paints a cell that also carries a
+                    # transient T1, and the pixel test read the division fill
+                    # as a T1-filter leak. Attribute the fill before judging it.
+                    states = api._dynamics_states(t1_frame)
+                    other_layer = {int(label) for label, entry in states.items()
+                                   if entry.get("event") != "t1"}
+                    filled, filled_by_other = set(), set()
                     for label in transient:
                         mask = t1_labels == label
                         if not mask.any():
                             continue
                         if (overlay[mask] != base_png[mask]).any(axis=1).mean() > 0.5:
-                            filled.add(int(label))
+                            (filled_by_other if label in other_layer else filled).add(int(label))
+                    if filled_by_other:
+                        print(f"  {mode:11s}: {len(filled_by_other)} transient cell(s) painted by "
+                              f"another dynamics layer, not by the T1 filter: {sorted(filled_by_other)}")
                     print(f"  {mode:11s}: {len(drawn):3d} T1 cells drawn, "
                           f"{len(filled)} of {len(transient)} transient cells filled")
                     if mode == "persistent":
@@ -5256,10 +8904,10 @@ if __name__ == "__main__":
                 track = item["track_id"]
                 api.queue_census_edit(0, chosen)
 
-                before_table = api.tracking_data.copy(deep=True)
+                before_table = api._tracking_data.copy(deep=True)
                 result = api.apply_census_edits()
                 assert result.get("applied") == 1, result
-                after = api.tracking_data
+                after = api._tracking_data
 
                 # (2) the cell for that track at that frame is now the chosen one
                 row = after.index[after[after.columns[0]] == track][0]
@@ -5319,15 +8967,15 @@ if __name__ == "__main__":
                 on_disk = pd.read_excel(os.path.join(
                     api.output_dirs["cell_track_output"], "all_cell_tracking",
                     "all_cell_merged_tracking_results.xlsx"))
-                assert on_disk.shape == api.tracking_data.shape, (on_disk.shape, api.tracking_data.shape)
+                assert on_disk.shape == api._tracking_data.shape, (on_disk.shape, api._tracking_data.shape)
                 assert on_disk.fillna("~").astype(str).equals(
-                    api.tracking_data.reset_index(drop=True).fillna("~").astype(str)), \
+                    api._tracking_data.reset_index(drop=True).fillna("~").astype(str)), \
                     "the saved .xlsx does not match the in-memory table"
                 print("  saved .xlsx matches the in-memory table exactly.")
 
                 # (4) one undo restores byte-identically
                 api.undo_census_edits()
-                assert api.tracking_data.astype(str).equals(before_table.astype(str)), \
+                assert api._tracking_data.astype(str).equals(before_table.astype(str)), \
                     "undo must restore the table byte-identically"
                 api.save_tracking()
                 print("  one undo restores the table byte-identically, and re-saves it.")

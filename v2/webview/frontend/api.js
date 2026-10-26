@@ -10,6 +10,15 @@
     return typeof window.pywebview !== "undefined" && window.pywebview.api;
   }
 
+  window.isNativeEpiQuant = window.location.hash === "#epi-quant-native";
+  window.pywebviewReady = new Promise((resolve) => {
+    if (hasPywebview()) {
+      resolve();
+    } else {
+      window.addEventListener("pywebviewready", resolve, { once: true });
+    }
+  });
+
   // 1x1 transparent PNG, used as a stand-in "image" for every mock overlay.
   const MOCK_PNG =
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -28,13 +37,37 @@
     // The two Round 27 census sets re-solve the frame pairs, so they need the
     // feature table; the real API refuses without it and so does the mock.
     extracted: false,
+    // Round 34: what the last Classify run decided for itself, which gates the
+    // PC-valued plots. `per_outline` + tracking loaded is the warned case, and
+    // `independent_samples` the refused one; both start off so dev mode shows
+    // the ordinary path first.
+    datasetMode: "time_series",
+    classified: false,
+    plotSettings: { style: "default", font_size: "M", line_width: "normal",
+                    size_preset: "single", font_family: null, error_band: "SD" },
+    timeWindows: { trajectory: null, playground: null },
+    lastChart: null,
+    movieCancelled: false,
+    jointPcaNames: [],
+    pcaSource: "project",
+    groupMode: "clusters",
+    groups: [],
+    classificationFrontBack: null,
+    trackingLoaded: false,
     inspection: null,
+    saves: [],
     hasLeadingEdge: false,
     hasShape: false,
     trackingCost: { mode: "hybrid", overlap_weight: 1.0, centroid_weight: 1.0,
-                    motion_compensation: false, max_frame_gap: 0, drift_mode: "none" },
+                    motion_compensation: false, max_frame_gap: 0, drift_mode: "none", gate_scale: 1.0 },
     t1PersistFrames: 1,
     t1Enter: null, t1Exit: null, t1EventFilter: "persistent",
+    // Round 30: seconds are the stored truth, frames are derived. `null`
+    // interval reproduces a project that has not said how long a frame is.
+    frameIntervalSec: null, t1MinDurationSec: 150,
+    t1MinInterfacePx: 2, t1QuartetFilter: false, pixelSizeUm: null,
+    // A mock movie's derived default, standing in for the backend sweep.
+    t1LengthFilter: false, t1MinLengthPx: null, t1DerivedLengthPx: 2,
     registerReference: true,
     deadBand: 0.75,
     repairThreshold: 0.5,
@@ -147,7 +180,11 @@
       return { cluster_sizes: { cluster_1: 120, cluster_2: 30 }, k_used: 2 };
     },
     async load_existing_tracking() {
-      return { track_count: mockState.trackNumbers.length, duplicates_cleaned: 0 };
+      mockState.trackingLoaded = true;
+      // Honest to the real shape: a stored table can hold rows with no cell.
+      return { track_count: mockState.trackNumbers.length + 2,
+               tracks_with_cells: mockState.trackNumbers.length,
+               empty_rows: 2, duplicates_cleaned: 0 };
     },
     async start_extraction(_maskType, _bgRatio, _excludeEdge) {
       mockState.preR24CellsInfo = false;
@@ -258,10 +295,15 @@
       return ["junction_contrast", "boundary_contrast", "morphology", "neighbor_count", "measurement_failures"];
     },
     async get_tracking_cost() {
-      return { ...mockState.trackingCost, default_overlap_weight: 1.0 };
+      return { ...mockState.trackingCost, default_overlap_weight: 1.0, default_gate_scale: 1.0 };
     },
-    async set_tracking_cost(mode, overlapWeight, motionCompensation, maxFrameGap, driftMode) {
+    async set_tracking_cost(mode, overlapWeight, motionCompensation, maxFrameGap, driftMode, gateScale) {
       if (driftMode) mockState.trackingCost.drift_mode = driftMode;
+      if (gateScale !== null && gateScale !== undefined) {
+        // Same contract as the real API: a non-positive scale is an error, not a clamp.
+        if (!(gateScale > 0)) throw new Error(`gate_scale must be > 0, got ${gateScale}`);
+        mockState.trackingCost.gate_scale = gateScale;
+      }
       if (maxFrameGap !== null && maxFrameGap !== undefined) {
         mockState.trackingCost.max_frame_gap = Math.max(0, maxFrameGap);
       }
@@ -277,11 +319,103 @@
       if (motionCompensation !== null && motionCompensation !== undefined) {
         mockState.trackingCost.motion_compensation = !!motionCompensation;
       }
-      return { ...mockState.trackingCost, default_overlap_weight: 1.0 };
+      return { ...mockState.trackingCost, default_overlap_weight: 1.0, default_gate_scale: 1.0 };
     },
     async get_t1_persistence() {
       return { value: mockState.t1PersistFrames, enter_px: mockState.t1Enter,
-               exit_px: mockState.t1Exit, event_filter: mockState.t1EventFilter };
+               exit_px: mockState.t1Exit, event_filter: mockState.t1EventFilter,
+               ...mockApi._t1Bounds() };
+    },
+    // Mirrors `EpiQuantAPI.t1_persist_bounds`, including the derivation of the
+    // frame count from seconds: a mock that returned a fixed 10 would hide the
+    // very behaviour Round 30 E added.
+    _t1Bounds() {
+      const interval = mockState.frameIntervalSec;
+      const frames = interval
+        ? Math.max(0, Math.ceil(mockState.t1MinDurationSec / interval))
+        : mockState.t1PersistFrames;
+      return { frame_interval_sec: interval, min_duration_sec: mockState.t1MinDurationSec,
+               frames, max_frames: interval ? Math.max(1, Math.ceil(600 / interval)) : 30,
+               max_duration_sec: 600, derived: !!interval };
+    },
+    async set_frame_interval(seconds) {
+      if (seconds === null || seconds === undefined || seconds === 0) {
+        mockState.frameIntervalSec = null;
+      } else {
+        if (seconds <= 0) throw new Error(`frame interval must be positive, got ${seconds}`);
+        mockState.frameIntervalSec = seconds;
+      }
+      return mockApi.get_acquisition();
+    },
+    async set_t1_min_duration(seconds) {
+      mockState.t1MinDurationSec = Math.max(0, seconds || 0);
+      return mockApi._t1Bounds();
+    },
+    // Mirrors the backend's refusal: a micron threshold without a pixel size
+    // is an error, not a silent switch to pixels. The mock has to return the
+    // error path too, or dev-mode click-through cannot see it.
+    // Mirrors the Round 33 backend: the minimum is in TRUE pixels and runs
+    // without a pixel size; empty means "derive from this movie", and with
+    // nothing to derive from enabling is refused with the reason.
+    async set_t1_length_filter(enabled, minLengthPx, useMovieDefault) {
+      if (useMovieDefault) mockState.t1MinLengthPx = null;
+      else if (minLengthPx != null) mockState.t1MinLengthPx = minLengthPx;
+      mockState.t1LengthFilter = !!enabled;
+      if (enabled && mockState.t1MinLengthPx == null && mockState.t1DerivedLengthPx == null) {
+        mockState.t1LengthFilter = false;
+        return { error: "No threshold to apply yet: track the movie so one can be derived " +
+                        "from it, or type one in.", ...mockApi._lengthSettings() };
+      }
+      return mockApi._lengthSettings();
+    },
+    async t1_length_settings() { return mockApi._lengthSettings(); },
+    _lengthSettings() {
+      const size = mockState.pixelSizeUm;
+      const explicit = mockState.t1MinLengthPx;
+      const px = explicit != null ? explicit : mockState.t1DerivedLengthPx;
+      return { enabled: mockState.t1LengthFilter, min_length_px: px,
+               source: explicit != null ? "set by you"
+                     : (px != null ? "derived from this movie" : "not derived yet"),
+               pixel_size_um: size,
+               min_length_um: (px != null && size) ? Math.round(1000 * px * size) / 1000 : null };
+    },
+    async set_t1_quartet_filter(enabled) {
+      mockState.t1QuartetFilter = !!enabled;
+      return mockApi._t1Parameters();
+    },
+    async set_pixel_size(micronsPerPixel) {
+      if (micronsPerPixel === null || micronsPerPixel === undefined || micronsPerPixel === 0) {
+        mockState.pixelSizeUm = null;
+      } else {
+        if (micronsPerPixel <= 0) throw new Error(`pixel size must be positive, got ${micronsPerPixel}`);
+        mockState.pixelSizeUm = micronsPerPixel;
+      }
+      return mockApi.get_acquisition();
+    },
+    async get_acquisition() {
+      return { frame_interval_sec: mockState.frameIntervalSec, pixel_size_um: mockState.pixelSizeUm,
+               ...mockApi._t1Bounds() };
+    },
+    async set_t1_min_interface_px(pixels) {
+      if (pixels != null && pixels < 0) throw new Error("min_interface_px must be >= 0");
+      mockState.t1MinInterfacePx = pixels == null ? 2 : pixels;
+      return mockApi._t1Parameters();
+    },
+    _t1Parameters() {
+      return { enter_px: mockState.t1Enter, exit_px: mockState.t1Exit, dilation_px: 2,
+               persist_frames: mockApi._t1Bounds().frames,
+               event_filter: mockState.t1EventFilter,
+               adjacency: "interface",
+               adjacency_used: ["interface"],
+               min_interface_px: mockState.t1MinInterfacePx,
+               gap_px: 3,
+               quartet_filter: mockState.t1QuartetFilter,
+               // R31 D: the interface graph carries lengths, so a band set
+               // here really does act -- unlike Round 30, where it did not.
+               band_active: mockState.t1Enter != null,
+               min_duration_sec: mockState.t1MinDurationSec,
+               frame_interval_sec: mockState.frameIntervalSec,
+               pixel_size_um: mockState.pixelSizeUm };
     },
     async set_t1_hysteresis(enterPx, exitPx) {
       if (enterPx == null || exitPx == null) { mockState.t1Enter = mockState.t1Exit = null; }
@@ -300,7 +434,10 @@
     },
     async set_t1_persistence(value) {
       mockState.t1PersistFrames = Math.max(0, value || 0);
-      return { value: mockState.t1PersistFrames };
+      if (mockState.frameIntervalSec) {
+        mockState.t1MinDurationSec = mockState.t1PersistFrames * mockState.frameIntervalSec;
+      }
+      return { value: mockState.t1PersistFrames, ...mockApi._t1Bounds() };
     },
     async get_junction_min_px() {
       return { value: 21, auto: 21, is_override: false };
@@ -339,8 +476,18 @@
         Dark2: ["#1b9e77", "#d95f02", "#7570b3", "#e7298a", "#66a61e", "#e6ab02", "#a6761d", "#666666"],
       };
     },
-    async run_classification(_n, _k, _rs, featureFamilies, selectedFeatures, _prune, datasetMode) {
+    async run_classification(_n, _k, _rs, featureFamilies, selectedFeatures, _prune, datasetMode,
+                             varianceThreshold) {
       const families = featureFamilies && featureFamilies.length ? featureFamilies : ["basic"];
+      const threshold = varianceThreshold === undefined ? 0.85 : varianceThreshold;
+      // Keep the real rule: below 1 is a cumulative-variance fraction, 1 or
+      // more is a component count. The mock answering a fixed 2 would hide
+      // exactly the mistake the control exists to prevent.
+      const kept = threshold >= 1 ? Math.round(threshold) : 2;
+      mockState.datasetMode = datasetMode || "time_series";
+      mockState.classified = true;
+      mockState.classificationFrontBack = families.includes("efd")
+        ? (mockState.trackingLoaded ? "per_track" : "per_outline") : null;
       return {
         cluster_sizes: { cluster_1: 120, cluster_2: 30 },
         k_used: 2,
@@ -350,7 +497,305 @@
         standardize_mode: families.includes("efd") ? "none" : "global",
         dataset_mode: datasetMode || "time_series",
         cells_used: 500,
+        variance_threshold: threshold,
+        components_kept: kept,
+        front_back: families.includes("efd")
+          ? (mockState.trackingLoaded ? "per_track" : "per_outline") : undefined,
       };
+    },
+    // --- Round 34: plots, the data layer, exports, movies, joint PCA ---
+    // Kept honest to the real response SHAPE, including the error and empty
+    // paths: a mock that always succeeded hid a propagation failure twice
+    // before, so each of these can return the refusal the backend returns.
+    // R35 0-A: these are a SNAPSHOT of what the real backend returns on the
+    // maintainer's machine (Matplotlib 3.10.3), not a hand-written short list.
+    // The mock used to offer 4 styles and 3 fonts against the real 30 and 382,
+    // which is most of "the menus look empty". A mock may stand in for layout;
+    // it may not make up what the options are.
+    async get_plot_options() {
+      return {
+        styles: ["default", "Solarize_Light2", "_classic_test_patch", "_mpl-gallery", "_mpl-gallery-nogrid", "bmh", "classic", "dark_background", "fast", "fivethirtyeight", "ggplot", "grayscale", "petroff10", "seaborn-v0_8", "seaborn-v0_8-bright", "seaborn-v0_8-colorblind", "seaborn-v0_8-dark", "seaborn-v0_8-dark-palette", "seaborn-v0_8-darkgrid", "seaborn-v0_8-deep", "seaborn-v0_8-muted", "seaborn-v0_8-notebook", "seaborn-v0_8-paper", "seaborn-v0_8-pastel", "seaborn-v0_8-poster", "seaborn-v0_8-talk", "seaborn-v0_8-ticks", "seaborn-v0_8-white", "seaborn-v0_8-whitegrid", "tableau-colorblind10"],
+        fonts: [".Aqua Kana", ".Keyboard", ".New York", ".SF Arabic", ".SF Arabic Rounded", ".SF Armenian", ".SF Armenian Rounded", ".SF Camera", ".SF Compact", ".SF Compact Rounded", ".SF Georgian", ".SF Georgian Rounded", ".SF Hebrew", ".SF Hebrew Rounded", ".SF NS Mono", ".SF NS Rounded", ".SF Soft Numeric", ".ThonburiUI", "Academy Engraved LET", "Al Bayan", "Al Nile", "Al Tarikh", "American Typewriter", "Andale Mono", "Apple Braille", "Apple Chancery", "Apple LiGothic", "Apple LiSung", "Apple SD Gothic Neo", "Apple Symbols", "AppleGothic", "AppleMyungjo", "Arial", "Arial Black", "Arial Hebrew", "Arial Narrow", "Arial Rounded MT Bold", "Arial Unicode MS", "Athelas", "Avenir", "Avenir Next", "Avenir Next Condensed", "Ayuthaya", "BIZ UDGothic", "BIZ UDMincho", "BM Dohyeon", "BM Hanna 11yrs Old", "BM Hanna Air", "BM Hanna Pro", "BM Jua", "BM Kirang Haerang", "BM Yeonsung", "Baghdad", "Bangla MN", "Bangla Sangam MN", "Baoli SC", "Baskerville", "Beirut", "BiauKaiHK", "Big Caslon", "Bodoni 72", "Bodoni 72 Oldstyle", "Bodoni 72 Smallcaps", "Bodoni Ornaments", "Bradley Hand", "Brush Script MT", "Canela Text", "Chalkboard", "Chalkboard SE", "Chalkduster", "Charter", "Cochin", "Comic Sans MS", "Copperplate", "Corsiva Hebrew", "Courier", "Courier New", "DIN Alternate", "DIN Condensed", "Damascus", "DecoType Naskh", "DejaVu Sans", "DejaVu Sans Display", "DejaVu Sans Mono", "DejaVu Serif", "DejaVu Serif Display", "Devanagari MT", "Devanagari Sangam MN", "Didot", "Diwan Kufi", "Diwan Thuluth", "Euphemia UCAS", "Farah", "Farisi", "Founders Grotesk", "Founders Grotesk Condensed", "Founders Grotesk Text", "Futura", "Galvji", "Geeza Pro", "Geneva", "Georgia", "Gill Sans", "Graphik", "Gujarati MT", "Gujarati Sangam MN", "GungSeo", "Gurmukhi MN", "Gurmukhi MT", "Gurmukhi Sangam MN", "Hannotate SC", "HanziPen SC", "HeadLineA", "Hei", "Heiti TC", "Helvetica", "Helvetica Neue", "Herculanum", "Hiragino Maru Gothic Pro", "Hiragino Mincho ProN", "Hiragino Sans", "Hiragino Sans CNS", "Hiragino Sans GB", "Hoefler Text", "ITF Devanagari", "Impact", "InaiMathi", "Iowan Old Style", "Kai", "Kailasa", "Kaiti SC", "Kannada MN", "Kannada Sangam MN", "Kefa", "Khmer MN", "Khmer Sangam MN", "Klee", "Kohinoor Bangla", "Kohinoor Devanagari", "Kohinoor Gujarati", "Kohinoor Telugu", "Kokonor", "Krungthep", "KufiStandardGK", "Lantinghei SC", "Lao MN", "Lao Sangam MN", "LiHei Pro", "LiSong Pro", "Libian SC", "LingWai SC", "LingWai TC", "Lucida Grande", "Luminari", "Malayalam MN", "Malayalam Sangam MN", "Marion", "Marker Felt", "Menlo", "Microsoft Sans Serif", "Mishafi", "Mishafi Gold", "Monaco", "Mshtakan", "Mukta Mahee", "Muna", "Myanmar MN", "Myanmar Sangam MN", "Nadeem", "Nanum Brush Script", "Nanum Gothic", "Nanum Myeongjo", "New Peninim MT", "Noteworthy", "Noto Nastaliq Urdu", "Noto Sans Adlam", "Noto Sans Armenian", "Noto Sans Avestan", "Noto Sans Bamum", "Noto Sans Bassa Vah", "Noto Sans Batak", "Noto Sans Bhaiksuki", "Noto Sans Brahmi", "Noto Sans Buginese", "Noto Sans Buhid", "Noto Sans Canadian Aboriginal", "Noto Sans Carian", "Noto Sans Caucasian Albanian", "Noto Sans Chakma", "Noto Sans Cham", "Noto Sans Coptic", "Noto Sans Cuneiform", "Noto Sans Cypriot", "Noto Sans Duployan", "Noto Sans Egyptian Hieroglyphs", "Noto Sans Elbasan", "Noto Sans Glagolitic", "Noto Sans Gothic", "Noto Sans Gunjala Gondi", "Noto Sans Hanifi Rohingya", "Noto Sans Hanunoo", "Noto Sans Hatran", "Noto Sans Imperial Aramaic", "Noto Sans Inscriptional Pahlavi", "Noto Sans Inscriptional Parthian", "Noto Sans Javanese", "Noto Sans Kaithi", "Noto Sans Kannada", "Noto Sans Kayah Li", "Noto Sans Kharoshthi", "Noto Sans Khojki", "Noto Sans Khudawadi", "Noto Sans Lepcha", "Noto Sans Limbu", "Noto Sans Linear A", "Noto Sans Linear B", "Noto Sans Lisu", "Noto Sans Lycian", "Noto Sans Lydian", "Noto Sans Mahajani", "Noto Sans Mandaic", "Noto Sans Manichaean", "Noto Sans Marchen", "Noto Sans Masaram Gondi", "Noto Sans Meetei Mayek", "Noto Sans Mende Kikakui", "Noto Sans Meroitic", "Noto Sans Miao", "Noto Sans Modi", "Noto Sans Mongolian", "Noto Sans Mro", "Noto Sans Multani", "Noto Sans Myanmar", "Noto Sans NKo", "Noto Sans Nabataean", "Noto Sans New Tai Lue", "Noto Sans Newa", "Noto Sans Ol Chiki", "Noto Sans Old Hungarian", "Noto Sans Old Italic", "Noto Sans Old North Arabian", "Noto Sans Old Permic", "Noto Sans Old Persian", "Noto Sans Old South Arabian", "Noto Sans Old Turkic", "Noto Sans Oriya", "Noto Sans Osage", "Noto Sans Osmanya", "Noto Sans Pahawh Hmong", "Noto Sans Palmyrene", "Noto Sans Pau Cin Hau", "Noto Sans PhagsPa", "Noto Sans Phoenician", "Noto Sans Psalter Pahlavi", "Noto Sans Rejang", "Noto Sans Samaritan", "Noto Sans Saurashtra", "Noto Sans Sharada", "Noto Sans Siddham", "Noto Sans Sora Sompeng", "Noto Sans Sundanese", "Noto Sans Syloti Nagri", "Noto Sans Syriac", "Noto Sans Tagalog", "Noto Sans Tagbanwa", "Noto Sans Tai Le", "Noto Sans Tai Tham", "Noto Sans Tai Viet", "Noto Sans Takri", "Noto Sans Thaana", "Noto Sans Tifinagh", "Noto Sans Tirhuta", "Noto Sans Ugaritic", "Noto Sans Vai", "Noto Sans Wancho", "Noto Sans Warang Citi", "Noto Sans Yi", "Noto Serif Ahom", "Noto Serif Balinese", "Noto Serif Hmong Nyiakeng", "Noto Serif Myanmar", "Noto Serif Yezidi", "Optima", "Oriya MN", "Oriya Sangam MN", "Osaka", "PCMyungjo", "PSL Ornanong Pro", "PT Mono", "PT Sans", "PT Serif", "PT Serif Caption", "Palatino", "Papyrus", "Party LET", "Phosphate", "PilGi", "PingFang HK", "Plantagenet Cherokee", "Produkt", "Proxima Nova", "Publico Text", "Raanana", "Rockwell", "STFangsong", "STHeiti", "STIX Two Math", "STIX Two Text", "STIXGeneral", "STIXIntegralsD", "STIXIntegralsSm", "STIXIntegralsUp", "STIXIntegralsUpD", "STIXIntegralsUpSm", "STIXNonUnicode", "STIXSizeFiveSym", "STIXSizeFourSym", "STIXSizeOneSym", "STIXSizeThreeSym", "STIXSizeTwoSym", "STIXVariants", "Sana", "Sathu", "Savoye LET", "Seravek", "Shree Devanagari 714", "SignPainter", "Silom", "SimSong", "Sinhala MN", "Sinhala Sangam MN", "Skia", "Snell Roundhand", "Songti SC", "Source Han Sans CN", "Sukhumvit Set", "Superclarendon", "Symbol", "System Font", "Tahoma", "Tamil MN", "Tamil Sangam MN", "Telugu MN", "Telugu Sangam MN", "Thonburi", "Times", "Times New Roman", "Toppan Bunkyu Gothic", "Toppan Bunkyu Midashi Gothic", "Toppan Bunkyu Midashi Mincho", "Toppan Bunkyu Mincho", "Trattatello", "Trebuchet MS", "Tsukushi A Round Gothic", "Tsukushi B Round Gothic", "Verdana", "Waseem", "Wawati SC", "Wawati TC", "Webdings", "Weibei SC", "Weibei TC", "Wingdings", "Wingdings 2", "Wingdings 3", "Xingkai SC", "YuGothic", "YuKyokasho Yoko", "YuMincho", "Yuanti SC", "Yuppy SC", "Yuppy TC", "Zapf Dingbats", "Zapfino", "Zhuque Fangsong (technical preview)", "cmb10", "cmex10", "cmmi10", "cmr10", "cmss10", "cmsy10", "cmtt10"],
+        font_stack: ["Arial", "Liberation Sans", "DejaVu Sans"],
+        size_presets: [{ value: "single", label: "Single column", title: "85 mm wide" },
+                       { value: "one_and_half", label: "1.5 column", title: "114 mm wide" },
+                       { value: "double", label: "Double column", title: "180 mm wide" }],
+        font_sizes: [{ value: "S", label: "Small", title: "7 pt" },
+                     { value: "M", label: "Medium", title: "8 pt" },
+                     { value: "L", label: "Large", title: "10 pt" }],
+        line_widths: [{ value: "thin", label: "Thin", title: "0.5 pt" },
+                      { value: "normal", label: "Normal", title: "1 pt" }],
+        error_bands: ["SD", "SEM", "95% CI", "min-max", "none"],
+        current: mockState.plotSettings,
+      };
+    },
+    // The real method takes ONE positional dict -- the pywebview bridge passes
+    // arguments positionally, and a `**kwargs` signature here is what Round 34
+    // shipped and this mock could not catch. `check_js_api_signatures` is the
+    // check that can; this signature just matches what it enforces.
+    async set_plot_settings(settings) {
+      Object.assign(mockState.plotSettings, settings || {});
+      const family = mockState.plotSettings.font_family;
+      const known = (await mockApi.get_plot_options()).fonts;
+      const note = family && !known.includes(family)
+        ? `${family} is not installed on this machine; using Arial instead.` : null;
+      return { settings: mockState.plotSettings, note };
+    },
+    async get_value_catalog() {
+      if (!mockState.trackingLoaded) {
+        return { values: [], error: "No tracking data loaded", pc: { allowed: true, warning: null } };
+      }
+      const values = [
+        { column: "Cell Area", source: "Cells_info", dimension: "area",
+          label: mockState.pixelSizeUm ? "Cell Area (µm²)" : "Cell Area (px²)", is_pc: false },
+        { column: "Cell Perimeter", source: "Cells_info", dimension: "length",
+          label: mockState.pixelSizeUm ? "Cell Perimeter (µm)" : "Cell Perimeter (px)", is_pc: false },
+        { column: "Circularity", source: "Cells_info", dimension: "none",
+          label: "Circularity", is_pc: false },
+        { column: "PC1", source: "Cells_info_PCA", dimension: "none", label: "PC1", is_pc: true },
+        { column: "PC2", source: "Cells_info_PCA", dimension: "none", label: "PC2", is_pc: true },
+        // R35 2-2: the two sidecar tables, which the real API now actually
+        // loads. R35 3-3: Track ID, mappable like any other value.
+        { column: "Solidity", source: "Cells_shape", dimension: "none",
+          label: "Solidity", is_pc: false },
+        { column: "Neighbor Count", source: "Cells_tissue", dimension: "none",
+          label: "Neighbor Count", is_pc: false },
+        { column: "Track ID", source: "Tracking", dimension: "none",
+          label: "Track ID", is_pc: false, map_only: true },
+      ];
+      return { values, error: null, pc: await mockApi.get_pc_availability() };
+    },
+    async get_time_window(step) {
+      if (!mockState.trackingLoaded) return { available: false, reason: "No tracking data loaded" };
+      const w = mockState.timeWindows[step] || [1, 19];
+      const dt = mockState.frameIntervalSec;
+      return { available: true, first_frame: 1, last_frame: 19,
+               start_frame: w[0], end_frame: w[1], frame_interval_sec: dt,
+               unit: dt ? "seconds" : "frames",
+               start_sec: dt ? (w[0] - 1) * dt : null, end_sec: dt ? (w[1] - 1) * dt : null };
+    },
+    async set_time_window(start, end, step, unit) {
+      const dt = mockState.frameIntervalSec;
+      let a = unit === "seconds" && dt ? 1 + Math.round(start / dt) : Math.round(start);
+      let b = unit === "seconds" && dt ? 1 + Math.round(end / dt) : Math.round(end);
+      a = Math.max(1, Math.min(19, a)); b = Math.max(1, Math.min(19, b));
+      mockState.timeWindows[step] = a <= b ? [a, b] : [b, a];
+      return mockApi.get_time_window(step);
+    },
+    async get_single_track_plot(trackId, columns, layout) {
+      if (!columns || !columns.length) return { error: "Pick at least one value." };
+      if (layout === "dual_axis" && columns.length !== 2) {
+        return { error: `The dual-axis layout takes exactly two values; ${columns.length} selected.` };
+      }
+      if (columns.some((c) => /^PC\d+$/.test(c)) && mockState.datasetMode === "independent_samples") {
+        return { error: "This classification was run in independent-samples mode, which fits a "
+                        + "separate PCA per frame. PC axes are not comparable between frames." };
+      }
+      mockState.lastChart = `clone_cell_track${trackId}`;
+      return { image: MOCK_PNG, chart_id: mockState.lastChart, note: `Track ${trackId}`,
+               width_mm: 85, warning: (await mockApi.get_pc_availability()).warning };
+    },
+    async get_cumulative_events_plot() {
+      if (!mockState.trackingLoaded) return { error: "Track the movie before counting events." };
+      mockState.lastChart = "cumulative_dynamics_events";
+      return { image: MOCK_PNG, chart_id: mockState.lastChart,
+               losses_without_a_paired_gain: mockState.t1QuartetFilter ? 3 : 0,
+               parameters: { event_filter: mockState.t1EventFilter, persist_frames: mockState.t1PersistFrames } };
+    },
+    async get_all_tracks_plot(columns, _layout, minCoverage) {
+      if (!columns || !columns.length) return { error: "Pick at least one value." };
+      if (minCoverage > 0.99) {
+        return { error: "No track covers 100% of the window; the best covers 93%." };
+      }
+      mockState.lastChart = "clone_multiple_cells";
+      return { image: MOCK_PNG, chart_id: mockState.lastChart, width_mm: 85,
+               note: "4 of 5 tracks (>= 90% of the window); mean +/- SD" };
+    },
+    async get_morphospace_plot(x, y) {
+      if (!mockState.classified) return { error: "Run Classify first: the morphospace is drawn in its PC space." };
+      if (!["PC1", "PC2"].includes(x) || !["PC1", "PC2"].includes(y)) {
+        return { error: `${/^PC\d+$/.test(x) ? x : y} is not in this classification (it kept PC1, PC2). `
+                        + "Raise 'Components to keep' in Classify and re-run." };
+      }
+      mockState.lastChart = `morphospace_${x}_${y}`;
+      return { image: MOCK_PNG, chart_id: mockState.lastChart };
+    },
+    async get_cell_map(frame, column) {
+      if (!column) return { error: "Pick a value to map." };
+      mockState.lastChart = `cell_map_${column}_frame${frame}`;
+      return {
+        image: MOCK_PNG, chart_id: mockState.lastChart,
+        // An image panel has no vector form, so it offers no SVG (R35 3-2).
+        kinds: ["png", "xlsx"],
+        note: column === "Track ID"
+          ? "5 track(s) in this frame"
+          : "Range (whole movie): 4.51 - 10.5 Cell Area (µm²)",
+      };
+    },
+    async get_streamlines_plot(start, end, _stepSec, _colourByTrack, registration) {
+      if (start != null && end != null && end <= start) {
+        return { error: "The end frame must be after the start frame." };
+      }
+      if (registration === "on" && !mockState.trackingRunDriftMode) {
+        return { error: "No frame-to-frame drift could be measured for this movie, "
+                        + "so Registration: On has nothing to subtract." };
+      }
+      mockState.lastChart = "cell_streamlines";
+      const convention = registration === "off" ? "unregistered (Registration: off)"
+        : registration === "on" ? "registered (Registration: on)"
+        : "unregistered as tracked (drift_mode='none')";
+      return { image: MOCK_PNG, chart_id: mockState.lastChart,
+               note: `frames ${start}-${end}, ${convention}` };
+    },
+    async export_chart(chartId, kind) {
+      if (!chartId) return { error: "That chart has not been drawn yet." };
+      const stamp = "20261021-120000";
+      if (kind === "xlsx") {
+        return { saved: `/mock/quantitative_analysis_output/${chartId}_${stamp}.xlsx`,
+                 sheets: ["Provenance", "Track data"], notes: [], csv_files: [] };
+      }
+      return { saved: `/mock/quantitative_analysis_output/${chartId}_${stamp}.${kind}`,
+               groups: 0, clip_paths: 0 };
+    },
+    async start_movie_render(step, startFrame, endFrame, _value, _trackNumber) {
+      mockState.movieCancelled = false;
+      (async () => {
+        const total = Math.max(1, (endFrame - startFrame) + 1);
+        for (let i = 0; i < total; i += 1) {
+          if (mockState.movieCancelled) break;
+          await delay(80);
+          window.onMovieProgress && window.onMovieProgress({
+            percent: Math.round(((i + 1) / total) * 100),
+            message: `Frame ${startFrame + i} (${i + 1} of ${total})` });
+        }
+        window.onMovieDone && window.onMovieDone({
+          folder: `/mock/quantitative_analysis_output/movie_${step}_20261021-120000`,
+          frames: mockState.movieCancelled ? 1 : Math.max(1, (endFrame - startFrame) + 1),
+          cancelled: mockState.movieCancelled });
+      })();
+      return true;
+    },
+    async cancel_movie_render() {
+      mockState.movieCancelled = true;
+      return true;
+    },
+    async build_joint_pca(comparison, groups) {
+      if (!/^[A-Za-z0-9_-]+$/.test(comparison || "")) {
+        return { error: "A comparison name may use letters, digits, '_' and '-' only." };
+      }
+      if (!groups || groups.length < 2) {
+        return { error: "Define at least two groups, each with at least one folder." };
+      }
+      const folders = groups.reduce((n, g) => n + g.folders.length, 0);
+      if (mockState.jointPcaNames.includes(comparison)) {
+        return { error: "These files already exist, so nothing was written:\n"
+                        + groups[0].folders[0] + `/cell_classification_output/joint_${comparison}_manifest.json` };
+      }
+      mockState.jointPcaNames.push(comparison);
+      return { comparison, cells: 1200, folders, components: 3,
+               written: groups.flatMap((g) => g.folders) };
+    },
+    async get_group_dynamics_plot(kind) {
+      if (!mockState.classified) return { error: "Classify the cells first: the groups are the clusters." };
+      if (kind === "oscillation" && !mockState.frameIntervalSec) {
+        return { error: "The detrending window is 5.5 min, so this needs the frame interval. "
+                        + "Set it in Extract." };
+      }
+      mockState.lastChart = `group_dynamics_${kind}`;
+      return { image: MOCK_PNG, chart_id: mockState.lastChart };
+    },
+    // --- Round 36: step 8 without tracking, the joint PCA, Distributions ---
+    async get_playground_capabilities() {
+      const tracked = mockState.trackingLoaded;
+      const extracted = mockState.extracted;
+      const joint = mockState.jointPcaNames.length > 0;
+      const panel = (ok, reason) => ({ enabled: !!ok, reason: ok ? null : reason });
+      return {
+        extracted, has_tracking: tracked,
+        panels: {
+          tracks: panel(extracted && tracked, "Needs tracking (step 5)."),
+          streamlines: panel(extracted && tracked, "Needs tracking (step 5)."),
+          morphospace: panel(extracted && (mockState.classified || joint),
+                             "Needs a PCA: run Classify (step 3), or build a joint PCA in "
+                             + "the Group comparator."),
+          cellmap: panel(extracted, "Needs Extract (step 2)."),
+          distributions: panel(extracted, "Needs Extract (step 2)."),
+          comparator: panel(extracted, "Needs Extract (step 2)."),
+        },
+      };
+    },
+    async get_joint_pca_options() {
+      const options = [{ value: "project", label: "This project",
+                         available: mockState.classified }];
+      mockState.jointPcaNames.forEach((name) => {
+        options.push({ value: `joint:${name}`, label: `Joint: ${name}`, available: true,
+                       folders: 3, groups: ["WT", "pyd"] });
+      });
+      return { options, current: mockState.pcaSource };
+    },
+    async set_pca_source(source) {
+      if (source !== "project"
+          && !mockState.jointPcaNames.includes(source.replace(/^joint:/, ""))) {
+        return { error: `No joint PCA named '${source}' was found.` };
+      }
+      mockState.pcaSource = source;
+      return { source };
+    },
+    async get_distributions_plot(column, _paired) {
+      if (!column) return { error: "Pick a value." };
+      mockState.lastChart = `distributions_${column}`;
+      const folders = mockState.groupMode === "folders";
+      return {
+        image: MOCK_PNG, chart_id: mockState.lastChart, width_mm: 85,
+        note: folders
+          ? "WT: 1200 cells / 8 individuals, pyd: 600 cells / 4 individuals; 2 group(s), "
+            + "one individual per folder; 95% CI bootstrapped over individuals (5000 resamples)"
+          : "cluster_1: 120 cells / 1 individuals; clusters of this project; "
+            + "descriptive only -- clusters were defined on these values",
+      };
+    },
+    async set_group_state(mode, groups) {
+      mockState.groupMode = mode;
+      mockState.groups = groups || [];
+      return { mode, groups: mockState.groups };
+    },
+    async get_group_extraction_status(groups) {
+      const folders = (groups || []).reduce((all, g) => all.concat(g.folders), []);
+      // Honest to the real shape: some folders already have a table.
+      const ready = folders.filter((_, i) => i % 3 === 0);
+      const missing = folders.filter((_, i) => i % 3 !== 0);
+      return { ready, missing, no_masks: [], total: folders.length };
+    },
+    async start_group_extraction(groups) {
+      const status = await mockApi.get_group_extraction_status(groups);
+      (async () => {
+        for (let i = 0; i < status.missing.length; i += 1) {
+          await delay(120);
+          window.onProgress && window.onProgress({
+            stage: "group_extract",
+            message: `${status.missing[i]} (${i + 1} of ${status.missing.length})`,
+            percent: Math.round((i / status.missing.length) * 100) });
+        }
+        window.onGroupExtractDone && window.onGroupExtractDone({
+          extracted: status.missing.length, already: status.ready.length, failed: [],
+          cancelled: false,
+          settings: { min_cell_area_px: 0, exclude_edge_cells: false } });
+      })();
+      return true;
+    },
+    async cancel_group_extraction() { return true; },
+    async get_pc_availability() {
+      if (mockState.datasetMode === "independent_samples") {
+        return { allowed: false, known: true, warning: null,
+                 reason: "This classification was run in independent-samples mode, which fits a "
+                         + "separate PCA per frame. PC axes are not comparable between frames, so "
+                         + "PC values cannot be plotted over time. Other values are unaffected." };
+      }
+      return { allowed: true, known: true, reason: null,
+               warning: mockState.classificationFrontBack === "per_outline" && mockState.trackingLoaded
+                 ? "EFD PCA was fit with per-outline front/back; re-run Classify to use per-track "
+                   + "(as in the figures)."
+                 : null };
     },
     async set_cluster_colors(colorMap) {
       mockState.clusterLegend.forEach((c) => {
@@ -379,8 +824,13 @@
     async reassign_cluster(_cellIndex, _newLabel) {
       return mockState.clusterLegend;
     },
+    // Records WHICH save ran, so dev mode can check that Ctrl/Cmd+S dispatched
+    // on the right step -- the mistake this guards against writes one table
+    // into the other's file. Returns the same `{saved}`/`{error}` shape as the
+    // real API (Round 29 §8).
     async save_classification() {
-      return null;
+      mockState.saves.push("classification");
+      return { saved: "/mock/cell_classification_output/cells_clustering_results.xlsx" };
     },
     async can_compute_leading_edge() {
       return mockState.clusterLegend.length === 2;
@@ -415,7 +865,11 @@
       (async () => {
         await delay(400);
         mockState.trackingRunDriftMode = mockState.trackingCost.drift_mode;
-        window.onTrackDone && window.onTrackDone({ track_count: mockState.trackNumbers.length });
+        mockState.trackingLoaded = true;
+        // A freshly computed table has no empty rows; the loader's does.
+        window.onTrackDone && window.onTrackDone({
+          track_count: mockState.trackNumbers.length,
+          tracks_with_cells: mockState.trackNumbers.length, empty_rows: 0 });
       })();
       return true;
     },
@@ -863,7 +1317,8 @@
       return { success: true, displaced_list: [] };
     },
     async save_tracking() {
-      return null;
+      mockState.saves.push("tracking");
+      return { saved: "/mock/cell_track_output/all_cell_tracking/all_cell_merged_tracking_results.xlsx" };
     },
     async set_track_colors(_matchedColor, _unmatchedColor) {
       return null;
@@ -1040,5 +1495,5 @@
     }
   );
 
-  window.usingMockApi = !hasPywebview();
+  window.usingMockApi = !hasPywebview() && !window.isNativeEpiQuant;
 })();

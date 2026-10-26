@@ -25,6 +25,8 @@ const state = {
   correctTrackShownAt: null,
   correctTrackShownFrame: null,
   trajectoryFrame: 1,
+  // Round 34: the Data playground's Cell map has its own player.
+  cellmapFrame: 1,
 
   clusterLegend: [],
   // Cached get_feature_options() result, refreshed on every entry to Classify
@@ -153,6 +155,14 @@ function goToStep(step) {
   document.querySelector(`.step-btn[data-step="${step}"]`).classList.add("active");
 }
 
+// The step the user is on. One reader, because Ctrl/Cmd+S dispatches on it
+// and a second opinion about "which step is this" is how a save ends up in
+// the wrong file (Round 29 §8).
+function currentStep() {
+  const active = document.querySelector(".step-section.active");
+  return active ? active.id.replace(/^step-/, "") : null;
+}
+
 function setStatus(elId, message, kind) {
   const el = document.getElementById(elId);
   el.textContent = message;
@@ -236,6 +246,23 @@ async function handleLoadExistingResults() {
       await onExtractDone(data);
       furthestStep = "classify";
     }
+    // R35 2-2: `get_existing_results` has always reported these, and nothing
+    // ever loaded them -- so a project with Cells_shape.xlsx and
+    // Cells_tissue.xlsx on disk came up with neither, and none of their
+    // columns appeared in Add value. Loaded before classification, which may
+    // want them as features.
+    if (existing.shape || existing.tissue) {
+      const summary = await window.EpiQuantAPI.load_existing_shape_features();
+      state.featureOptions = null;
+      // `onExtractDone` above already built the value catalog, from
+      // `Cells_info` alone -- so without this the shape and tissue columns
+      // were loaded and usable but absent from every picker.
+      await loadValueCatalog();
+      await refreshPlaygroundCapabilities();
+      if (summary && summary.families) {
+        setStatus("setup-status", `Loaded ${Object.keys(summary.families).join(", ")} features…`);
+      }
+    }
     if (existing.classification) {
       const result = await window.EpiQuantAPI.load_existing_classification();
       await afterClassificationReady(result);
@@ -304,6 +331,11 @@ async function onExtractDone(data) {
   state.frameCount = data.frame_count;
   state.frameNumbers = await window.EpiQuantAPI.get_frame_numbers();
   state.extractFrame = state.frameNumbers[0] ?? 1;
+  state.cellmapFrame = state.frameNumbers[0] ?? 1;
+  // R36 8-1: the Data playground opens here, not after tracking. Static crops
+  // and sparsely sampled series have nothing to track and were locked out of
+  // the analyses they exist for.
+  await unlockPlaygroundAfterExtract();
   // Report the removals, per frame and as a total. A filter whose removals
   // cannot be seen cannot be judged too aggressive (Round 19 D4) — the same
   // rule as the T1 event filter and the junction-length minimum.
@@ -820,6 +852,8 @@ async function handleRunClassification() {
   const datasetMode = document.querySelector("input[name='dataset-mode']:checked").value;
   const pruneRaw = document.getElementById("prune-correlation").value;
   const prune = pruneRaw === "" ? null : parseFloat(pruneRaw);
+  const varianceRaw = document.getElementById("variance-threshold").value;
+  const varianceThreshold = varianceRaw === "" ? 0.85 : parseFloat(varianceRaw);
 
   if (!isEfd && selected.length < 2) {
     setStatus("classify-status", "Select at least two features.", "error");
@@ -830,7 +864,7 @@ async function handleRunClassification() {
   document.getElementById("run-classification-btn").disabled = true;
   try {
     const result = await window.EpiQuantAPI.run_classification(
-      nClusters, kRange, null, families, selected, prune, datasetMode,
+      nClusters, kRange, null, families, selected, prune, datasetMode, varianceThreshold,
     );
     await afterClassificationReady(result);
   } catch (err) {
@@ -1007,8 +1041,31 @@ async function handleCorrectClassImageClick(event) {
   setStatus("correct-class-selected-cell", `Reassigned ${result.cell_index} -> cluster ${targetLabel}.`, "success");
 }
 
+// Round 29 §8. ONE handler decides what Ctrl/Cmd+S saves. Two handlers would
+// be two places that evolve separately until one day they disagree -- and the
+// failure mode there is writing the classification result into the tracking
+// file, which destroys data rather than merely annoying someone.
+//
+// This is the FRONT half of the defence. The back half is in the API: the two
+// save methods check the shape of what they are about to write and refuse a
+// table of the wrong kind. `currentStep()` is a thing that gets refactored;
+// the backend's refusal is not.
+function saveKeyDown(event) {
+  if (!((event.key === "s" || event.key === "S") && (event.ctrlKey || event.metaKey))) return false;
+  const step = currentStep();
+  if (step === "correct-classification") { handleSaveClassificationCorrections(); return true; }
+  if (step === "correct-tracking") { handleSaveTrackingCorrections(); return true; }
+  // Any other step: not ours. Returning false lets the next owner look, and
+  // nothing is written.
+  return false;
+}
+
 async function handleSaveClassificationCorrections() {
-  await window.EpiQuantAPI.save_classification();
+  const result = await window.EpiQuantAPI.save_classification();
+  if (result && result.error) {
+    setStatus("correct-class-selected-cell", result.error, "error");
+    return;
+  }
   setStatus("correct-class-selected-cell", "Saved.", "success");
 }
 
@@ -1108,7 +1165,7 @@ async function onRetrackDone(data) {
   setStatus("retrack-status",
     `Re-tracked ${(data.frames || []).length} frame(s): ${data.relinked} link(s) updated, ` +
     `${(data.reconciled || []).length} seam reconciliation(s), ${(data.new_tracks || []).length} new track(s). ` +
-    `${data.track_count} tracks total.`, "success");
+    `${describeTrackCount(data)} total.`, "success");
 
   await refreshTrackNumbers();
 }
@@ -1139,17 +1196,34 @@ async function refreshTrackNumbers() {
   return state.trackNumbers;
 }
 
+// A row of the tracking table is not necessarily a track: a stored table can
+// carry rows that claim no cell in any frame (`AS_LE_lateral view_E-cad` has
+// 37 of 145, and they are like that on disk). Every plot counts the ones that
+// hold cells, so the Track step said 145 while the plots said 108. Say both.
+function describeTrackCount(data) {
+  const rows = data.track_count;
+  const withCells = data.tracks_with_cells;
+  const empty = data.empty_rows;
+  if (withCells === undefined || !empty) return `${rows} tracks`;
+  return `${withCells} tracks (${empty} of the ${rows} rows hold no cell and are not shown)`;
+}
+
 async function onTrackDone(data) {
   const dupNote = data.duplicates_cleaned ? ` (cleaned ${data.duplicates_cleaned} duplicate track claims from this file)` : "";
-  setStatus("track-status", `Done: ${data.track_count} tracks.${dupNote}`, "success");
+  setStatus("track-status", `Done: ${describeTrackCount(data)}.${dupNote}`, "success");
   document.getElementById("start-tracking-btn").disabled = false;
   document.getElementById("track-next-choices").style.display = "flex";
   enableStep("correct-tracking");
   enableStep("trajectory");
 
   await refreshTrackNumbers();
+  // Round 34: the value catalog, the time window and the PC gate all depend
+  // on there being a tracking table, so they are refreshed here rather than
+  // on every entry to a plotting step.
+  await refreshRound34Data();
 
   state.correctTrackFrame = state.frameNumbers[0] ?? 1;
+  state.cellmapFrame = state.frameNumbers[0] ?? 1;
   await showCorrectTrackFrame(state.correctTrackFrame);
 }
 
@@ -1173,7 +1247,10 @@ function onTrackError(data) {
 const TRACK_COLOR_MODE_PANELS = {
   uniform: ["correct-track-uniform-colors"],
   identity: ["correct-track-identity-palette"],
-  environment: ["correct-track-environment", "correct-track-environment-hint"],
+  // `correct-track-environment-hint` is NOT listed: it became a popover
+  // (Round 29 §1) and the sync below sets `display`, which would force it
+  // open. It is closed explicitly when the mode changes, like the colour one.
+  environment: ["correct-track-environment"],
   lifecycle: ["correct-track-lifecycle"],
   agreement: ["correct-track-agreement"],
 };
@@ -1187,6 +1264,76 @@ async function applyTrackingCost(mode, overlapWeight, motionCompensation, maxFra
   syncTrackingCostControls(applied);
 }
 
+// The persistence horizon is stored in SECONDS and shown in both units: the
+// same 150 s is 5 frames at 30 s/frame and 10 at 15 s/frame, so a frame count
+// alone does not say what was required. The input's own max comes from the
+// backend for the same reason -- it used to be a literal 10, which was exactly
+// the requirement of a 15 s/frame movie, with no headroom for a faster one.
+// Round 31 C: seconds per frame and microns per pixel are properties of the
+// ACQUISITION, entered once in Extract and persisted with the project. Both
+// may stay empty, and empty must behave exactly as before -- so this only
+// displays what the backend reports and never substitutes a default.
+function syncAcquisition(values) {
+  if (!values) return;
+  const interval = document.getElementById("frame-interval-input");
+  const pixel = document.getElementById("pixel-size-input");
+  if (interval && values.frame_interval_sec != null) interval.value = values.frame_interval_sec;
+  if (pixel && values.pixel_size_um != null) pixel.value = values.pixel_size_um;
+  const text = [
+    values.frame_interval_sec ? `${values.frame_interval_sec} s/frame` : "frame interval unset",
+    values.pixel_size_um ? `${values.pixel_size_um} µm/px` : "pixel size unset",
+  ].join(" · ");
+  ["acquisition-hint", "acquisition-readout"].forEach((id) => {
+    const node = document.getElementById(id);
+    if (node) node.textContent = text;
+  });
+  syncT1Persistence(values);
+  window.EpiQuantAPI.t1_length_settings().then(syncLengthFilter);
+}
+
+function wireAcquisitionInputs() {
+  document.getElementById("frame-interval-input").addEventListener("change", async (e) => {
+    const value = parseFloat(e.target.value);
+    syncAcquisition(await window.EpiQuantAPI.set_frame_interval(Number.isFinite(value) ? value : null));
+  });
+  document.getElementById("pixel-size-input").addEventListener("change", async (e) => {
+    const value = parseFloat(e.target.value);
+    syncAcquisition(await window.EpiQuantAPI.set_pixel_size(Number.isFinite(value) ? value : null));
+  });
+}
+
+// The threshold is in TRUE pixels. Beside it: where it came from (this
+// movie's sweep, or the user), and its length in microns when -- and only
+// when -- Extract has a pixel size.
+function syncLengthFilter(settings) {
+  if (!settings) return;
+  const span = document.getElementById("t1-length-px");
+  if (!span) return;
+  const parts = [];
+  if (settings.min_length_px != null) {
+    if (settings.source === "derived from this movie") parts.push(`auto ${settings.min_length_px} px`);
+    if (settings.min_length_um != null) parts.push(`= ${settings.min_length_um} µm`);
+  } else if (settings.source === "not derived yet") {
+    parts.push("auto: derived from this movie when switched on");
+  }
+  span.textContent = parts.length ? ` (${parts.join(", ")})` : "";
+}
+
+function syncT1Persistence(bounds) {
+  const input = document.getElementById("t1-persist-input");
+  if (bounds.value != null) input.value = bounds.value;
+  else if (bounds.frames != null) input.value = bounds.frames;
+  if (bounds.max_frames) input.max = bounds.max_frames;
+  const interval = document.getElementById("frame-interval-input");
+  if (interval && bounds.frame_interval_sec != null) interval.value = bounds.frame_interval_sec;
+  const hint = document.getElementById("t1-persist-seconds");
+  if (hint) {
+    hint.textContent = bounds.frame_interval_sec
+      ? ` = ${Math.round(parseInt(input.value, 10) * bounds.frame_interval_sec)} s`
+      : " (set the frame interval to see this in seconds)";
+  }
+}
+
 function syncTrackingCostControls(cost) {
   const radio = document.querySelector(`input[name="track-cost-mode"][value="${cost.mode}"]`);
   if (radio) radio.checked = true;
@@ -1196,6 +1343,8 @@ function syncTrackingCostControls(cost) {
   weight.disabled = cost.mode === "centroid";
   document.getElementById("motion-compensation-input").checked = !!cost.motion_compensation;
   document.getElementById("gap-closing-input").checked = !!cost.max_frame_gap;
+  const gateScale = document.getElementById("gate-scale-input");
+  if (gateScale && cost.gate_scale !== undefined) gateScale.value = cost.gate_scale;
   const drift = document.getElementById("drift-register-input");
   if (drift) drift.checked = cost.drift_mode && cost.drift_mode !== "none";
 }
@@ -1207,6 +1356,8 @@ function syncTrackColorModePanels() {
   // `display` and would force this one visible.
   const colorHelp = document.getElementById("correct-track-color-help-popover");
   if (colorHelp && mode !== "uniform") colorHelp.style.display = "none";
+  const envHelp = document.getElementById("correct-track-environment-hint");
+  if (envHelp && mode !== "environment") envHelp.style.display = "none";
   Object.entries(TRACK_COLOR_MODE_PANELS).forEach(([panelMode, ids]) => {
     ids.forEach((id) => {
       const el = document.getElementById(id);
@@ -1359,14 +1510,28 @@ async function refreshT1Counts() {
       `(${shownCounts.filtered} hidden by "${shownCounts.filter}", ` +
       `${shownCounts.unjudgeable} can't judge) — cell and axis together.`
     : "";
+  // Round 32: the two optional filters, each with what it removed, beside
+  // the raw numbers they never change.
+  const lf = events.length_filter;
+  const lengthNote = lf && lf.active
+    ? ` Interface ≥ ${lf.min_length_px} px` +
+      (lf.min_length_um != null ? ` (${lf.min_length_um} µm)` : "") +
+      ` [${lf.source}]: removed ${lf.gains_removed} gained / ${lf.losses_removed} lost.`
+    : "";
+  const quartetNote = events.quartet_filter
+    ? ` Quartet check: ${events.quartet_rejected} gain(s) rejected` +
+      ` (${events.quartet_orphaned_losses} paired loss(es) hidden with them).`
+    : "";
   if (hold > 0) {
     readout.textContent =
       `T1 this frame: raw ${events.gained} gained / ${events.lost} lost; ` +
       `settled ${events.gained_persistent} / ${events.lost_persistent} after ${hold} frame(s); ` +
-      `can't judge ${events.gained_unjudgeable || 0} / ${events.lost_unjudgeable || 0}.` + axisNote;
+      `can't judge ${events.gained_unjudgeable || 0} / ${events.lost_unjudgeable || 0}.` + axisNote +
+      lengthNote + quartetNote;
   } else {
     readout.textContent =
-      `T1 this frame: ${events.gained} gained / ${events.lost} lost (no persistence filter).` + axisNote;
+      `T1 this frame: ${events.gained} gained / ${events.lost} lost (no persistence filter).` + axisNote +
+      lengthNote + quartetNote;
   }
 }
 
@@ -1773,8 +1938,7 @@ async function handleStartCensus() {
   const conv = started.register ? "registered" : "unregistered";
   const comparison = started.register
     ? ""
-    : ` This tracking ran without registration; with drift_mode="mask" the same set is far smaller` +
-      ` (measured on GBE: 255 items unregistered vs 25 registered).`;
+    : ` This tracking ran without registration; with drift_mode="mask" the same set is far smaller.`;
   const drifted = started.setting_changed_since_tracking
     ? ` ⚠ The drift setting is now "${started.current_drift_setting}" but this tracking ran` +
       ` "${started.tracking_drift_mode}" — the queue follows the run, not the setting.`
@@ -2037,6 +2201,10 @@ const KEY_OWNERS = [
   { name: "stepper", active: () => stepperVisible(), down: stepperKeyDown, up: null },
   { name: "census", active: () => censusState.active, down: censusKeyDown, up: censusKeyUp },
   { name: "inspection", active: () => inspectionActive(), down: inspectionKeyDown, up: null },
+  // `X` (swap mode) and Ctrl/Cmd+S (save) claim nothing the owners above use,
+  // so they sit below them and above the player, which owns the arrows.
+  { name: "swap", active: () => swapModeActive(), down: swapKeyDown, up: null },
+  { name: "save", active: () => true, down: saveKeyDown, up: null },
   { name: "player", active: () => playerVisible(), down: playerKeyDown, up: null },
 ];
 
@@ -2185,6 +2353,62 @@ function resetSmartStopPanel() {
   document.getElementById("compute-stop-frame-btn").style.display = "none";
   document.getElementById("smart-stop-result").textContent = "";
   document.getElementById("apply-smart-stop-btn").style.display = "none";
+}
+
+// Round 29 §6: `X` for swap/exchange. NOT Ctrl/Cmd+W -- that is "close
+// window" on macOS and "close tab" in a browser, so the native window would
+// very likely be gone before JS saw the event, and even a successful
+// preventDefault would be fighting a system-wide habit over unsaved work.
+// `X` was grepped as unclaimed: the census owns J/K/L/digits/space, the
+// magnifier the arrows and Esc, the inspection K/arrows/space/Esc.
+function swapModeActive() {
+  return currentStep() === "correct-tracking";
+}
+
+function setSwapMode(on) {
+  const box = document.getElementById("track-swap-mode-checkbox");
+  if (!box) return;
+  box.checked = on;
+  resetTrackSwapSelection();
+  syncSwapModeIndicator();
+}
+
+// The mode has to be VISIBLE, or the user cannot tell whether the next click
+// selects a cell or swaps two tracks -- which matters more than the shortcut.
+function syncSwapModeIndicator() {
+  const box = document.getElementById("track-swap-mode-checkbox");
+  const on = !!(box && box.checked);
+  const wrap = document.querySelector("#step-correct-tracking .image-click-wrap");
+  if (wrap) wrap.classList.toggle("swap-mode-on", on);
+  const label = box && box.closest("label");
+  if (label) label.classList.toggle("swap-mode-label-on", on);
+  // Round 32 UI-2: the status line follows the SAME state as the checkbox,
+  // in both directions. It used to be written only when the mode came on, so
+  // leaving with `X` left "Swap mode ON" on screen over an unticked box.
+  // Turning off only replaces the line if it is still the swap message, so an
+  // unrelated status (a selected cell, an error) is not clobbered.
+  const status = document.getElementById("correct-track-selected-cell");
+  if (on) {
+    setStatus("correct-track-selected-cell",
+      "Swap mode ON (X or Esc to leave) — click two matched cells to exchange their tracks.", "");
+  } else if (status && status.textContent.startsWith("Swap mode ON")) {
+    setStatus("correct-track-selected-cell", "Swap mode off.", "");
+  }
+}
+
+function swapKeyDown(event) {
+  const box = document.getElementById("track-swap-mode-checkbox");
+  if (!box) return false;
+  if (event.key === "x" || event.key === "X") {
+    setSwapMode(!box.checked);
+    return true;
+  }
+  // Esc leaves the mode, and only claims the key when there is a mode to leave.
+  if (event.key === "Escape" && box.checked) {
+    setSwapMode(false);
+    return true;
+  }
+  return false;
 }
 
 function resetTrackSwapSelection() {
@@ -2637,7 +2861,11 @@ async function handleApplyConfirmedMoves() {
 }
 
 async function handleSaveTrackingCorrections() {
-  await window.EpiQuantAPI.save_tracking();
+  const result = await window.EpiQuantAPI.save_tracking();
+  if (result && result.error) {
+    setStatus("correct-track-selected-cell", result.error, "error");
+    return;
+  }
   setStatus("correct-track-selected-cell", "Saved.", "success");
 }
 
@@ -2680,6 +2908,9 @@ async function loadTrack(tn, { preserveFrame = false, trusted = false } = {}) {
   const frame = keep ? current : range.min_frame;
   state.trajectoryFrame = frame;
   await showTrajectoryFrame(frame);
+  // Round 34, 4-1: the chosen values survive a change of cell; only the cell
+  // changes. Clicking a cell in the image goes through here too.
+  await refreshTrajectoryCharts();
   return true;
 }
 
@@ -2720,6 +2951,14 @@ async function showTrajectoryFrame(frame) {
   const modeEl = document.querySelector('input[name="trajectory-color-mode"]:checked');
   const colorMode = modeEl ? modeEl.value : "highlight";
   document.getElementById("correct-track-dynamics").style.display = colorMode === "dynamics" ? "flex" : "none";
+  // Round 32 T1-4: the highlight view needs a track. With none selected (or
+  // an empty track list) there is nothing to draw, so say so and do not
+  // call -- the backend used to crash on `int(None)` here.
+  if (colorMode === "highlight" && state.currentTrackNumber == null) {
+    setPreviewImage("trajectory-overlay-img", null);
+    setStatus("trajectory-status", "Select a track to highlight it.", "");
+    return;
+  }
   const img = await window.EpiQuantAPI.get_trajectory_overlay(
     state.currentTrackNumber, frame, getRenderMode("trajectory"), colorMode,
     document.getElementById("dynamics-axes-checkbox").checked
@@ -3205,13 +3444,29 @@ function init() {
   document.getElementById("gap-closing-input").addEventListener("change", async (e) => {
     await applyTrackingCost(null, null, null, e.target.checked ? 1 : 0);
   });
+  document.getElementById("gate-scale-input").addEventListener("change", async (e) => {
+    const value = parseFloat(e.target.value);
+    // Re-read what the backend applied: it rejects <= 0, and the box must never
+    // show a scale the next tracking run will not use.
+    let applied = null;
+    if (value > 0) {
+      applied = await window.EpiQuantAPI.set_tracking_cost(null, null, null, null, null, value);
+    }
+    if (applied) syncTrackingCostControls(applied);
+    else syncTrackingCostControls(await window.EpiQuantAPI.get_tracking_cost());
+  });
   document.getElementById("drift-register-input").addEventListener("change", async (e) => {
     const applied = await window.EpiQuantAPI.set_tracking_cost(
       null, null, null, null, e.target.checked ? "mask" : "none");
     if (applied) syncTrackingCostControls(applied);
     await refreshRegistrationStatus();
   });
-  document.getElementById("copy-view-btn").addEventListener("click", handleCopyView);
+  // Theme: session-only, deliberately not persisted -- the same reason
+  // "Enable inset view" and the magnifier's geometry are not. It is a view
+  // preference and nothing downstream reads it.
+  document.getElementById("theme-select").addEventListener("change", (e) => {
+    document.documentElement.dataset.theme = e.target.value;
+  });
   ["extract-show-outline", "extract-outline-color-input", "extract-show-labels", "extract-label-size-input"]
     .forEach((id) => document.getElementById(id).addEventListener("change", refreshExtractImage));
   document.getElementById("extract-qc-lut-select").addEventListener("change", refreshExtractImage);
@@ -3335,7 +3590,37 @@ function init() {
   });
   document.getElementById("t1-persist-input").addEventListener("change", async (e) => {
     const applied = await window.EpiQuantAPI.set_t1_persistence(parseInt(e.target.value, 10));
-    if (applied) e.target.value = applied.value;
+    if (applied) syncT1Persistence(applied);
+    await showTrajectoryFrame(state.trajectoryFrame);
+  });
+  document.getElementById("t1-interface-input").addEventListener("change", async (e) => {
+    await window.EpiQuantAPI.set_t1_min_interface_px(parseInt(e.target.value, 10));
+    await showTrajectoryFrame(state.trajectoryFrame);
+  });
+  const applyLengthFilter = async () => {
+    const box = document.getElementById("t1-length-checkbox");
+    const px = parseFloat(document.getElementById("t1-length-input").value);
+    // Empty means "use the value derived from this movie" (Round 33).
+    const result = await window.EpiQuantAPI.set_t1_length_filter(
+      box.checked, Number.isFinite(px) ? px : null, !Number.isFinite(px));
+    syncLengthFilter(result);
+    if (result && result.error) {
+      // Refused, not quietly run in pixels: say why and leave it off. Nothing
+      // changed, so do not redraw -- the redraw rewrites this status line
+      // with the counts and the reason would vanish before it is read.
+      box.checked = false;
+      setStatus("dynamics-t1-counts", result.error, "error");
+      return;
+    }
+    // Clear a previous refusal's error styling: `refreshT1Counts` rewrites
+    // the text but not the class, which left the counts in red.
+    setStatus("dynamics-t1-counts", "", "");
+    await showTrajectoryFrame(state.trajectoryFrame);
+  };
+  document.getElementById("t1-length-checkbox").addEventListener("change", applyLengthFilter);
+  document.getElementById("t1-length-input").addEventListener("change", applyLengthFilter);
+  document.getElementById("t1-quartet-checkbox").addEventListener("change", async (e) => {
+    await window.EpiQuantAPI.set_t1_quartet_filter(e.target.checked);
     await showTrajectoryFrame(state.trajectoryFrame);
   });
   wirePopover("dynamics-help-btn", "dynamics-help-close", "dynamics-help-popover");
@@ -3370,7 +3655,10 @@ function init() {
   document.getElementById("apply-confirmed-moves-btn").addEventListener("click", handleApplyConfirmedMoves);
   document.getElementById("compute-stop-frame-btn").addEventListener("click", handleComputeStopFrame);
   document.getElementById("apply-smart-stop-btn").addEventListener("click", handleApplySmartStop);
-  document.getElementById("track-swap-mode-checkbox").addEventListener("change", resetTrackSwapSelection);
+  document.getElementById("track-swap-mode-checkbox").addEventListener("change", () => {
+    resetTrackSwapSelection();
+    syncSwapModeIndicator();
+  });
   document.getElementById("apply-track-swap-btn").addEventListener("click", handleApplyTrackSwap);
   document.getElementById("enable-inset-checkbox").addEventListener("change", async (e) => {
     if (!e.target.checked) {
@@ -3464,6 +3752,8 @@ function init() {
   document.getElementById("stop-inspection-btn").addEventListener("click", finishTrackInspection);
   wirePopover("correct-track-color-help-btn", "correct-track-color-help-close",
               "correct-track-color-help-popover");
+  wirePopover("environment-help-btn", "environment-help-close",
+              "correct-track-environment-hint");
   wirePopover("min-cell-area-help-btn", "min-cell-area-help-close", "min-cell-area-help-popover");
   wirePopover("drift-help-btn", "drift-help-close", "drift-help-popover");
   document.getElementById("agreement-register-input").addEventListener("change", async (e) => {
@@ -3496,6 +3786,8 @@ function init() {
   });
   document.getElementById("trajectory-overlay-img").addEventListener("click", handleTrajectoryImageClick);
 
+  wireRound34();
+
   // Global callbacks pushed from Python via window.evaluate_js
   window.onProgress = onProgress;
   window.onExtractDone = onExtractDone;
@@ -3513,9 +3805,11 @@ function init() {
   window.EpiQuantAPI.get_tracking_cost().then((cost) => {
     if (cost) syncTrackingCostControls(cost);
   });
+  wireAcquisitionInputs();
+  window.EpiQuantAPI.get_acquisition().then(syncAcquisition);
   window.EpiQuantAPI.get_t1_persistence().then((p) => {
     if (!p) return;
-    document.getElementById("t1-persist-input").value = p.value;
+    syncT1Persistence(p);
     if (p.enter_px != null) document.getElementById("t1-enter-input").value = p.enter_px;
     if (p.exit_px != null) document.getElementById("t1-exit-input").value = p.exit_px;
     if (p.event_filter) document.getElementById("t1-event-filter-select").value = p.event_filter;
@@ -3527,4 +3821,992 @@ function init() {
   });
 }
 
-document.addEventListener("DOMContentLoaded", init);
+document.addEventListener("DOMContentLoaded", async () => {
+  if (window.isNativeEpiQuant) await window.pywebviewReady;
+  init();
+});
+
+// ---------------------------------------------------------------------
+// Round 34: chart controls, the Trajectory charts, the Data playground,
+// the right-click export menu and the movie maker.
+//
+// One control bar per plotting step, one export menu for every chart. The
+// controls are session settings (style, type size, line width, figure width,
+// error band) plus the step's shared time window -- shared so that changing
+// the value or the cell does not silently reset the window a figure was
+// framed with.
+// ---------------------------------------------------------------------
+
+const chartState = {
+  options: null,
+  values: [],          // the value catalog, for the chip pickers
+  pc: { allowed: true, warning: null },
+  chips: { clone: [], tracks: [] },
+  menuChart: null,     // which chart the context menu was opened on
+  menuStatus: null,    // and which status line belongs to its panel
+  cellmapValue: null,  // the Cell map's chosen value (its picker holds no state)
+  distValue: null,     // same, for Distributions
+  jointFamilies: ["basic"],
+  capabilities: null,  // what each panel of step 8 can do right now
+  groups: [],          // group comparator: [{name, folders: []}]
+  pendingFolders: [],
+};
+
+// R35 1-1: the Figure settings live in a right-click popover now, not in a
+// bar on every panel. What stays on the panel is the time window, which is a
+// property of the DATA being shown, not of how it is drawn.
+function timeWindowMarkup(step) {
+  return `
+    <span class="control-group-label">Time window</span>
+    <label>from <input type="number" id="${step}-window-start" class="small-input"></label>
+    <label>to <input type="number" id="${step}-window-end" class="small-input"></label>
+    <span id="${step}-window-unit" class="hint-inline"></span>`;
+}
+
+function fillSelect(id, entries, current) {
+  const select = document.getElementById(id);
+  if (!select) return;
+  select.innerHTML = "";
+  entries.forEach((entry) => {
+    const value = typeof entry === "string" ? entry : entry.value;
+    const label = typeof entry === "string" ? entry : entry.label;
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    // The number the label no longer carries (R35 0-B) lives here.
+    if (entry && entry.title) option.title = entry.title;
+    if (value === current) option.selected = true;
+    select.appendChild(option);
+  });
+}
+
+async function instantiateChartControls() {
+  document.querySelectorAll("[data-time-window]").forEach((host) => {
+    host.innerHTML = timeWindowMarkup(host.dataset.timeWindow);
+  });
+  chartState.options = await window.EpiQuantAPI.get_plot_options();
+  const current = chartState.options.current;
+  fillSelect("figure-style-select", chartState.options.styles, current.style);
+  // "Default" is a name, not a description: the fallback chain belongs in the
+  // tooltip, not in a menu entry that stretches the control (R35 0-B).
+  const fontSelect = [{ value: "", label: "Default" }]
+    .concat(chartState.options.fonts.map((f) => ({ value: f, label: f })));
+  fillSelect("figure-font-select", fontSelect, current.font_family || "");
+  document.getElementById("figure-font-select").title =
+    `Default = ${chartState.options.font_stack.join(" → ")}`;
+  fillSelect("figure-fontsize-select", chartState.options.font_sizes, current.font_size);
+  fillSelect("figure-linewidth-select", chartState.options.line_widths, current.line_width);
+  fillSelect("figure-sizepreset-select", chartState.options.size_presets, current.size_preset);
+  fillSelect("figure-error-select", chartState.options.error_bands, current.error_band);
+  ["style", "font", "fontsize", "linewidth", "sizepreset", "error"].forEach((name) => {
+    const el = document.getElementById(`figure-${name}-select`);
+    if (el) el.addEventListener("change", applyPlotSettings);
+  });
+  ["trajectory", "playground"].forEach((step) => {
+    ["start", "end"].forEach((edge) => {
+      const el = document.getElementById(`${step}-window-${edge}`);
+      if (el) el.addEventListener("change", () => applyTimeWindow(step));
+    });
+  });
+  wireDraggable("figure-settings-popover", "figure-settings-handle");
+  document.getElementById("figure-settings-close").addEventListener("click", () => {
+    document.getElementById("figure-settings-popover").style.display = "none";
+  });
+}
+
+// The settings are session level and apply to every chart, so a change
+// redraws whatever the user is looking at -- in both plotting steps, since a
+// chart on the step they are not on would otherwise still be showing the old
+// style when they switch back.
+async function applyPlotSettings() {
+  const value = (name) => document.getElementById(`figure-${name}-select`).value;
+  const result = await window.EpiQuantAPI.set_plot_settings({
+    style: value("style"),
+    font_family: value("font") || null,
+    font_size: value("fontsize"),
+    line_width: value("linewidth"),
+    size_preset: value("sizepreset"),
+    error_band: value("error"),
+  });
+  setStatus("figure-settings-note", result.note || "", result.note ? "warn" : "");
+  await refreshTrajectoryCharts();
+  await refreshPlaygroundPanel();
+}
+
+function openFigureSettings(event) {
+  const popover = document.getElementById("figure-settings-popover");
+  popover.style.display = "block";
+  popover.style.transform = "none";
+  // R36 2: the popover is `position: fixed`, so it must be placed in VIEWPORT
+  // coordinates. It used `pageX/pageY`, which are document coordinates -- on
+  // the Trajectory step, where Clone cell data sits well down a scrolled
+  // page, that put it below the bottom of the screen. It did open; it just
+  // could not be seen. The Playground page is short, which is why it looked
+  // fine there.
+  const box = popover.getBoundingClientRect();
+  const x = event ? event.clientX : window.innerWidth / 2 - box.width / 2;
+  const y = event ? event.clientY - 40 : 80;
+  const clamp = (value, lower, upper) => Math.max(lower, Math.min(upper, value));
+  popover.style.left = `${clamp(x, 8, Math.max(8, window.innerWidth - box.width - 8))}px`;
+  popover.style.top = `${clamp(y, 8, Math.max(8, window.innerHeight - box.height - 8))}px`;
+}
+
+// Drag by the header. Same shape as the inset-view popover already uses.
+function wireDraggable(popoverId, handleId) {
+  const popover = document.getElementById(popoverId);
+  const handle = document.getElementById(handleId);
+  if (!popover || !handle) return;
+  let dx = 0;
+  let dy = 0;
+  const move = (event) => {
+    popover.style.left = `${event.clientX - dx}px`;
+    popover.style.top = `${event.clientY - dy}px`;
+    popover.style.transform = "none";
+  };
+  const stop = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", stop);
+  };
+  handle.addEventListener("mousedown", (event) => {
+    if (event.target.closest("button")) return;
+    const box = popover.getBoundingClientRect();
+    dx = event.clientX - box.left;
+    dy = event.clientY - box.top;
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", stop);
+    event.preventDefault();
+  });
+}
+
+async function syncTimeWindow(step) {
+  const window_ = await window.EpiQuantAPI.get_time_window(step);
+  const unit = document.getElementById(`${step}-window-unit`);
+  if (!window_ || !window_.available) {
+    if (unit) unit.textContent = "(track the movie first)";
+    return;
+  }
+  const seconds = window_.unit === "seconds";
+  const startEl = document.getElementById(`${step}-window-start`);
+  const endEl = document.getElementById(`${step}-window-end`);
+  startEl.value = seconds ? Math.round(window_.start_sec) : window_.start_frame;
+  endEl.value = seconds ? Math.round(window_.end_sec) : window_.end_frame;
+  // R35 0-B: the label is the UNIT. The range belongs on the inputs, where the
+  // browser enforces it, not in a sentence beside them.
+  const span = window_.last_frame - window_.first_frame;
+  const dt = window_.frame_interval_sec || 1;
+  [startEl, endEl].forEach((el) => {
+    el.min = seconds ? 0 : window_.first_frame;
+    el.max = seconds ? Math.round(span * dt) : window_.last_frame;
+  });
+  if (unit) {
+    unit.textContent = seconds ? "s" : "frame";
+    unit.title = seconds
+      ? `Seconds from frame ${window_.first_frame}, the movie's first`
+      : "Set a frame interval in Extract to work in seconds";
+  }
+}
+
+async function applyTimeWindow(step) {
+  const current = await window.EpiQuantAPI.get_time_window(step);
+  if (!current || !current.available) return;
+  await window.EpiQuantAPI.set_time_window(
+    parseFloat(document.getElementById(`${step}-window-start`).value),
+    parseFloat(document.getElementById(`${step}-window-end`).value),
+    step, current.unit);
+  await syncTimeWindow(step);
+  await refreshChartsFor(step);
+}
+
+async function refreshChartsFor(step) {
+  if (step === "trajectory") await refreshTrajectoryCharts();
+  else await refreshPlaygroundPanel();
+}
+
+// --- value chips -------------------------------------------------------
+
+async function loadValueCatalog() {
+  const catalog = await window.EpiQuantAPI.get_value_catalog();
+  chartState.values = catalog.values || [];
+  chartState.pc = catalog.pc || { allowed: true, warning: null };
+  const pcs = chartState.values.filter((v) => v.is_pc).map((v) => v.column);
+  ["morphospace-x", "morphospace-y"].forEach((id, i) =>
+    fillSelect(id, pcs, pcs[Math.min(i, pcs.length - 1)]));
+}
+
+// R35 2-1: a drawn-by-us dropdown, not a native <datalist>.
+//
+// A `<datalist>` whose option carries both `value` and `label` is rendered by
+// WebKit on TWO lines -- "Cell Area" above "Cell Area (µm²) (Cells_info)" --
+// which is what the maintainer saw. There is no way to style it. One line
+// each: the name in body colour, the unit and source in grey; the search
+// matches both.
+function valuePickerMarkup(key) {
+  return `
+    <span class="value-picker-wrap">
+      <input type="text" id="${key}-value-input" class="value-picker-input"
+             placeholder="Search a value" autocomplete="off" role="combobox"
+             aria-expanded="false" aria-controls="${key}-value-menu">
+      <div id="${key}-value-menu" class="value-picker-menu" role="listbox" style="display:none"></div>
+    </span>`;
+}
+
+function valueSecondary(entry) {
+  const unit = entry.label && entry.label !== entry.column
+    ? entry.label.slice(entry.column.length).trim() : "";
+  return [unit, entry.source].filter(Boolean).join(" · ");
+}
+
+function wireValuePicker(key, onPick) {
+  const input = document.getElementById(`${key}-value-input`);
+  const menu = document.getElementById(`${key}-value-menu`);
+  if (!input || !menu) return;
+  let active = -1;
+
+  const matches = () => {
+    const needle = input.value.trim().toLowerCase();
+    return chartState.values.filter((entry) =>
+      !needle
+      || entry.column.toLowerCase().includes(needle)
+      || String(entry.source || "").toLowerCase().includes(needle));
+  };
+
+  const close = () => {
+    menu.style.display = "none";
+    input.setAttribute("aria-expanded", "false");
+    active = -1;
+  };
+
+  const render = () => {
+    const found = matches();
+    menu.innerHTML = "";
+    if (!found.length) {
+      close();
+      return;
+    }
+    found.forEach((entry, index) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "value-picker-row" + (index === active ? " active" : "");
+      row.setAttribute("role", "option");
+      const name = document.createElement("span");
+      name.className = "value-picker-name";
+      name.textContent = entry.column;
+      const meta = document.createElement("span");
+      meta.className = "value-picker-meta";
+      meta.textContent = valueSecondary(entry);
+      row.append(name, meta);
+      row.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        input.value = "";
+        close();
+        onPick(entry.column);
+      });
+      menu.appendChild(row);
+    });
+    menu.style.display = "block";
+    input.setAttribute("aria-expanded", "true");
+  };
+
+  input.addEventListener("input", () => { active = -1; render(); });
+  input.addEventListener("focus", render);
+  input.addEventListener("blur", () => setTimeout(close, 120));
+  input.addEventListener("keydown", (event) => {
+    const found = matches();
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      active = Math.max(0, Math.min(found.length - 1,
+                                    active + (event.key === "ArrowDown" ? 1 : -1)));
+      render();
+      const rows = menu.querySelectorAll(".value-picker-row");
+      if (rows[active]) rows[active].scrollIntoView({ block: "nearest" });
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const chosen = found[active >= 0 ? active : 0];
+      if (chosen) {
+        input.value = "";
+        close();
+        onPick(chosen.column);
+      }
+    } else if (event.key === "Escape") {
+      close();
+    }
+  });
+}
+
+function renderChips(key, hostId, onChange) {
+  const host = document.getElementById(hostId);
+  host.innerHTML = "";
+  chartState.chips[key].forEach((column, index) => {
+    const chip = document.createElement("span");
+    chip.className = "value-chip";
+    chip.draggable = true;
+    chip.dataset.index = index;
+    chip.textContent = column;
+    const remove = document.createElement("button");
+    remove.className = "chip-remove";
+    remove.textContent = "×";
+    remove.title = "Remove";
+    remove.addEventListener("click", () => {
+      chartState.chips[key].splice(index, 1);
+      renderChips(key, hostId, onChange);
+      onChange();
+    });
+    chip.appendChild(remove);
+    // Drag to reorder: the chip order IS the drawing order, for the small
+    // multiples and for which value gets the left axis.
+    chip.addEventListener("dragstart", (e) => e.dataTransfer.setData("text/plain", String(index)));
+    chip.addEventListener("dragover", (e) => e.preventDefault());
+    chip.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const from = parseInt(e.dataTransfer.getData("text/plain"), 10);
+      const to = parseInt(chip.dataset.index, 10);
+      if (Number.isNaN(from) || from === to) return;
+      const moved = chartState.chips[key].splice(from, 1)[0];
+      chartState.chips[key].splice(to, 0, moved);
+      renderChips(key, hostId, onChange);
+      onChange();
+    });
+    host.appendChild(chip);
+  });
+}
+
+function wireChipInput(pickerKey, key, hostId, onChange) {
+  wireValuePicker(pickerKey, (column) => {
+    if (!chartState.chips[key].includes(column)) chartState.chips[key].push(column);
+    renderChips(key, hostId, onChange);
+    onChange();
+  });
+}
+
+// --- charts: render + the right-click export menu ----------------------
+
+function showChart(imgId, result, statusId) {
+  const img = document.getElementById(imgId);
+  if (result && result.error) {
+    img.removeAttribute("src");
+    img.dataset.chart = "";
+    setStatus(statusId, result.error, "error");
+    return false;
+  }
+  img.src = result.image;
+  img.dataset.chart = result.chart_id;
+  img.dataset.kinds = (result.kinds || ["png", "svg", "xlsx"]).join(",");
+  // R35 1-4: the preview is rendered at 600 dpi, so it must be SHOWN at its
+  // physical width (mm -> CSS px at 96/in) or it arrives six times too big.
+  // On a Retina screen this is what makes it sharp rather than resampled.
+  if (result.width_mm) img.style.width = `${(result.width_mm / 25.4) * 96}px`;
+  const parts = [result.note, result.warning].filter(Boolean);
+  setStatus(statusId, parts.join(" — "), result.warning ? "warn" : "");
+  return true;
+}
+
+// R35 4-2: the status line of the panel the chart lives in, found from the
+// image itself. Morphospace and Streamlines reported nothing after an export
+// because the old callback only knew two panels by name; this one knows none
+// of them, which is why it works for all of them.
+function statusLineFor(imgEl) {
+  const panel = imgEl.closest(".playground-panel, #clone-cell-panel, "
+                              + "#cumulative-events-panel, #group-dynamics-wrap, .step-section");
+  const line = panel ? panel.querySelector(".status-line") : null;
+  return line ? line.id : "tracks-status";
+}
+
+function wireChartContextMenu() {
+  const menu = document.getElementById("chart-context-menu");
+  document.addEventListener("contextmenu", (event) => {
+    const img = event.target.closest(".chart-img");
+    if (!img || !img.dataset.chart) {
+      menu.style.display = "none";
+      return;
+    }
+    event.preventDefault();
+    chartState.menuChart = img.dataset.chart;
+    chartState.menuStatus = statusLineFor(img);
+    // An image panel has no vector form, so it does not offer SVG.
+    const kinds = (img.dataset.kinds || "png,svg,xlsx").split(",");
+    menu.querySelectorAll("button[data-export]").forEach((button) => {
+      button.style.display = kinds.includes(button.dataset.export) ? "" : "none";
+    });
+    // `.nav-menu` is `position: absolute`, so PAGE coordinates are the right
+    // ones here -- unlike the settings popover above, which is fixed. The
+    // right edge is clamped against the document width, not the viewport, or
+    // the clamp itself would misplace it on a scrolled page.
+    menu.style.display = "block";
+    const width = menu.getBoundingClientRect().width || 200;
+    menu.style.left = `${Math.min(event.pageX, document.documentElement.scrollWidth - width - 8)}px`;
+    menu.style.top = `${event.pageY}px`;
+  });
+  document.addEventListener("click", () => { menu.style.display = "none"; });
+  menu.querySelectorAll("button[data-menu='settings']").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      menu.style.display = "none";
+      openFigureSettings(event);
+    });
+  });
+  menu.querySelectorAll("button[data-export]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      menu.style.display = "none";
+      if (!chartState.menuChart) return;
+      const statusId = chartState.menuStatus || "tracks-status";
+      const result = await window.EpiQuantAPI.export_chart(chartState.menuChart, button.dataset.export);
+      if (result.error) setStatus(statusId, result.error, "error");
+      else {
+        const extra = (result.notes && result.notes.length) ? ` — ${result.notes.join("; ")}` : "";
+        setStatus(statusId, `Saved to ${result.saved}${extra}`, "success");
+      }
+    });
+  });
+}
+
+// --- step 7 charts -----------------------------------------------------
+
+function trajectoryColorMode() {
+  const checked = document.querySelector("input[name='trajectory-color-mode']:checked");
+  return checked ? checked.value : "highlight";
+}
+
+async function refreshTrajectoryCharts() {
+  const dynamics = trajectoryColorMode() === "dynamics";
+  document.getElementById("clone-cell-panel").style.display = dynamics ? "none" : "";
+  document.getElementById("cumulative-events-panel").style.display = dynamics ? "" : "none";
+  if (dynamics) {
+    const result = await window.EpiQuantAPI.get_cumulative_events_plot();
+    if (showChart("cumulative-events-chart", result, "cumulative-events-status")
+        && result.losses_without_a_paired_gain != null) {
+      setStatus("cumulative-events-status",
+                `${result.losses_without_a_paired_gain} loss(es) with no paired gain are not counted `
+                + "(rosettes and the like); the three curves count the loss axes on screen.");
+    }
+    return;
+  }
+  const track = parseInt(document.getElementById("track-number-input").value, 10);
+  if (!Number.isFinite(track) || !chartState.chips.clone.length) {
+    setStatus("clone-cell-status",
+              chartState.chips.clone.length ? "Pick a track." : "Add a value to plot.");
+    return;
+  }
+  const layout = document.getElementById("clone-layout-select").value;
+  const result = await window.EpiQuantAPI.get_single_track_plot(track, chartState.chips.clone, layout);
+  showChart("clone-cell-chart", result, "clone-cell-status");
+}
+
+// --- step 8 ------------------------------------------------------------
+
+function playgroundPanel() {
+  const checked = document.querySelector("input[name='playground-panel']:checked");
+  return checked ? checked.value : "tracks";
+}
+
+async function refreshPlaygroundPanel() {
+  const panel = playgroundPanel();
+  const map = { tracks: "playground-tracks", morphospace: "playground-morphospace",
+                cellmap: "playground-cellmap", streamlines: "playground-streamlines",
+                distributions: "playground-distributions" };
+  Object.entries(map).forEach(([name, id]) => {
+    document.getElementById(id).style.display = name === panel ? "" : "none";
+  });
+  const comparator = document.getElementById("group-comparator-checkbox").checked;
+  document.getElementById("group-comparator").style.display = comparator ? "" : "none";
+  document.getElementById("group-dynamics-wrap").style.display =
+    comparator && panel === "tracks" ? "" : "none";
+
+  if (panel === "tracks") {
+    if (!chartState.chips.tracks.length) {
+      setStatus("tracks-status", "Add a value to plot.");
+      return;
+    }
+    const coverage = parseFloat(document.getElementById("tracks-coverage-input").value) / 100;
+    const result = await window.EpiQuantAPI.get_all_tracks_plot(
+      chartState.chips.tracks, "small_multiples", coverage, null,
+      document.getElementById("tracks-by-cluster-checkbox").checked);
+    showChart("tracks-chart", result, "tracks-status");
+  } else if (panel === "morphospace") {
+    const x = document.getElementById("morphospace-x").value;
+    const y = document.getElementById("morphospace-y").value;
+    if (!x || !y) {
+      setStatus("morphospace-status", "Run Classify first.", "error");
+      return;
+    }
+    const result = await window.EpiQuantAPI.get_morphospace_plot(
+      x, y,
+      document.getElementById("morphospace-hulls").checked,
+      document.getElementById("morphospace-boundary").checked,
+      document.getElementById("morphospace-exemplars").checked);
+    showChart("morphospace-chart", result, "morphospace-status");
+  } else if (panel === "cellmap") {
+    await refreshCellMap();
+  } else if (panel === "distributions") {
+    await refreshDistributions();
+  }
+}
+
+async function showCellMapFrame(frame) {
+  state.cellmapFrame = frame;
+  setFrameLabel("cellmap", frame);
+  await refreshCellMap();
+}
+
+async function refreshCellMap() {
+  const column = chartState.cellmapValue;
+  if (!column) {
+    setStatus("cellmap-status", "Pick a value to map.");
+    return;
+  }
+  const isTrack = column === "Track ID";
+  // The Track ID has no continuous scale: it is coloured by the identity
+  // palette, so neither control applies to it.
+  document.getElementById("cellmap-colormap").disabled = isTrack;
+  document.getElementById("cellmap-fixed-scale").disabled = isTrack;
+  const result = await window.EpiQuantAPI.get_cell_map(
+    state.cellmapFrame, column,
+    document.getElementById("cellmap-colormap").value || null,
+    document.getElementById("cellmap-fixed-scale").checked);
+  if (showChart("cellmap-img", result, "cellmap-status")) {
+    // An image panel is shown at its own pixel size, never scaled to a
+    // physical width; `showChart` set one for the figure panels.
+    document.getElementById("cellmap-img").style.width = "";
+  }
+}
+
+async function drawStreamlines() {
+  const start = parseInt(document.getElementById("streamlines-start").value, 10);
+  const end = parseInt(document.getElementById("streamlines-end").value, 10);
+  const result = await window.EpiQuantAPI.get_streamlines_plot(
+    Number.isFinite(start) ? start : null, Number.isFinite(end) ? end : null,
+    null, false, document.getElementById("streamlines-registration").value);
+  showChart("streamlines-chart", result, "streamlines-status");
+}
+
+// --- Part 6: the clipboard menu and the movie maker --------------------
+
+function wireClipboardMenu() {
+  const button = document.getElementById("copy-view-btn");
+  const menu = document.getElementById("copy-view-menu");
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    menu.style.display = menu.style.display === "none" ? "block" : "none";
+  });
+  document.addEventListener("click", () => { menu.style.display = "none"; });
+  menu.querySelectorAll("button").forEach((entry) => {
+    entry.addEventListener("click", async () => {
+      menu.style.display = "none";
+      if (entry.dataset.action === "copy") await handleCopyView();
+      else openMovieMaker();
+    });
+  });
+}
+
+async function openMovieMaker() {
+  const dialog = document.getElementById("movie-maker-dialog");
+  dialog.style.display = "block";
+  const window_ = await window.EpiQuantAPI.get_time_window(
+    currentStep() === "playground" ? "playground" : "trajectory");
+  if (window_ && window_.available) {
+    document.getElementById("movie-start-input").value = window_.start_frame;
+    document.getElementById("movie-end-input").value = window_.end_frame;
+  }
+  setStatus("movie-status", "");
+}
+
+async function startMovie() {
+  const source = document.getElementById("movie-source-select").value;
+  const step = source === "cellmap" ? "cellmap" : currentStep();
+  const body = {
+    step,
+    start_frame: parseInt(document.getElementById("movie-start-input").value, 10),
+    end_frame: parseInt(document.getElementById("movie-end-input").value, 10),
+    value: chartState.cellmapValue || null,
+  };
+  document.getElementById("movie-progress").style.display = "block";
+  document.getElementById("movie-cancel-btn").style.display = "";
+  document.getElementById("movie-start-btn").disabled = true;
+  setStatus("movie-status", "Rendering…");
+  await window.EpiQuantAPI.start_movie_render(body.step, body.start_frame, body.end_frame, body.value,
+                                             state.currentTrackNumber);
+}
+
+function onMovieProgress(payload) {
+  const bar = document.getElementById("movie-progress");
+  bar.value = payload.percent || 0;
+  setStatus("movie-status", payload.message || "");
+}
+
+function onMovieDone(payload) {
+  document.getElementById("movie-progress").style.display = "none";
+  document.getElementById("movie-cancel-btn").style.display = "none";
+  document.getElementById("movie-start-btn").disabled = false;
+  setStatus("movie-status",
+            payload.error ? payload.error : `${payload.frames} frame(s) written to ${payload.folder}`,
+            payload.error ? "error" : "success");
+}
+
+// --- Part 7: the group comparator (folders + joint PCA) ----------------
+
+function renderGroupList() {
+  const host = document.getElementById("group-list");
+  host.innerHTML = "";
+  chartState.groups.forEach((group, index) => {
+    const chip = document.createElement("span");
+    chip.className = "value-chip";
+    chip.textContent = `${group.name} (${group.folders.length} individual`
+      + `${group.folders.length === 1 ? "" : "s"})`;
+    chip.title = group.folders.join("\n");
+    const remove = document.createElement("button");
+    remove.className = "chip-remove";
+    remove.textContent = "×";
+    remove.addEventListener("click", () => {
+      chartState.groups.splice(index, 1);
+      renderGroupList();
+      pushGroupState().then(refreshPlaygroundCapabilities);
+    });
+    chip.appendChild(remove);
+    host.appendChild(chip);
+  });
+  chartState.pendingFolders.forEach((folder) => {
+    const chip = document.createElement("span");
+    chip.className = "value-chip pending";
+    chip.textContent = folder;
+    host.appendChild(chip);
+  });
+}
+
+function wireGroupComparator() {
+  // R36 5: one short line on the panel, the full explanation in the tooltip,
+  // and BOTH follow the mode. The tooltip used to be a static HTML attribute
+  // describing the Clusters mode, so it still said "Within one movie..."
+  // while Multi-groups was selected. It is also set from JS as a single-line
+  // string -- written in the markup it carried the HTML indentation into the
+  // tooltip.
+  const describeGroupMode = (folders) => {
+    const note = document.getElementById("group-comparator-note");
+    note.textContent = folders
+      ? "Each group is one or more project folders."
+      : "Clusters of the current project.";
+    note.title = folders
+      ? "Each folder counts as one individual: group means are means of individual means, "
+        + "and intervals resample individuals."
+      : "Descriptive only: the clusters were defined on these values, and cells in one sample "
+        + "are not independent.";
+  };
+  document.getElementById("group-mode-select").addEventListener("change", (event) => {
+    const folders = event.target.value === "folders";
+    document.getElementById("group-folders").style.display = folders ? "" : "none";
+    describeGroupMode(folders);
+    refreshPlaygroundPanel();
+  });
+  describeGroupMode(document.getElementById("group-mode-select").value === "folders");
+  document.getElementById("group-add-folder-btn").addEventListener("click", async () => {
+    const path = await window.EpiQuantAPI.select_folder("Select an individual's project folder");
+    if (path) {
+      chartState.pendingFolders.push(path);
+      renderGroupList();
+    }
+  });
+  document.getElementById("group-add-btn").addEventListener("click", () => {
+    const name = document.getElementById("group-name-input").value.trim();
+    if (!name || !chartState.pendingFolders.length) return;
+    chartState.groups.push({ name, folders: chartState.pendingFolders.slice() });
+    chartState.pendingFolders = [];
+    document.getElementById("group-name-input").value = "";
+    renderGroupList();
+    pushGroupState().then(refreshPlaygroundCapabilities);
+  });
+  document.getElementById("joint-pca-btn").addEventListener("click", async () => {
+    const name = document.getElementById("joint-name-input").value.trim();
+    setStatus("joint-pca-status", "Building the joint PCA…");
+    await pushGroupState();
+    const result = await window.EpiQuantAPI.build_joint_pca(
+      name, chartState.groups, chartState.jointFamilies || ["basic"], null);
+    setStatus("joint-pca-status",
+              result.error ? result.error
+                : `${result.cells} cells from ${result.folders} folder(s), ${result.components} components; `
+                  + `written to ${result.written.length} folder(s).`,
+              result.error ? "error" : "success");
+    if (!result.error) {
+      // The new comparison has to appear in the PCA source menu without a
+      // restart -- that gap is what made Round 34's joint PCA unreachable.
+      await refreshPlaygroundCapabilities();
+      document.getElementById("pca-source-select").value = `joint:${result.comparison}`;
+      await applyPcaSource();
+    }
+  });
+}
+
+// --- wiring ------------------------------------------------------------
+
+async function wireRound34() {
+  await instantiateChartControls();
+  wireChartContextMenu();
+  wireClipboardMenu();
+  wireGroupComparator();
+
+  document.querySelectorAll("[data-picker]").forEach((host) => {
+    host.innerHTML = valuePickerMarkup(host.dataset.picker);
+  });
+  wireChipInput("clone", "clone", "clone-value-chips", refreshTrajectoryCharts);
+  wireChipInput("tracks", "tracks", "tracks-value-chips", refreshPlaygroundPanel);
+  wireValuePicker("cellmap", (column) => {
+    chartState.cellmapValue = column;
+    refreshCellMap();
+  });
+  wireValuePicker("dist", (column) => {
+    chartState.distValue = column;
+    refreshDistributions();
+  });
+  document.getElementById("clone-layout-select").addEventListener("change", refreshTrajectoryCharts);
+  document.querySelectorAll("input[name='trajectory-color-mode']").forEach((radio) => {
+    radio.addEventListener("change", refreshTrajectoryCharts);
+  });
+  document.querySelectorAll("input[name='playground-panel']").forEach((radio) => {
+    radio.addEventListener("change", refreshPlaygroundPanel);
+  });
+  ["group-comparator-checkbox", "tracks-by-cluster-checkbox", "morphospace-hulls",
+   "morphospace-boundary", "morphospace-exemplars", "cellmap-fixed-scale"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", refreshPlaygroundPanel);
+  });
+  ["morphospace-x", "morphospace-y"].forEach((id) => {
+    document.getElementById(id).addEventListener("change", refreshPlaygroundPanel);
+  });
+  document.getElementById("tracks-coverage-input").addEventListener("change", refreshPlaygroundPanel);
+  document.getElementById("cellmap-colormap").addEventListener("change", refreshCellMap);
+  document.getElementById("streamlines-draw-btn").addEventListener("click", drawStreamlines);
+  document.getElementById("streamlines-registration").addEventListener("change", drawStreamlines);
+  document.getElementById("group-dynamics-btn").addEventListener("click", async () => {
+    const kind = document.getElementById("group-dynamics-select").value;
+    setStatus("group-dynamics-status", "Computing…");
+    const result = await window.EpiQuantAPI.get_group_dynamics_plot(
+      kind, chartState.chips.tracks[0] || "Cell Area");
+    showChart("group-dynamics-chart", result, "group-dynamics-status");
+  });
+  document.getElementById("pca-source-select").addEventListener("change", applyPcaSource);
+  document.getElementById("dist-paired-checkbox").addEventListener("change", refreshDistributions);
+  document.getElementById("joint-features-btn").addEventListener("click", openJointFeatures);
+  document.getElementById("joint-features-close").addEventListener("click", () => {
+    document.getElementById("joint-features-popover").style.display = "none";
+  });
+  wireDraggable("joint-features-popover", "joint-features-handle");
+  document.getElementById("group-extract-btn").addEventListener("click", extractMissingGroupFolders);
+  window.onGroupExtractDone = onGroupExtractDone;
+  document.getElementById("movie-start-btn").addEventListener("click", startMovie);
+  document.getElementById("movie-maker-close").addEventListener("click", () => {
+    document.getElementById("movie-maker-dialog").style.display = "none";
+  });
+  document.getElementById("movie-cancel-btn").addEventListener("click", async () => {
+    await window.EpiQuantAPI.cancel_movie_render();
+  });
+
+  fillSelect("cellmap-colormap",
+             ["viridis", "magma", "YlGn", "RdBu_r", "coolwarm", "PuOr_r", "BrBG"], "viridis");
+  wireFrameNav("cellmap", () => state.cellmapFrame, (f) => (state.cellmapFrame = f),
+               showCellMapFrame);
+  wireZoom("cellmap", "cellmap-img");
+  window.onMovieProgress = onMovieProgress;
+  window.onMovieDone = onMovieDone;
+}
+
+// Called whenever tracking becomes available or changes: the catalog, the
+// window bounds and the PC gate all depend on it.
+async function refreshRound34Data() {
+  await loadValueCatalog();
+  await syncTimeWindow("trajectory");
+  await syncTimeWindow("playground");
+  if (chartState.pc && chartState.pc.warning) {
+    setStatus("clone-cell-status", chartState.pc.warning, "warn");
+  }
+  await refreshPlaygroundCapabilities();
+  enableStep("playground");
+}
+
+// ---------------------------------------------------------------------
+// Round 36: step 8 after Extract, the joint PCA, and Distributions
+// ---------------------------------------------------------------------
+
+// R36 8-1: step 8 opens once there are cells. Static crops and sparsely
+// sampled series have nothing to track, and requiring tracking locked them
+// out of every analysis they were collected for.
+async function unlockPlaygroundAfterExtract() {
+  await loadValueCatalog();
+  await syncTimeWindow("playground");
+  await refreshPlaygroundCapabilities();
+  enableStep("playground");
+}
+
+async function refreshPlaygroundCapabilities() {
+  const caps = await window.EpiQuantAPI.get_playground_capabilities();
+  chartState.capabilities = caps;
+  // Each panel's radio carries its own reason, so a disabled control always
+  // answers "why not" on hover instead of just being grey.
+  Object.entries(caps.panels || {}).forEach(([panel, state_]) => {
+    const radio = document.querySelector(`input[name="playground-panel"][value="${panel}"]`);
+    if (!radio) return;
+    radio.disabled = !state_.enabled;
+    const label = radio.closest("label");
+    if (label) label.title = state_.reason || "";
+    if (label) label.classList.toggle("disabled-reason", !state_.enabled);
+  });
+  const comparator = document.getElementById("group-comparator-checkbox");
+  if (comparator && caps.panels && caps.panels.comparator) {
+    comparator.disabled = !caps.panels.comparator.enabled;
+    const label = comparator.closest("label");
+    if (label) label.title = caps.panels.comparator.reason || "";
+  }
+  // If the selected panel just became unavailable, fall back to one that works.
+  const current = document.querySelector("input[name='playground-panel']:checked");
+  if (current && current.disabled) {
+    const fallback = Array.from(document.querySelectorAll("input[name='playground-panel']"))
+      .find((el) => !el.disabled);
+    if (fallback) fallback.checked = true;
+  }
+  await refreshPcaSources();
+  return caps;
+}
+
+async function refreshPcaSources() {
+  const options = await window.EpiQuantAPI.get_joint_pca_options();
+  const select = document.getElementById("pca-source-select");
+  if (!select) return;
+  const previous = select.value;
+  select.innerHTML = "";
+  options.options.forEach((entry) => {
+    const option = document.createElement("option");
+    option.value = entry.value;
+    option.textContent = entry.label;
+    option.disabled = !entry.available;
+    if (entry.folders) {
+      option.title = `${entry.folders} folder(s), group(s): ${(entry.groups || []).join(", ")}`;
+    }
+    select.appendChild(option);
+  });
+  select.value = options.options.some((o) => o.value === previous) ? previous : options.current;
+  const note = document.getElementById("pca-source-note");
+  if (note) {
+    const joint = options.options.filter((o) => o.value !== "project").length;
+    note.textContent = joint
+      ? `${joint} joint comparison(s) found`
+      : "no joint PCA yet — build one in the Group comparator";
+  }
+}
+
+async function applyPcaSource() {
+  const select = document.getElementById("pca-source-select");
+  const result = await window.EpiQuantAPI.set_pca_source(select.value);
+  if (result && result.error) {
+    setStatus("morphospace-status", result.error, "error");
+    select.value = "project";
+    await window.EpiQuantAPI.set_pca_source("project");
+    return;
+  }
+  await refreshPlaygroundPanel();
+}
+
+// --- Distributions (8-2) ----------------------------------------------
+
+async function refreshDistributions() {
+  const column = chartState.distValue;
+  if (!column) {
+    setStatus("dist-status", "Pick a value.");
+    return;
+  }
+  await pushGroupState();
+  const result = await window.EpiQuantAPI.get_distributions_plot(
+    column, document.getElementById("dist-paired-checkbox").checked);
+  showChart("dist-chart", result, "dist-status");
+}
+
+// The backend needs the comparator's mode and groups to know how to split the
+// cells and where to look for a joint PCA.
+async function pushGroupState() {
+  const using = document.getElementById("group-comparator-checkbox").checked;
+  const mode = using ? document.getElementById("group-mode-select").value : "none";
+  await window.EpiQuantAPI.set_group_state(mode, chartState.groups);
+}
+
+// --- the joint PCA's feature families (6-1) ---------------------------
+
+async function openJointFeatures(event) {
+  const popover = document.getElementById("joint-features-popover");
+  const options = await window.EpiQuantAPI.get_feature_options();
+  const picker = document.getElementById("joint-feature-families");
+  picker.innerHTML = "";
+  Object.entries(options.families).forEach(([name, spec]) => {
+    const label = document.createElement("label");
+    label.className = "checkbox-label";
+    const checked = spec.base || (chartState.jointFamilies || []).includes(name) ? " checked" : "";
+    const disabled = spec.base ? " disabled" : "";
+    label.innerHTML =
+      `<input type="checkbox" class="joint-family-checkbox" value="${name}"${checked}${disabled}>`
+      + ` ${spec.label}`;
+    picker.appendChild(label);
+  });
+  picker.querySelectorAll(".joint-family-checkbox").forEach((el) => {
+    el.addEventListener("change", handleJointFamilyChange);
+  });
+  handleJointFamilyChange();
+  popover.style.display = "block";
+  popover.style.transform = "none";
+  const box = popover.getBoundingClientRect();
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  popover.style.left = `${clamp(event ? event.clientX : 200, 8,
+                                Math.max(8, window.innerWidth - box.width - 8))}px`;
+  popover.style.top = `${clamp(event ? event.clientY - 40 : 80, 8,
+                               Math.max(8, window.innerHeight - box.height - 8))}px`;
+}
+
+function handleJointFamilyChange() {
+  const boxes = Array.from(document.querySelectorAll(".joint-family-checkbox"));
+  const efdOn = boxes.some((el) => el.value === "efd" && el.checked);
+  boxes.forEach((el) => {
+    if (el.value === "efd") return;
+    el.disabled = efdOn || el.value === "basic";
+    if (efdOn) el.checked = false;
+    else if (el.value === "basic") el.checked = true;
+  });
+  chartState.jointFamilies = efdOn ? ["efd"]
+    : boxes.filter((el) => el.checked).map((el) => el.value);
+  setStatus("joint-features-status",
+            efdOn
+              ? "Elliptic Fourier is used on its own; every folder needs its raw coefficients."
+              : `Selected: ${chartState.jointFamilies.join(", ")}`);
+}
+
+// --- batch extraction over the group folders --------------------------
+
+async function extractMissingGroupFolders() {
+  await pushGroupState();
+  const status = await window.EpiQuantAPI.get_group_extraction_status(chartState.groups);
+  if (status.no_masks && status.no_masks.length) {
+    setStatus("group-extract-status",
+              `No masks/ directory in: ${status.no_masks.join(", ")}`, "error");
+    return;
+  }
+  if (!status.missing.length) {
+    setStatus("group-extract-status",
+              `All ${status.ready.length} folder(s) already have Cells_info.xlsx.`, "success");
+    return;
+  }
+  document.getElementById("group-extract-progress").style.display = "block";
+  document.getElementById("group-extract-btn").disabled = true;
+  setStatus("group-extract-status",
+            `Extracting ${status.missing.length} of ${status.total} folder(s)…`);
+  await window.EpiQuantAPI.start_group_extraction(chartState.groups);
+}
+
+function onGroupExtractDone(payload) {
+  document.getElementById("group-extract-progress").style.display = "none";
+  document.getElementById("group-extract-btn").disabled = false;
+  if (payload.error) {
+    setStatus("group-extract-status", payload.error, "error");
+    return;
+  }
+  const parts = [`${payload.extracted} folder(s) extracted`,
+                 `${payload.already} already had a table`];
+  if (payload.cancelled) parts.push("cancelled");
+  if (payload.failed && payload.failed.length) parts.push(`failed: ${payload.failed.join("; ")}`);
+  if (payload.settings) {
+    parts.push(`min area ${payload.settings.min_cell_area_px} px, `
+               + `edge cells ${payload.settings.exclude_edge_cells ? "excluded" : "kept"}`);
+  }
+  setStatus("group-extract-status", parts.join("; "),
+            (payload.failed && payload.failed.length) ? "warn" : "success");
+}

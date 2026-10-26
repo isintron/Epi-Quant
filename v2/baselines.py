@@ -65,7 +65,7 @@ import data_input
 TRACKING_PARAMETERS = (
     "overlap_weight", "centroid_weight", "motion_compensation", "max_frame_gap",
     "cost_form", "overlap_power", "no_link_ratio", "four_quadrant", "drift_mode",
-    "feature_columns", "weights",
+    "feature_columns", "weights", "gate_scale",
 )
 
 # Where the app writes its own outputs. Nothing in this module may read a
