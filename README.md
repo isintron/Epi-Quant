@@ -1,205 +1,130 @@
 # Epi-Quant
 
-**Epi-Quant** is an open-source toolkit for automatic **cell classification, cell tracking, and quantitative analysis** of epithelial tissues during morphogenesis.
+Epi-Quant is a desktop application for measuring cell shape, tracking cells, and exploring cell dynamics in segmented **two-dimensional epithelial images**. It is intended for biologists who have a time series of microscopy images and cell segmentation masks. Classification uses selected geometric features with PCA and k-means; tracking uses frame-to-frame assignment and can be corrected by visual inspection. You can skip classification and go directly from feature extraction to tracking.
 
-It is designed for developmental biologists who perform live imaging experiments and wish to extract robust quantitative measurements from segmented epithelial tissues.
+![Epi-Quant overview](readme_assets/fig-1.png)
 
-Epi-Quant integrates:
+## Start here
 
-- PCA-based cell classification
-- Hungarian algorithm–based robust cell tracking
-- Quantitative morphodynamic analysis
-- Intuitive graphical user interface (GUI)
+1. [Install and launch Epi-Quant](#installation).
+2. Prepare an `images/` folder and a `masks/` folder as shown under [Input data](#input-data).
+3. In **Setup**, select those two folders and a separate output folder, then click **Set Project**.
+4. In **Extract Cell Features**, inspect the masks and run **Extract Features**. Continue to **Classify Cells**, or choose **Skip classification, track directly**.
+5. Run **Track Cells**, inspect and correct questionable links, then explore trajectories, cell events, and plots.
 
-<img src="./readme_assets/fig-1.png" alt="fig-1" style="zoom:67%;" />
-
-## Overview
-
-Epi-Quant analyzes segmented epithelial tissues (e.g., from [Cellpose](https://www.cellpose.org) output) and provides but not limits:
-
-- Cell type classification
-- Cell tracking across time-lapse sequences
-- Morphometric measurements (cell area, perimeter, aspect ratio, orientation, etc.)
-- Velocity field visualization
-- Comparative analysis between genotypes
-
-## Requirements
-
-- Python ≥ 3.8
-- numpy
-- pandas
-- matplotlib
-- PIL
-- scikit-learn
-- scipy
-- PyQt5
-
-We recommend using a Conda environment.
+The [illustrated GUI tutorial](Tutos/Tutos.md) follows each screen and includes practical advice for segmentation and tracking correction. A [PDF version](<Tutos/Epi-Quant%20GUI%20Tutos.pdf>) is also available.
 
 ## Installation
 
-Epi-Quant is distributed as a standalone executable generated using **PyInstaller**.
-Users do not need to install Python or additional dependencies when using the compiled version.
+Epi-Quant currently runs from the Python source in this repository. The current desktop interface uses [pywebview](https://github.com/r0x0r/pywebview), rather than the older PyQt5 interface in `src/`. Use **Python 3.11** for the steps below; pywebview requires Python 3.10 or newer. A terminal (command line) is needed to install the dependencies and each time you start the app. Linux users should read the desktop-backend note below before launching.
 
-### Option 1 — Download Precompiled Executable
+**Open a terminal:** on macOS, open **Terminal** from Applications → Utilities; on Windows, open **PowerShell** from the Start menu; on Linux, open your distribution's **Terminal** application. Download the repository with **Code → Download ZIP** on [GitHub](https://github.com/isintron/Epi-Quant), extract it, and change into the extracted folder in the terminal. If you use Git, the alternative is:
 
-Go to the **Releases** section of this repository and download the appropriate version for your operating system:
-
-- Windows:  `.exe`
-- macOS: `.app` or Unix executable
-- Linux: binary executable
-
-Executables are platform-specific. Please download the version matching your OS.
-
-On macOS, you may need to manually allow the application under Security & Privacy settings.
-
-### Option 2 — Build the Executable Yourself
-
-If you wish to generate the executable locally, follow these steps.
-Step 1 — Install PyInstaller
-
-```
-pip install pyinstaller
-```
-Step 2 — Build
-Run the following command in the project root directory:
-
-```
-python -m PyInstaller gui_main.spec
+```sh
+git clone https://github.com/isintron/Epi-Quant.git
+cd Epi-Quant
 ```
 
-### Important: Platform-Specific Build
+Run the following commands **from the folder containing this README**. Paths containing spaces must be enclosed in quotes when you use `cd`. For example, `cd "/path/to/Epi-Quant"` on macOS/Linux or `cd "C:\path\to\Epi-Quant"` in PowerShell.
 
-PyInstaller builds **platform-dependent executables**:
+### Option A: Conda
 
-- Running this command on Windows produces a `.exe`
-- Running it on macOS produces a macOS executable
-- Running it on Linux produces a Linux binary
+Install [Miniconda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html) if needed. On Windows, use **Anaconda Prompt** or a PowerShell session where Conda is initialized. The same commands work on macOS and Linux:
 
-Cross-platform compilation is **not supported**.
-
-Therefore:
-
-> To distribute Epi-Quant for multiple operating systems, the build process must be executed separately on each target platform.
-
-## Input Data Format
-
-Epi-Quant requires:
-
-1. Segmented cell contour file (.npy)
-   Generated by Cellpose.
-2. Original image file (.tif or image sequence)
-   Used for visualization and analysis.
-
-## Typical Workflow
-
-```mermaid
----
-config:
-  flowchart:
-    htmlLabels: false
----
-flowchart TD
-
-A(Cellpose Segmentation)
-B(Load files into EpiQuant)
-C(PCA-based Cell Classification)
-D(Hungarian-based Cell Tracking)
-E(Quantitative Analysis)
-F(Visualization & Export)
-
-A --> B
-B --> C
-C --> D
-D --> E
-E --> F
-
-style A fill:#ffffff,stroke:#000000;
-style B fill:#ffffff,stroke:#000000;
-style C fill:#ffffff,stroke:#000000;
-style D fill:#ffffff,stroke:#000000;
-style E fill:#ffffff,stroke:#000000;
-style F fill:#ffffff,stroke:#000000;
+```sh
+conda create -n epi-quant python=3.11 -y
+conda activate epi-quant
+python -m pip install -r v2/webview/requirements.txt
+python v2/webview/app.py
 ```
 
-## Quick Start (GUI Workflow)
+The packages are installed inside the new environment. When returning later, open a terminal in the repository folder, run `conda activate epi-quant`, then `python v2/webview/app.py`. See the [Conda environment guide](https://docs.conda.io/projects/conda/en/stable/user-guide/tasks/manage-environments.html) if activation is unfamiliar.
 
-### Launch and Run Epi-Quant
+### Option B: pip and venv
 
-After downloading or building the executable, launch:
-- Windows → double-click `EpiQuant.exe`
-- macOS / Linux → open the executable or run in terminal
-The main interface will appear as shown below.
+Install [Python 3.11](https://www.python.org/downloads/) first. On **macOS or Linux**:
 
-<img src="./readme_assets/fig-2.png" alt="fig-2" style="zoom: 50%;" />
-
-**Step 1 — Set Input and Output Paths**
-
-At the top of the GUI, click <kbd>Browse</kbd> to locate folders:
-1. Path to Original Images — Select the folder containing the original microscopy images.
-2. Path to .npy Files — Select the folder containing segmentation masks.
-3. Output Folder Path — Choose the directory where all analysis results will be saved.
-
-**Step 2 — Extract Cell Features**
-
-In the **Work Area** panel (right side): Click <kbd>Extract Cell Features</kbd>. This step:
-
-- Reads segmentation contours
-- Extracts geometric descriptors per cell
-- Computes centroid, area, perimeter, ellipse parameters, etc. Progress messages will appear in the **Operation Log** at the bottom.
-
-**Step 3 — Classify Cells**
-
-Click <kbd>Classify Cells</kbd>. This performs:
-
-- PCA dimensionality reduction
-- $k$-means clustering
-- Automatic cell-type separation
-
-If needed, manual correction can be performed using <kbd>Correct Cell Classification</kbd>
-
-**Step 4 — Track Cells**
-
-Click <kbd>Track Cells</kbd>. This performs:
-
-- Frame-to-frame matching
-- Hungarian algorithm–based assignment
-- Robust handling of unequal cell numbers
-If needed, correction is available via <kbd>Correct Cell Tracking</kbd>
-
-**Step 5 — Generate Quantitative Data**
-
-Click <kbd>Generate Quantitative Data</kbd>
-
-## Output Directory Structure (Example)
-
-For clarity, a full output directory typically appears as:
-
+```sh
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r v2/webview/requirements.txt
+python v2/webview/app.py
 ```
-output_path/
-├── cell_classification_output/
-├── cell_track_output/
-├── quantitative_analysis_output/
+
+On **Windows PowerShell**:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r v2/webview/requirements.txt
+python v2/webview/app.py
+```
+
+If PowerShell blocks activation, use `.\.venv\Scripts\python.exe -m pip install -r v2/webview/requirements.txt` and `.\.venv\Scripts\python.exe v2/webview/app.py` instead. The [Python Packaging User Guide](https://packaging.python.org/en/latest/guides/installing-using-pip-and-virtual-environments/) explains virtual environments in more detail.
+
+On **Linux**, pywebview also needs a desktop backend. After installing the requirements, install either `python -m pip install 'pywebview[gtk]'` or `python -m pip install 'pywebview[qt]'`; consult the [pywebview installation guide](https://github.com/r0x0r/pywebview/blob/master/docs/guide/installation.md) for any system packages your distribution needs. On Windows, pywebview may require the [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/). The app opens as a desktop window; it does not start a web server for your browser.
+
+### Python dependencies
+
+The authoritative Python package list is [`v2/webview/requirements.txt`](v2/webview/requirements.txt): pywebview, NumPy, pandas, OpenCV, Pillow, scikit-learn, SciPy, openpyxl, Matplotlib, and pyefd. The installation command above installs them together. Cellpose, EpySeg, and Tissue Analyzer can supply segmentations, but are **not required** to run Epi-Quant or included in this requirements file. This repository is not currently packaged for `pip install .`.
+
+## Input data
+
+Put one segmentation mask and one microscopy image per frame in separate folders. Keep the frame numbers consistent between them. For example:
+
+```text
+my_experiment/
 ├── images/
+│   ├── sample_0000.tif
+│   └── sample_0001.tif
 └── masks/
+    ├── sample_0000_mask.tif
+    └── sample_0001_mask.tif
 ```
 
-- `images/` – Original image copies
-- `masks/` – Segmentation mask copies
-- `cell_classification_output/` – PCA + clustering
-- `cell_track_output/` – Tracking and displacement
-- `quantitative_analysis_output/` – Morphodynamic metrics
+- **Masks:** a folder of Cellpose-style `.npy` files, or a folder of `.tif`/`.tiff` instance masks or cell-boundary images (such as EpySeg or Tissue Analyzer exports). Do not mix `.npy` and TIFF masks in the same folder. TIFF masks are converted to `.npy` in `masks/npy_converted/` when needed; that directory is a generated cache, not the original data. In **Extract → Advanced options**, choose **Mask type** if automatic detection mistakes a binary cell-body mask for boundary lines.
+- **Images:** `.tif`, `.tiff`, `.jpg`, `.jpeg`, or `.png`. These are used for viewing and intensity-based quality checks. Epi-Quant first tries to match image and mask names, then falls back to frame numbers. Check the pairing in the preview before trusting intensity-based results.
+- **Frame naming:** for a time series, number **every** file consistently (`0000`, `0001`, …). If any mask filename has no digits, the importer numbers all frames by sorted position. The last number in a filename is treated as its frame number; avoid unrelated numbers after the frame counter.
+- **Scale:** set **Frame interval** (seconds) and **Pixel size** (µm/pixel) in Extract when you know them. Features that need physical units depend on these settings.
 
-## Example Applications
+Epi-Quant measures two-dimensional cell outlines. For a 3D dataset, first make a biologically justified 2D projection or surface representation and validate the resulting segmentation; the app does not analyze full 3D cell shapes.
 
-For example, Epi-Quant can be applied to analyze *Drosophila* dorsal closure by distinguishing amnioserosa (AS, shown in light brown) cells and lateral epidermis (LE, shown in light green) cells using quantitative geometric descriptors and unsupervised clustering.
+### Test dataset
 
-<img src="./readme_assets/fig-3.png" alt="fig-3" style="zoom: 20%;" />
+The test dataset is available from the [Dataset release](https://github.com/isintron/Epi-Quant/releases/tag/Dataset). It is distributed separately from the Git repository to avoid making clones unnecessarily large. To try the interface, use the dataset's small, segmented image series in the layout above. Keep the input folders unchanged and choose a separate output folder. The screenshots in the [GUI tutorial](Tutos/Tutos.md) show an example project, but are not themselves analysis inputs.
 
-Quantifying dynamic changes across developmental timepoints. Users can characterize oscillatory behavior, shape transitions, and directional movement during tissue morphogenesis.
+## What the analysis produces
 
-<img src="./readme_assets/fig-4.png" alt="fig-4" style="zoom: 20%;" />
+**Set Project** creates these three folders inside the output folder you select. The original `images/` and `masks/` folders remain where you put them; the output folder does not contain automatic copies of them.
 
-Comparing developmental dynamics between wild-type and mutant backgrounds to identify genotype-dependent differences in tissue remodeling and cell behavior.
+| Folder                            | Typical contents                                                                                                                                                     | Format and purpose                                                                                                                                                                                                                                                       |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cell_classification_output/`   | `Cells_info.xlsx`; optional `Cells_shape.xlsx`, `Cells_tissue.xlsx`; `Cells_info_PCA.xlsx`, `cells_clustering_results.xlsx`; settings and provenance files | One row per detected cell for measured features; optional shape/texture descriptors and PCA/clustering results. The PCA/clustering files appear only after classification. Tables are Excel workbooks (`.xlsx`); settings/provenance use JSON.                         |
+| `cell_track_output/`            | `all_cell_tracking/all_cell_merged_tracking_results.xlsx`; optional `cell_lineage.xlsx`, `ground_truth_links.csv` and review records                           | The main workbook contains persistent track IDs and frame columns. Lineage and manually reviewed ground truth appear only after their respective operations. Tracking workbooks use `.xlsx`; reviewed links use `.csv`.                                              |
+| `quantitative_analysis_output/` | Exported plots, source tables and movies; optional Tissue Analyzer-style track maps                                                                                  | Plot exports use `.png` or `.svg`, with `.xlsx` tables where offered. Movie frames are `.png` files with a `settings.json`; optional track-map export writes TIFF images in per-frame folders. Files appear only when you use the corresponding export action. |
 
-<img src="./readme_assets/fig-5.png" alt="fig-5" style="zoom:25%;" />
+Some operations write additional intermediate files. Keep the three folders together when reopening a project; **Load Existing Results** reads previously generated tables from them. Exported plots and movies are separate from the underlying measurements.
+
+## What Epi-Quant can analyze
+
+<img src="readme_assets/fig-2.png" alt="Segmentation, feature extraction, and classification" style="zoom: 100%;" />
+
+From segmented images, Epi-Quant measures cell geometry and classifies cells using selected features, PCA, and k-means. PCA describes shape variation; it is not the method that detects divisions, cell loss, or neighbour exchanges.
+
+<img src="readme_assets/fig-3.png" alt="Tracking and cell dynamics examples" style="zoom: 100%;" />
+
+Track cells across a time series, inspect suspicious links, and correct identities. The figure illustrates single-cell dynamics, cell elimination, and collective movement.
+
+<img src="readme_assets/fig-4.png" alt="Quantitative comparison of cell dynamics" style="zoom: 100%;" />
+
+Plot cell and tissue measurements over time and compare groups using the underlying exported tables.
+
+<img src="readme_assets/fig-5.png" alt="Elliptic Fourier shape analysis" style="zoom: 100%;" />
+
+Optional elliptic Fourier descriptors (EFDs) capture the contour of lobed or puzzle-like cells. See the [20-page illustrated tutorial](Tutos/Tutos.md) for the GUI steps, exports, and keyboard shortcuts.
+
+## License and attribution
+
+Epi-Quant is released under the [MIT License](LICENSE). Parts of the T1/neighbour-exchange logic and lineage conventions were adapted from [TissueMiner](https://github.com/mpicbg-scicomp/tissue_miner), which is distributed under the BSD 3-Clause License. Its copyright notice and full license are retained in [`third_party/tissue_miner_LICENSE`](third_party/tissue_miner_LICENSE); see the attribution in [`v2/topology.py`](v2/topology.py) and [`v2/lineage.py`](v2/lineage.py). Please also cite [Etournay et al., *eLife* (2016)](https://doi.org/10.7554/eLife.14334) when using the TissueMiner-derived approach.
+
+For questions or bug reports, open a [GitHub issue](https://github.com/isintron/Epi-Quant/issues) with the operating system, Python version, mask format, and the step at which the problem occurred. Do not upload unpublished microscopy data unless you intend to share it publicly.

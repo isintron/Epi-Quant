@@ -9,10 +9,10 @@ figures/
 rounds/
 docs/
 
-# Claude
 .claude/
 CLAUDE.md
 CLAUDE.local.md
+AGENTS.md
 
 # Python
 __pycache__/
