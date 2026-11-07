@@ -2,7 +2,7 @@
 
 Welcome to Epi-Quant repository🥳
 
-![Epi-Quant logo](readme_assets/Epi-Quant-LOGO.png)
+<img src="readme_assets/Epi-Quant-LOGO-Cropped.png" alt="Epi-Quant logo" style="zoom:50%;" />
 
 Epi-Quant is a desktop application for measuring cell shape, tracking cells, and exploring cell dynamics in segmented **two-dimensional epithelial images**. It is intended for biologists who have a time series of microscopy images and cell segmentation masks. Classification uses selected geometric features with PCA and k-means; tracking uses frame-to-frame assignment and can be corrected by visual inspection. You can skip classification and go directly from feature extraction to tracking.
 
